@@ -31,13 +31,15 @@ var purchaseorderSearch = nlapiSearchRecord("purchaseorder",null,
   var amount = purchaseorderSearch[0].getValue('amount');
   var quantity = purchaseorderSearch[0].getValue('quantity');
   var item = purchaseorderSearch[0].getValue('item');
+  var date = purchaseorderSearch[0].getValue('trandate');
 
 
 
   nlapiLogExecution('Debug', 'amount', amount); 
   nlapiLogExecution('Debug', 'quantity', quantity); 
   nlapiLogExecution('Debug', 'item', item); 
-  
+  nlapiLogExecution('Debug', 'date', date); 
+
   
   var rate = parseFloat(amount/quantity) ; 
   nlapiLogExecution('Debug', 'rate', rate);

@@ -1,5 +1,4 @@
-<h4> Netsuite - SuiteScripts</h4>
-NetSuite Customizations using SuiteScripts (Javascript)
+<h4>NetSuite Customizations - SuiteScripts (Javascript)</h4>
 
 <h5>Netsuite Full Documentation - https://docs.oracle.com/cloud/latest/netsuitecs_gs/docs.htm </h5>
 

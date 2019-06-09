@@ -6,5 +6,8 @@
 
 <h5>Suitescript 2.0 Documentation - https://docs.oracle.com/cloud/latest/netsuitecs_gs/NSSCR/NSSCR.pdf</h5>
 
+<h5>More from RipTutorial - https://riptutorial.com/ebook/netsuite</h5>
+
+
 
 

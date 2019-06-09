@@ -10,13 +10,22 @@ define(['N/record'],
  function beforeSubmit(context) {
 
    var newRecord = context.newRecord;
-   
-   
- newRecord.setValue({
- fieldId: 'vendorname',
- value: 'Jenne Distributor'
+  
+   //SetFieldValue - VendorName
+   newRecord.setValue({
+     fieldId: 'vendorname',
+     value: 'Jenne'
+   });
+//GetFieldValue - InternalId
+var internalid =  newRecord.getValue({
+ fieldId: 'internalid',
 });
 
+//Log internal id value
+log.debug ({
+ title: 'Success',
+ details: internalid
+ });
 
  }
 

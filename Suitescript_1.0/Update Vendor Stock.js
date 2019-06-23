@@ -1,7 +1,7 @@
 function UpdateVendorStock(){
 	
 
-	var itemId = nlapiGetRecordId(); //Get internal ID
+	var itemId = nlapiGetRecordId(); //Get item internal ID
 
 var itemSearch = nlapiSearchRecord("item",null,
 [

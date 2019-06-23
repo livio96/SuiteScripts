@@ -1,75 +1,59 @@
-function recent_so_info() {
+function UpdateVendorStock(){
 	
 
-var item_id = nlapiGetRecordId(); 
+	var itemId = nlapiGetRecordId(); //Get internal ID
 
-  if(item_id !=null) {
-  
-var salesorderSearch = nlapiSearchRecord("salesorder",null,
+var itemSearch = nlapiSearchRecord("item",null,
 [
-   ["trandate","after","1/1/2017"], 
+   ["custitem_display_sca","is","T"], 
    "AND", 
-   ["type","anyof","SalesOrd"],
+   ["custitem_awa_is_custom_parent","is","F"], 
    "AND", 
-   ["subsidiary","anyof","1"], 
-   "AND", 
-   ["item","noneof","@NONE@"], 
-   "AND", 
-   ["item.custitem_awa_is_custom_child","is","T"], 
-   "AND", 
-   ["item.internalid","anyof",item_id]
+   ["internalid","anyof",itemId]
 ], 
 [
-   new nlobjSearchColumn("trandate").setSort(true), 
-   //new nlobjSearchColumn("amount"), 
-   //new nlobjSearchColumn("quantity")
-   new nlobjSearchColumn("rate")
-
+   new nlobjSearchColumn("itemid"), 
+   new nlobjSearchColumn("quantityonhand").setSort(true), 
+   new nlobjSearchColumn("custitem15"), 
+   new nlobjSearchColumn("custitem24")
 ]
 );
-
-/*if(salesorderSearch) {
-//var date = salesorderSearch[0].getValue('trandate') ; 
-//var amount = salesorderSearch[0].getValue('amount') ; 
-//var quantity = salesorderSearch[0].getValue('quantity') ; 
-  
- var rate = parseFloat(amount/quantity) ; 
-  
-nlapiLogExecution('Debug', 'rate', rate); 
-
-	  
-     nlapiSetFieldValue('custitem_so_rate', rate) ; 
+ if(itemSearch) {
+  var jenne_quantity = itemSearch[0].getValue('custitem15');
+  var item = itemSearch[0].getValue('itemid');
+  var onhand = itemSearch[0].getValue('quantityonhand');
+  var teledynamic_quantity = itemSearch[0].getValue('custitem24');
 
 }
-*/
 
-var search_length = 0;
 
-    if (salesorderSearch) {
-      if (salesorderSearch.length < 5) {
-        search_length = salesorderSearch.length;
-      } 
-      else
-          search_length = 5;
+	
+if(onhand == null) {
+  onhand = parseInt(0)
+}
 
-      nlapiLogExecution("Debug", "length", search_length);
+if(jenne_quantity == null || jenne_quantity =='')
+  		jenne_quantity = parseInt(0)
+if(teledynamic_quantity == null || teledynamic_quantity =='') 
+  		teledynamic_quantity = parseInt(0)
+if(onhand == null || onhand ==''){
+  onhand = parseInt(0) ; 
+}
 
-      var sum = 0;
-      for (var i = 0; i < search_length; i++) {
-        nlapiLogExecution("Debug", "Value ", salesorderSearch[i].getValue("rate")
-        );
-        sum += parseFloat(salesorderSearch[i].getValue("rate"));
-      }
-    }
+ var vendor_stock = parseInt(jenne_quantity) + parseInt(teledynamic_quantity) + parseInt(onhand);
 
-    if (search_length > 0) {
-      var rate = parseFloat(sum / search_length);
+ nlapiLogExecution('Debug','Item name: ',  item)
+        nlapiLogExecution('Debug','Jenne: ',  jenne_quantity)
+          nlapiLogExecution('Debug','tele : ',  teledynamic_quantity)
+            nlapiLogExecution('Debug','stock : ',  onhand)
+            nlapiLogExecution('Debug','vendor stock : ',  vendor_stock)
+  			
+  
+	    nlapiSetFieldValue('custitem_vendor_stock', parseInt(vendor_stock) ) ;
 
-      nlapiLogExecution("Debug", "rate", rate);
 
-      nlapiSetFieldValue("custitem_so_rate", rate);
-    }
 
-  }
+
+
 
 }

@@ -1,0 +1,47 @@
+function calculate_rewards(type){
+  
+	var status = nlapiGetFieldValue('status') ; 
+	var customer_id = nlapiGetFieldValue('entity') ; //Get Customer Id
+	var current_customer_points = nlapiLookupField('customer', customer_id, 'custentity_tq_points');
+	var customer_record = nlapiLoadRecord('customer', customer_id) ; 
+  
+  
+  	nlapiLogExecution('Debug' , 'Current Customer Points', current_customer_points ) ; 
+
+		var amount = nlapiGetLineItemValue('item', 'amount', '1');
+		var i = 1 
+		var order_total = 0
+		while(amount != null){
+			amount = nlapiGetLineItemValue('item','amount', i);
+			i = i + 1
+			if(amount != null)
+			order_total = parseFloat(order_total) +  parseFloat(amount); 
+		}
+
+	nlapiLogExecution('Debug' , 'order total', order_total ) ; 
+	nlapiLogExecution('Debug' , 'order status', status ) ; 
+
+	
+	
+
+	var new_customer_points = parseInt(order_total/2) ; 
+  	nlapiLogExecution('Debug' , 'New rewards points', new_customer_points ) ; 
+	nlapiLogExecution('Debug' , 'Current rewards points', current_customer_points ) ; 
+  
+    	if(current_customer_points == null || current_customer_points == 'undefined' || current_customer_points == 0  ){
+      current_customer_points = parseInt(0)
+    }
+  
+	var final_calculation = parseInt(current_customer_points) + parseInt(new_customer_points)
+    	nlapiLogExecution('Debug' , 'Final calculation', final_calculation ) ; 
+
+	customer_record.setFieldValue('custentity_tq_points', final_calculation ) ;
+     nlapiSubmitRecord(customer_record, true);   
+     current_customer_points = nlapiLookupField('customer', customer_id, 'custentity_tq_points');
+  
+	nlapiLogExecution('Debug' , 'Calculated rewards points', current_customer_points ) ; 
+
+    
+
+
+}

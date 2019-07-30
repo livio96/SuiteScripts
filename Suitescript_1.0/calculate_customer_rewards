@@ -4,7 +4,7 @@ function calculate_rewards(type){
 	var customer_id = nlapiGetFieldValue('entity') ; //Get Customer Id
 	var current_customer_points = nlapiLookupField('customer', customer_id, 'custentity_tq_points');
 	var customer_record = nlapiLoadRecord('customer', customer_id) ; 
-  
+    var customer_email = nlapiLookupField('customer', customer_id , 'email') ; 
   
   	nlapiLogExecution('Debug' , 'Current Customer Points', current_customer_points ) ; 
 
@@ -34,7 +34,38 @@ function calculate_rewards(type){
   
 	var final_calculation = parseInt(current_customer_points) + parseInt(new_customer_points)
     	nlapiLogExecution('Debug' , 'Final calculation', final_calculation ) ; 
-
+		
+  	
+  	if(final_calculation >= 250 && final_calculation < 500){
+      var emailMerger = nlapiCreateEmailMerger(1458);
+	  var mergeResult = emailMerger.merge();
+	  var body = mergeResult.getBody();
+	  var subject = mergeResult.getSubject();
+	  nlapiSendEmail(nlapiGetUser(), 'lbeqiri@telquestintl.com', subject, body, null, null, null, null);
+      nlapiLogExecution('Debug', 'Email sent: 250 - 500 points', '200-500 points') ; 
+    }
+  	else if(final_calculation >=500 && final_calculation < 750){
+      var emailMerger = nlapiCreateEmailMerger(1458);
+	  var mergeResult = emailMerger.merge();
+	  var body = mergeResult.getBody();
+	  var subject = mergeResult.getSubject();
+	  nlapiSendEmail(nlapiGetUser(), 'lbeqiri@telquestintl.com', subject, body, null, null, null, null);
+      nlapiLogExecution('Debug', 'Email sent: 500 - 750 points', '500-750 points') ; 
+    }
+  	else{
+      
+      var emailMerger = nlapiCreateEmailMerger(1458);
+	  var mergeResult = emailMerger.merge();
+	  var body = mergeResult.getBody();
+	  var subject = mergeResult.getSubject();
+	  nlapiSendEmail(nlapiGetUser(), 'lbeqiri@telquestintl.com', subject, body, null, null, null, null);
+      nlapiLogExecution('Debug', 'Email sent: 750+ points', '750+ points') ; 
+      
+    }
+  
+  
+  
+  
 	customer_record.setFieldValue('custentity_tq_points', final_calculation ) ;
      nlapiSubmitRecord(customer_record, true);   
      current_customer_points = nlapiLookupField('customer', customer_id, 'custentity_tq_points');

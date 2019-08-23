@@ -5,7 +5,14 @@ function calculate_rewards(type){
 	var current_customer_points = nlapiLookupField('customer', customer_id, 'custentity_tq_points');
 	var customer_record = nlapiLoadRecord('customer', customer_id) ; 
     var customer_email = nlapiLookupField('customer', customer_id , 'email') ; 
+	var order_origin = nlapiGetFieldValue('custbodyorder_origin') ; 
   
+    nlapiLogExecution('Debug', 'Type' , type) ; 
+  		nlapiLogExecution('Debug', 'Status', status); 
+        nlapiLogExecution('Debug', 'Order Origin' , order_origin) ; 
+
+  		if(type=='approve' && order_origin == 33) {
+
   	nlapiLogExecution('Debug' , 'Current Customer Points', current_customer_points ) ; 
 
 		var amount = nlapiGetLineItemValue('item', 'amount', '1');
@@ -72,7 +79,7 @@ function calculate_rewards(type){
   
 	nlapiLogExecution('Debug' , 'Calculated rewards points', current_customer_points ) ; 
 
-    
+        }
 
 
 }

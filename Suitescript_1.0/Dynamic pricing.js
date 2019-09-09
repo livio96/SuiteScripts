@@ -15,6 +15,10 @@ function ChangePrice() {
 		nlapiLogExecution('Debug','Logged Out price',logged_out_price) ; 
 		nlapiLogExecution('Debug','Price Checker',price_checker) ; 
 
+	      var map_price_level = nlapiGetLineItemValue('price1','price_1_',6);
+        	 if(map_price_level != null || map_price_level != 0 || map_price_level != undefined)
+       	 	nlapiSetLineItemValue('price1', 'price_1_', 11, map_price_level);
+
 
   		if(on_hand==0 && jenne_cost !=0 && jenne_quantity != 0 ) {
          	  // nlapiSetFieldValue('custitem_price_checker',logged_in_price) ; 

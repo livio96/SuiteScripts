@@ -1,42 +1,67 @@
-function recent_so_info() {
-	
+/* Suitescript 1.0 
+ * Update - Average SO Rate (custom_field)
+ * Calculates the average of 5 most recent sales orders
+ * Runs only on csv imports
+ * Created by Livio Beqiri
+ */
+function average_so_rate() {
 
-var item_id = nlapiGetRecordId(); 
+    var context = nlapiGetContext().getExecutionContext()
 
-var salesorderSearch = nlapiSearchRecord("salesorder",null,
-[
-   ["trandate","after","1/1/2018"], 
-   "AND", 
-   ["type","anyof","SalesOrd"], 
-   "AND", 
-   ["item","noneof","@NONE@"], 
-   "AND", 
-   ["item.custitem_awa_is_custom_child","is","T"], 
-   "AND", 
-   ["item.internalid","anyof",item_id]
-], 
-[
-   new nlobjSearchColumn("trandate").setSort(true), 
-   new nlobjSearchColumn("type"), 
-   new nlobjSearchColumn("quantity"), 
-   new nlobjSearchColumn("rate"), 
-   new nlobjSearchColumn("amount")
-]
-);
+    //if(context === 'csvimport'){
+    var item_id = nlapiGetRecordId();
 
+    if (item_id != null) {
+        var salesorderSearch = nlapiSearchRecord("salesorder", null,
+            [
 
-var date = salesorderSearch[0].getValue('trandate') ; 
-var quantity = salesorderSearch[0].getValue('quantity') ; 
-var rate = salesorderSearch[0].getValue('rate') ; 
+                ["item.internalid", "anyof", item_id]
+            ],
+            [
+                new nlobjSearchColumn("trandate").setSort(true),
+                //new nlobjSearchColumn("amount"), 
+                //new nlobjSearchColumn("quantity"),
+                new nlobjSearchColumn("rate")
+
+            ]
+        );
 
 
-nlapiLogExecution('Debug', 'date' date); 
-nlapiLogExecution('Debug', 'quantity' quantity); 
-nlapiLogExecution('Debug', 'rate' rate); 
+        var search_length = 0;
 
-	
+        if (salesorderSearch) {
+            if (salesorderSearch.length < 5) {
+                search_length = salesorderSearch.length;
+            } else
+                search_length = 5;
 
+            //nlapiLogExecution("Debug", "length", search_length);
 
+            var sum = 0;
+            var rate = 0;
+            //This is equal to search length - excluded lines
+         	var final_length = 0; 
+            for (var i = 0; i < search_length; i++) {
+                rate = salesorderSearch[i].getValue("rate");
+                if (rate > 0) {
+                  	final_length = final_length + 1; 
+                   nlapiLogExecution("Debug", "Value ", rate);
+                    sum += parseFloat(rate);
+                }
 
+            }
+        }
+
+        if (search_length > 0) {
+            var final_rate = Math.round(parseFloat(sum / final_length));
+
+            nlapiLogExecution("Debug", "rate", final_rate);
+
+            nlapiSetFieldValue("custitem_so_rate", final_rate);
+        }
+
+         }
+
+   //}
 
 }

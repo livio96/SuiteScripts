@@ -1,5 +1,3 @@
-them within the sealed function.
-
 /**
  *@NApiVersion 2.x
  *@NScriptType UserEventScript

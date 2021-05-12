@@ -10,7 +10,7 @@ function(search,file) {
 	//Load saved search
     function execute(scriptContext) {
     	var mySearch = search.load({
-    		id: '379271'
+    		id: '379598'
     	})
     	
 		//Run saved search
@@ -35,9 +35,14 @@ function(search,file) {
          				summary: "GROUP",
         				 label: "Item"
 				})
+                         var price = resultObject.getValue({
+						 name: "formulatext",
+         				 formula: "case when {custrecord_bbl_update_brokerbin_price} is not null then TO_CHAR({custrecord_bbl_update_brokerbin_price}) else 'Call' end",
+        			    label: "Price"
+      })
 				
 				//Add each result as a new line on CSV
-				csvFile += internalid+','+itemid+'\r\n'				
+				csvFile += internalid+','+price+'\r\n'				
               return true;
 				
 			}
@@ -48,7 +53,7 @@ function(search,file) {
 		//Creation of file
     		var fileObj = file.create({
 			//To make each file unique and avoid overwriting, append date on the title
-			name: 'UpdateWebsiteQuantities.csv',
+			name: 'BrokerbinListings.csv',
 			fileType: file.Type.CSV,
 			contents: csvFile,
 			description: 'This is a CSV file.',

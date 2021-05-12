@@ -74,46 +74,62 @@ define(['N/search', 'N/record', 'N/runtime', 'N/file', 'N/format', 'N/log'],
                         var customer_old_credit_limit = customer_rec.getValue({
                             fieldId: 'creditlimit'
                         });
-                      
-                      
-                      
-                       var euler_hermes_exception = customer_rec.getValue({
+                        var current_customer_terms = customer_rec.getValue({
+                            fieldId: 'terms'
+                        })
+
+
+
+                        var euler_hermes_exception = customer_rec.getValue({
                             fieldId: 'custentity_eh_exception'
                         });
 
                         //update cust record only if it is not a euler hermes exception
-                      	if(euler_hermes_exception != true){
-                        newRecord.setValue({
-                            fieldId: 'custrecord_customer_old_credit_limit',
-                            value: customer_old_credit_limit
-                        });
+                        if (euler_hermes_exception != true) {
+                            newRecord.setValue({
+                                fieldId: 'custrecord_customer_old_credit_limit',
+                                value: customer_old_credit_limit
+                            });
 
-                        if (credit_limit > 0)
+                            if (credit_limit > 0) {
+                                customer_rec.setValue({
+                                    fieldId: 'creditlimit',
+                                    value: credit_limit
+                                });
+                                //if current customer terms are blank, set customer terms to net 30 - otherwise skip
+                                if (current_customer_terms == '' || current_customer_terms == null) {
+                                    customer_rec.setValue({
+                                        fieldId: 'terms',
+                                        value: 2
+                                    });
+                                }
+                            }
+                            if (credit_limit == 0 || credit_limit == '') {
+                                customer_rec.setValue({
+                                    fieldId: 'creditlimit',
+                                    value: ''
+                                });
+                                customer_rec.setValue({
+                                    fieldId: 'terms',
+                                    value: ''
+                                });
+                            }
+
                             customer_rec.setValue({
-                                fieldId: 'creditlimit',
+                                fieldId: 'custentity_eh_credit_limit',
                                 value: credit_limit
                             });
-							if (credit_limit == 0)
-                            customer_rec.setValue({
-                                fieldId: 'creditlimit',
-                                value: ''
+
+                            customer_rec.save({
+                                enableSourcing: true,
+                                ignoreMandatoryFields: true
                             });
 
-                        customer_rec.setValue({
-                            fieldId: 'custentity_eh_credit_limit',
-                            value: credit_limit
-                        });
-
-                        customer_rec.save({
-                            enableSourcing: true,
-                            ignoreMandatoryFields: true
-                        });
-
-                        if (customer_old_credit_limit != credit_limit)
-                            newRecord.setValue({
-                                fieldId: 'custrecord_cust_rec_update',
-                                value: true
-                            });
+                            if (customer_old_credit_limit != credit_limit)
+                                newRecord.setValue({
+                                    fieldId: 'custrecord_cust_rec_update',
+                                    value: true
+                                });
                         }
                     }
                     // if no search results
@@ -153,12 +169,12 @@ define(['N/search', 'N/record', 'N/runtime', 'N/file', 'N/format', 'N/log'],
                                 var current_cust_eh_id = customer_rec.getValue({
                                     fieldId: 'custentity_eh_id'
                                 });
-                              
-                              var exception = customer_rec.getValue({
+
+                                var exception = customer_rec.getValue({
                                     fieldId: 'custentity_eh_exception'
                                 });
 
-                                
+
                                 if (current_cust_eh_id == '' || current_cust_eh_id == null) {
 
                                     customer_rec.setValue({
@@ -172,6 +188,9 @@ define(['N/search', 'N/record', 'N/runtime', 'N/file', 'N/format', 'N/log'],
                                     var customer_old_credit_limit = customer_rec.getValue({
                                         fieldId: 'creditlimit'
                                     });
+                                    var current_customer_terms = customer_rec.getValue({
+                                        fieldId: 'terms'
+                                    });
 
                                     newRecord.setValue({
                                         fieldId: 'custrecord_customer_old_credit_limit',
@@ -179,44 +198,58 @@ define(['N/search', 'N/record', 'N/runtime', 'N/file', 'N/format', 'N/log'],
                                     });
 
                                     //update customer record only if its not an exception
-                                    if(exception != true){
-                                      
-                                    if(current_cust_eh_id == null || current_cust_eh_id == '')
-                                    customer_rec.setValue({
-                                        fieldId: 'custentity_eh_id',
-                                        value: euler_hermes_id
-                                    });
-                                      
-                                    if (credit_limit > 0)
-                                        customer_rec.setValue({
-                                            fieldId: 'creditlimit',
-                                            value: credit_limit
+                                    if (exception != true) {
+
+                                        if (current_cust_eh_id == null || current_cust_eh_id == '')
+                                            customer_rec.setValue({
+                                                fieldId: 'custentity_eh_id',
+                                                value: euler_hermes_id
+                                            });
+
+                                        if (credit_limit > 0) {
+                                            customer_rec.setValue({
+                                                fieldId: 'creditlimit',
+                                                value: credit_limit
+                                            });
+                                            //only if customer terms are blank, set customer terms to net 30
+                                            if (current_customer_terms == '' || current_customer_terms == null) {
+                                                customer_rec.setValue({
+                                                    fieldId: 'terms',
+                                                    value: 2
+                                                });
+
+                                            }
+                                        }
+
+                                        if (credit_limit == 0 || credit_limit == '') {
+                                            customer_rec.setValue({
+                                                fieldId: 'creditlimit',
+                                                value: ''
+                                            });
+                                            customer_rec.setValue({
+                                                fieldId: 'terms',
+                                                value: ''
+                                            });
+                                        }
+
+
+                                        customer_rec.save({
+                                            enableSourcing: true,
+                                            ignoreMandatoryFields: true
                                         });
 
-                             if (credit_limit == 0)
-                            customer_rec.setValue({
-                                fieldId: 'creditlimit',
-                                value: ''
-                            });
-                                      
-                                      
-                                    customer_rec.save({
-                                        enableSourcing: true,
-                                        ignoreMandatoryFields: true
-                                    });
+                                        if (customer_old_credit_limit != credit_limit)
+                                            newRecord.setValue({
+                                                fieldId: 'custrecord_cust_rec_update',
+                                                value: true
+                                            });
 
-                                    if (customer_old_credit_limit != credit_limit)
                                         newRecord.setValue({
-                                            fieldId: 'custrecord_cust_rec_update',
-                                            value: true
+                                            fieldId: 'custrecord_ns_customer',
+                                            value: cust_id
                                         });
 
-                                    newRecord.setValue({
-                                        fieldId: 'custrecord_ns_customer',
-                                        value: cust_id
-                                    });
-
-                                }
+                                    }
                                 }
                             }
                         }
@@ -225,7 +258,7 @@ define(['N/search', 'N/record', 'N/runtime', 'N/file', 'N/format', 'N/log'],
 
 
             }
-        
+
 
         }
         return {

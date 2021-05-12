@@ -10,7 +10,7 @@ define(['N/render','N/search', 'N/record', 'N/email', 'N/runtime','N/file','N/ta
 				var script = runtime.getCurrentScript();
 				
 				var RemoveCustomerAddressSearch = search.load({
-					id: 'customsearch_remove_customer_address'
+					id: 'customsearch_remove_customer_address_2'
 				});
 				
 				var searchid = 0;

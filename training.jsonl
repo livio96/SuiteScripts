@@ -1,0 +1,21 @@
+{"prompt": "<I am writing an official doc and i want the bullet points below with their content be converted into a text with sizable paragraphs , like the examples below: 
+
+bullet points :
+•	Initiative Title: Programmatically detecting 0% discounts (or no discounts) in CuPPA on service/payer level
+•	Reason Code: Discounting and Contract Intake
+•	Initiative Owner: CDI
+•	BPS Addressed: 7
+•	BPS pro-rata: YES
+•	BPS calculation/estimate: In Q4 2022, PBX in collaboration with the Operational teams have identified 2.35 bps in defects related to operational teams not detecting 0% or no discounts at service/payer level. 
+•	Current Process: the initiative mentioned above is not part of CDI’s programmatic controls process.
+•	Future State Process: The initiative owner, Contract Ops, will add 2 new queries to their programmatic error detection tool that captures CuPPA contracts with either 0% discounts or missing discounts entirely. 
+Action Plan: CDI audit team to create the new SQL queries and add them to the existing error detection tool (logic)
+
+official text:>", "completion": "<This initiative, named "Programmatically detecting 0% discounts (or no discounts) in CuPPA on service/payer level", is aimed at addressing Reason Code 'Discounting and Contract Intake' and is owned by CDI. 
+The initiative is intended to address 7 BPS of billing defects by identifying and addressing issues related to operational teams not detecting 0% or no discounts at service/payer level. 
+To provide an estimate for the BPS, data from Q4 2022 was analyzed to identify 2.35 BPS, with this number then extrapolated to a pro-rata basis by multiplying it by 3 to account for the three quarters of data being analyzed (Q2-Q4 2022).
+
+Currently, this initiative is not part of CDI’s programmatic controls process. To rectify this, the initiative owner, Contract Ops, will add two new queries to their programmatic error detection tool that captures CuPPA contracts with either 0% discounts or missing discounts entirely. 
+
+To ensure the successful implementation of this initiative, the action plan includes the CDI audit team creating the new SQL queries and adding them to the existing error detection tool logic. 
+To ensure the initiative progresses, PBX, Contract Ops and CDI are meeting on a weekly basis.>"}

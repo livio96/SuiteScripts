@@ -8,7 +8,7 @@
      function UPS_Tracking_Status(context) {
          try {
            
-             var api_key = '4DAA2104CBB8D475'; 
+             var api_key = ''; 
             
              //Run a search 
 

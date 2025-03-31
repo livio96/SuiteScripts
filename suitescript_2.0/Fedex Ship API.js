@@ -7,21 +7,18 @@ define([
     'N/https',
     'N/encode',
     'N/file',
-    'N/log'
-], function(serverWidget, https, encode, file, log) {
+    'N/log',
+    'N/record'
+], function(serverWidget, https, encode, file, log, record) {
 
     function onRequest(context) {
         log.debug('onRequest START', 'Method: ' + context.request.method);
 
         if (context.request.method === 'GET') {
             // Display form for the user to enter weight
-            log.debug('GET request', 'Displaying form to user');
-
             var form = serverWidget.createForm({ title: 'Create FedEx Label' });
             var rmaId = context.request.parameters.rmaId || '';
             
-            log.debug('RMA ID (GET)', rmaId);
-
             var hiddenRmaField = form.addField({
                 id: 'custpage_rmaid',
                 type: serverWidget.FieldType.TEXT,
@@ -39,62 +36,63 @@ define([
 
             form.addSubmitButton({ label: 'Create Label' });
             context.response.writePage(form);
-
-            log.debug('GET request', 'Form displayed');
         } 
         else {
             // Handle POST request
-            log.debug('POST request', 'Handling label creation');
-
             var request = context.request;
             var rmaId = request.parameters.custpage_rmaid || '';
             var totalWeight = parseFloat(request.parameters.custpage_weight) || 1;
 
-            log.debug('POST data', 'RMA ID: ' + rmaId + ' | totalWeight: ' + totalWeight);
+            // Load the RMA record (Return Authorization) and extract the Bill-To address
+            var rmaRecord = record.load({
+    type: 'returnauthorization',
+    id: rmaId
+});
+
+            
+            // Assuming the billing address is stored as a subrecord with fieldId 'billingaddress'
+            var billingAddress = rmaRecord.getSubrecord({ fieldId: 'billingaddress' });
+            var billAddr1    = billingAddress.getValue({ fieldId: 'addr1' });
+            var billAddr2    = billingAddress.getValue({ fieldId: 'addr2' });
+            var billCity     = billingAddress.getValue({ fieldId: 'city' });
+            var billState    = billingAddress.getValue({ fieldId: 'state' });
+            var billZip      = billingAddress.getValue({ fieldId: 'zip' });
+            var billCountry  = billingAddress.getValue({ fieldId: 'country' });
 
             try {
                 // Obtain FedEx OAuth token
-                log.debug('FedEx OAuth', 'Requesting token...');
                 var token = getFedExOAuthToken(
                     '', 
                     '767cfc1e6cb84c6abe54b7ca61e4398f'
                 );
-                log.debug('FedEx OAuth token retrieved', token);
 
-                // Create shipment and obtain Base64 PDF label
-                log.debug('FedEx Shipment', 'Creating shipment...');
+                // Create shipment and pass along the Bill-To address for the shipper block
                 var labelPdfBase64 = createFedExShipmentAndGetLabel({
                     token: token,
-                    weight: totalWeight
+                    weight: totalWeight,
+                    billAddress: {
+                        addr1: billAddr1,
+                        addr2: billAddr2,
+                        city: billCity,
+                        state: billState,
+                        zip: billZip,
+                        country: billCountry
+                    }
                 });
 
-                var base64Length = labelPdfBase64 ? labelPdfBase64.length : 'null';
-                log.debug('FedEx Shipment', 'Label received (base64 length: ' + base64Length + ')');
-
-                // Return PDF inline if present
                 if (labelPdfBase64) {
-                    log.debug('Label base64 (snippet)', labelPdfBase64.substring(0, 200));
-
-                    // ***IMPORTANT***: Do NOT decode base64. NetSuite expects
-                    // base64 for a PDF file's `contents`.
-
                     var fileObj = file.create({
                         name: 'FedExLabel_' + rmaId + '.pdf',
                         fileType: file.Type.PDF,
                         contents: labelPdfBase64,  // keep it as base64
-                        folder: -15 // temp folder (not in file cabinet)
+                        folder: -15
                     });
 
-                    log.debug('File object created', 
-                        'File name: ' + fileObj.name + ' | size: ' + fileObj.size);
-
-                    // Return inline to the user's browser
+                    // Return inline PDF to the user
                     context.response.writeFile({
                         file: fileObj,
                         isInline: true
                     });
-
-                    log.debug('Response', 'PDF returned inline to user');
                 } else {
                     log.error('Label creation error', 'No label base64 returned');
                     context.response.write('Error creating FedEx label. Check logs for details.');
@@ -123,17 +121,12 @@ define([
             'Accept': 'application/json'
         };
 
-        log.debug('getFedExOAuthToken', 'Sending token request to ' + tokenUrl);
-
         var response = https.request({
             method: https.Method.POST,
             url: tokenUrl,
             body: requestBodyObj,
             headers: headers
         });
-
-        log.debug('FedEx token response code', response.code);
-        log.debug('FedEx token response body', response.body);
 
         if (response.code !== 200) {
             throw 'FedEx OAuth Error (code ' + response.code + '): ' + response.body;
@@ -149,29 +142,30 @@ define([
     function createFedExShipmentAndGetLabel(params) {
         var token = params.token;
         var weight = params.weight;
+        var billAddress = params.billAddress;
 
-        // Hard-coded date for demo
+        // Hard-coded ship date for demo
         var shipDatestamp = "2025-04-04";
 
-        // Build FedEx ship payload
+        // Build FedEx shipment payload with dynamic Bill-To (From) address
         var payload = {
             "labelResponseOptions": "LABEL",
             "requestedShipment": {
                 "shipper": {
                     "contact": {
-                        "personName": "Revelry",
-                        "phoneNumber": "2106831933",
-                        "companyName": ""
+                        "personName": "Bill To Contact",  // Adjust if you have a dynamic contact name
+                        "phoneNumber": "2106831933",       // Could be dynamic if needed
+                        "companyName": ""                  // Adjust if required
                     },
                     "address": {
                         "streetLines": [
-                            "8136 Industry Way",
-                            "Suite 500"
+                            billAddress.addr1,
+                            billAddress.addr2
                         ],
-                        "city": "Texas",
-                        "stateOrProvinceCode": "TX",
-                        "postalCode": "78744",
-                        "countryCode": "US"
+                        "city": billAddress.city,
+                        "stateOrProvinceCode": billAddress.state,
+                        "postalCode": billAddress.zip,
+                        "countryCode": billAddress.country
                     }
                 },
                 "origin": {
@@ -194,18 +188,18 @@ define([
                 "recipients": [
                     {
                         "contact": {
-                            "personName": "Mariusz Stefaniak",
+                            "personName": "Livio Beqiri",
                             "phoneNumber": "4382200400",
                             "companyName": ""
                         },
                         "address": {
                             "streetLines": [
-                                "111 E Cesar Chavez St",
+                                "123 Main Ave",
                                 ""
                             ],
-                            "city": "Austin",
-                            "stateOrProvinceCode": "TX",
-                            "postalCode": "78701",
+                            "city": "Montclair",
+                            "stateOrProvinceCode": "NJ",
+                            "postalCode": "07042",
                             "countryCode": "US"
                         }
                     }
@@ -222,7 +216,6 @@ define([
                 "shippingChargesPayment": {
                     "paymentType": "SENDER"
                 },
-                // Requesting PDF label
                 "labelSpecification": {
                     "imageType": "PDF",
                     "labelStockType": "PAPER_4X6"
@@ -254,8 +247,6 @@ define([
             'Authorization': 'Bearer ' + token
         };
 
-        log.debug('createFedExShipmentAndGetLabel', 'Sending createShipment request to FedEx');
-
         var response = https.request({
             method: https.Method.POST,
             url: url,
@@ -263,20 +254,10 @@ define([
             body: JSON.stringify(payload)
         });
 
-        log.debug('createShipment response code', response.code);
-        log.debug('createShipment response body', response.body);
-
         if (response.code === 200 || response.code === 201) {
             var respBody = JSON.parse(response.body);
             try {
-                // Grab the Base64 PDF from "encodedLabel" (NOT "content")
-                var labelBase64 = respBody.output
-                    .transactionShipments[0]
-                    .pieceResponses[0]
-                    .packageDocuments[0]
-                    .encodedLabel;
-                
-                log.debug('Label extraction successful', 'Base64 length: ' + labelBase64.length);
+                var labelBase64 = respBody.output.transactionShipments[0].pieceResponses[0].packageDocuments[0].encodedLabel;
                 return labelBase64;
             } catch (e) {
                 log.error('Error extracting label PDF', e);

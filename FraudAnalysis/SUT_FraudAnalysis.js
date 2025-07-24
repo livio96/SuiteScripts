@@ -289,47 +289,190 @@ RECOMMENDATION: Manual review required due to system unavailability.`;
     /**
      * Extract comprehensive sales order data for analysis
      */
-    function getSalesOrderData(salesOrderId) {
+/**
+ * Extract comprehensive sales order data for analysis - FIXED VERSION
+ */
+function getSalesOrderData(salesOrderId) {
+    try {
         const salesOrder = record.load({
             type: record.Type.SALES_ORDER,
             id: salesOrderId
         });
 
+        // Initialize order data
         const orderData = {
             orderNumber: salesOrder.getValue('tranid'),
             orderDate: salesOrder.getValue('trandate'),
             customerId: salesOrder.getValue('entity'),
             customerName: salesOrder.getText('entity'),
             total: salesOrder.getValue('total'),
-            currency: salesOrder.getText('currency'),
-            status: salesOrder.getText('orderstatus'),
+            currency: salesOrder.getText('currency') || salesOrder.getValue('currency'),
+            status: salesOrder.getText('orderstatus') || salesOrder.getValue('orderstatus'),
             
-            // Customer address information
-            billingAddress: {
-                addressee: salesOrder.getValue('billaddresslist') ? salesOrder.getText('billaddresslist') : '',
-                address1: salesOrder.getValue('billaddr1') || '',
-                city: salesOrder.getValue('billcity') || '',
-                state: salesOrder.getValue('billstate') || '',
-                zip: salesOrder.getValue('billzip') || '',
-                country: salesOrder.getValue('billcountry') || ''
-            },
-            
-            shippingAddress: {
-                addressee: salesOrder.getValue('shipaddresslist') ? salesOrder.getText('shipaddresslist') : '',
-                address1: salesOrder.getValue('shipaddr1') || '',
-                city: salesOrder.getValue('shipcity') || '',
-                state: salesOrder.getValue('shipstate') || '',
-                zip: salesOrder.getValue('shipzip') || '',
-                country: salesOrder.getValue('shipcountry') || ''
-            },
+            // Initialize address objects
+            billingAddress: {},
+            shippingAddress: {},
             
             // Payment and shipping info
-            paymentTerms: salesOrder.getText('terms') || '',
-            shippingMethod: salesOrder.getText('shipmethod') || '',
+            paymentTerms: salesOrder.getText('terms') || salesOrder.getValue('terms') || '',
+            shippingMethod: salesOrder.getText('shipmethod') || salesOrder.getValue('shipmethod') || '',
             
             // Line items
             lineItems: []
         };
+
+        // Get payment method from the sales order
+        try {
+            // Try to get payment method
+            orderData.paymentMethod = salesOrder.getText('paymentmethod') || salesOrder.getValue('paymentmethod') || '';
+            
+            // Try to get credit card info (last 4 digits only for security)
+            const ccNumber = salesOrder.getValue('ccnumber') || '';
+            if (ccNumber) {
+                orderData.paymentMethod += ' (****' + ccNumber.slice(-4) + ')';
+            }
+        } catch (e) {
+            log.debug('Payment method not available', e.toString());
+            orderData.paymentMethod = 'N/A';
+        }
+
+        // Get billing address - Method 1: Try subrecord approach
+        try {
+            const billingAddressSubrecord = salesOrder.getSubrecord({
+                fieldId: 'billingaddress'
+            });
+            
+            if (billingAddressSubrecord) {
+                orderData.billingAddress = {
+                    attention: billingAddressSubrecord.getValue('attention') || '',
+                    addressee: billingAddressSubrecord.getValue('addressee') || '',
+                    address1: billingAddressSubrecord.getValue('addr1') || '',
+                    address2: billingAddressSubrecord.getValue('addr2') || '',
+                    city: billingAddressSubrecord.getValue('city') || '',
+                    state: billingAddressSubrecord.getValue('state') || '',
+                    zip: billingAddressSubrecord.getValue('zip') || '',
+                    country: billingAddressSubrecord.getValue('country') || ''
+                };
+            }
+        } catch (e) {
+            log.debug('Billing subrecord method failed', e.toString());
+            
+            // Method 2: Try field-based approach
+            try {
+                orderData.billingAddress = {
+                    attention: salesOrder.getValue('billattention') || '',
+                    addressee: salesOrder.getValue('billaddressee') || '',
+                    address1: salesOrder.getValue('billaddr1') || '',
+                    address2: salesOrder.getValue('billaddr2') || '',
+                    city: salesOrder.getValue('billcity') || '',
+                    state: salesOrder.getValue('billstate') || '',
+                    zip: salesOrder.getValue('billzip') || '',
+                    country: salesOrder.getValue('billcountry') || ''
+                };
+                
+                // If no addr1, try to get the full address text
+                if (!orderData.billingAddress.address1) {
+                    const billAddressText = salesOrder.getValue('billaddress');
+                    if (billAddressText) {
+                        // Parse the address text (it's usually multiline)
+                        const addressLines = billAddressText.split('\n').filter(line => line.trim());
+                        if (addressLines.length > 0) {
+                            orderData.billingAddress.addressee = addressLines[0] || '';
+                            orderData.billingAddress.address1 = addressLines[1] || '';
+                            orderData.billingAddress.address2 = addressLines[2] || '';
+                            // Last line often contains city, state, zip
+                            if (addressLines.length > 3) {
+                                const lastLine = addressLines[addressLines.length - 1];
+                                const cityStateZip = lastLine.match(/^(.+?),\s*([A-Z]{2})\s+(\d{5}(?:-\d{4})?)$/);
+                                if (cityStateZip) {
+                                    orderData.billingAddress.city = cityStateZip[1];
+                                    orderData.billingAddress.state = cityStateZip[2];
+                                    orderData.billingAddress.zip = cityStateZip[3];
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (e2) {
+                log.debug('Billing field method failed', e2.toString());
+                orderData.billingAddress = {
+                    address1: 'Unable to retrieve billing address',
+                    city: '',
+                    state: '',
+                    zip: '',
+                    country: ''
+                };
+            }
+        }
+
+        // Get shipping address - Method 1: Try subrecord approach
+        try {
+            const shippingAddressSubrecord = salesOrder.getSubrecord({
+                fieldId: 'shippingaddress'
+            });
+            
+            if (shippingAddressSubrecord) {
+                orderData.shippingAddress = {
+                    attention: shippingAddressSubrecord.getValue('attention') || '',
+                    addressee: shippingAddressSubrecord.getValue('addressee') || '',
+                    address1: shippingAddressSubrecord.getValue('addr1') || '',
+                    address2: shippingAddressSubrecord.getValue('addr2') || '',
+                    city: shippingAddressSubrecord.getValue('city') || '',
+                    state: shippingAddressSubrecord.getValue('state') || '',
+                    zip: shippingAddressSubrecord.getValue('zip') || '',
+                    country: shippingAddressSubrecord.getValue('country') || ''
+                };
+            }
+        } catch (e) {
+            log.debug('Shipping subrecord method failed', e.toString());
+            
+            // Method 2: Try field-based approach
+            try {
+                orderData.shippingAddress = {
+                    attention: salesOrder.getValue('shipattention') || '',
+                    addressee: salesOrder.getValue('shipaddressee') || '',
+                    address1: salesOrder.getValue('shipaddr1') || '',
+                    address2: salesOrder.getValue('shipaddr2') || '',
+                    city: salesOrder.getValue('shipcity') || '',
+                    state: salesOrder.getValue('shipstate') || '',
+                    zip: salesOrder.getValue('shipzip') || '',
+                    country: salesOrder.getValue('shipcountry') || ''
+                };
+                
+                // If no addr1, try to get the full address text
+                if (!orderData.shippingAddress.address1) {
+                    const shipAddressText = salesOrder.getValue('shipaddress');
+                    if (shipAddressText) {
+                        // Parse the address text
+                        const addressLines = shipAddressText.split('\n').filter(line => line.trim());
+                        if (addressLines.length > 0) {
+                            orderData.shippingAddress.addressee = addressLines[0] || '';
+                            orderData.shippingAddress.address1 = addressLines[1] || '';
+                            orderData.shippingAddress.address2 = addressLines[2] || '';
+                            // Last line often contains city, state, zip
+                            if (addressLines.length > 3) {
+                                const lastLine = addressLines[addressLines.length - 1];
+                                const cityStateZip = lastLine.match(/^(.+?),\s*([A-Z]{2})\s+(\d{5}(?:-\d{4})?)$/);
+                                if (cityStateZip) {
+                                    orderData.shippingAddress.city = cityStateZip[1];
+                                    orderData.shippingAddress.state = cityStateZip[2];
+                                    orderData.shippingAddress.zip = cityStateZip[3];
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (e2) {
+                log.debug('Shipping field method failed', e2.toString());
+                orderData.shippingAddress = {
+                    address1: 'Unable to retrieve shipping address',
+                    city: '',
+                    state: '',
+                    zip: '',
+                    country: ''
+                };
+            }
+        }
 
         // Get line items
         const lineCount = salesOrder.getLineCount('item');
@@ -342,28 +485,91 @@ RECOMMENDATION: Manual review required due to system unavailability.`;
             });
         }
 
-        // Try to get customer additional info
-        try {
-            const customer = record.load({
-                type: record.Type.CUSTOMER,
-                id: orderData.customerId
-            });
-            
-            orderData.customerInfo = {
-                dateCreated: customer.getValue('datecreated'),
-                email: customer.getValue('email'),
-                phone: customer.getValue('phone'),
-                creditLimit: customer.getValue('creditlimit'),
-                terms: customer.getText('terms')
-            };
-        } catch (error) {
-            log.debug('Could not load customer details', error.toString());
-            orderData.customerInfo = {};
+        // Get customer additional info with better error handling
+        orderData.customerInfo = {};
+        if (orderData.customerId) {
+            try {
+                const customer = record.load({
+                    type: record.Type.CUSTOMER,
+                    id: orderData.customerId
+                });
+                
+                // Get all possible customer fields with fallbacks
+                orderData.customerInfo = {
+                    dateCreated: customer.getValue('datecreated'),
+                    email: customer.getValue('email') || '',
+                    phone: customer.getValue('phone') || customer.getValue('phoneticname') || '',
+                    altPhone: customer.getValue('altphone') || '',
+                    fax: customer.getValue('fax') || '',
+                    creditLimit: customer.getValue('creditlimit') || 0,
+                    balance: customer.getValue('balance') || 0,
+                    terms: customer.getText('terms') || customer.getValue('terms') || '',
+                    isPerson: customer.getValue('isperson'),
+                    firstName: customer.getValue('firstname') || '',
+                    lastName: customer.getValue('lastname') || '',
+                    companyName: customer.getValue('companyname') || '',
+                    category: customer.getText('category') || '',
+                    salesRep: customer.getText('salesrep') || ''
+                };
+                
+                // If email is still empty, try alternate email field
+                if (!orderData.customerInfo.email) {
+                    orderData.customerInfo.email = customer.getValue('altemail') || '';
+                }
+                
+                // Get primary contact if available
+                try {
+                    const contactId = customer.getValue('primarycontact');
+                    if (contactId) {
+                        const contact = record.load({
+                            type: record.Type.CONTACT,
+                            id: contactId
+                        });
+                        
+                        orderData.customerInfo.contactName = contact.getValue('entityid') || '';
+                        orderData.customerInfo.contactEmail = contact.getValue('email') || orderData.customerInfo.email;
+                        orderData.customerInfo.contactPhone = contact.getValue('phone') || orderData.customerInfo.phone;
+                    }
+                } catch (contactError) {
+                    log.debug('Could not load primary contact', contactError.toString());
+                }
+                
+            } catch (error) {
+                log.error('Could not load customer details', {
+                    customerId: orderData.customerId,
+                    error: error.toString()
+                });
+            }
         }
 
-        return orderData;
-    }
+        // Get order-level email and phone if not found in customer
+        if (!orderData.customerInfo.email) {
+            orderData.customerInfo.email = salesOrder.getValue('email') || 'N/A';
+        }
+        if (!orderData.customerInfo.phone) {
+            orderData.customerInfo.phone = salesOrder.getValue('phone') || 'N/A';
+        }
 
+        // Log what we found for debugging
+        log.debug('Extracted Order Data', {
+            orderNumber: orderData.orderNumber,
+            hasEmail: !!orderData.customerInfo.email,
+            hasPhone: !!orderData.customerInfo.phone,
+            hasBillingAddress: !!orderData.billingAddress.address1,
+            hasShippingAddress: !!orderData.shippingAddress.address1,
+            paymentMethod: orderData.paymentMethod
+        });
+
+        return orderData;
+        
+    } catch (error) {
+        log.error('Error in getSalesOrderData', {
+            error: error.toString(),
+            salesOrderId: salesOrderId
+        });
+        throw error;
+    }
+}
     /**
      * Call OpenRouter API for fraud analysis
      */
@@ -623,6 +829,9 @@ function cleanTextForPdf(text) {
 /**
  * Generate PDF report with fraud analysis results - IMPROVED VERSION
  */
+/**
+ * Generate PDF report with fraud analysis results - IMPROVED VERSION
+ */
 function generateFraudAnalysisPDF(orderData, analysisResult) {
     try {
         log.debug('PDF Generation Start', {
@@ -735,6 +944,7 @@ function generateFraudAnalysisPDF(orderData, analysisResult) {
             
             // Payment and shipping
             paymentTerms: escapeXml(orderData.paymentTerms || 'N/A'),
+            paymentMethod: escapeXml(orderData.paymentMethod || 'N/A'),
             shippingMethod: escapeXml(orderData.shippingMethod || 'N/A'),
             
             // Format the analysis
@@ -882,6 +1092,10 @@ function generateFraudAnalysisPDF(orderData, analysisResult) {
                     <td>${templateData.paymentTerms}</td>
                 </tr>
                 <tr>
+                    <td>Payment Method</td>
+                    <td>${templateData.paymentMethod}</td>
+                </tr>
+                <tr>
                     <td>Shipping Method</td>
                     <td>${templateData.shippingMethod}</td>
                 </tr>
@@ -999,7 +1213,6 @@ function generateFraudAnalysisPDF(orderData, analysisResult) {
         return errorPdf;
     }
 }
-
     /**
      * Create error response page
      */

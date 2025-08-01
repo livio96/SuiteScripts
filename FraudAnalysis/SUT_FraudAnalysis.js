@@ -10,8 +10,8 @@ define(['N/ui/serverWidget', 'N/https', 'N/file', 'N/record', 'N/log', 'N/render
         // Configuration - Replace with your actual OpenRouter API key
         const OPENROUTER_API_KEY = '';
         const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
-        //const MODEL_NAME = 'deepseek/deepseek-r1:free';
-        const MODEL_NAME = 'anthropic/claude-sonnet-4'
+        const MODEL_NAME = 'deepseek/deepseek-r1:free';
+        //const MODEL_NAME = 'anthropic/claude-sonnet-4'
 
         function onRequest(context) {
             try {
@@ -125,6 +125,23 @@ define(['N/ui/serverWidget', 'N/https', 'N/file', 'N/record', 'N/log', 'N/render
                 });
             }
 
+            // Add analysis parameters section
+            const analysisParams = form.addFieldGroup({
+                id: 'custpage_analysis_params',
+                label: 'Analysis Parameters'
+            });
+
+            // Add IP Address field (optional)
+            const ipAddressField = form.addField({
+                id: 'custpage_ip_address',
+                type: serverWidget.FieldType.TEXT,
+                label: 'Customer IP Address (Optional)',
+                container: 'custpage_analysis_params'
+            });
+            ipAddressField.setHelpText({
+                help: 'Enter the customer\'s IP address if available. This will be included in the fraud analysis. Leave blank if not available.'
+            });
+
             // Add instructions
             const instructionField = form.addField({
                 id: 'custpage_instructions',
@@ -134,7 +151,8 @@ define(['N/ui/serverWidget', 'N/https', 'N/file', 'N/record', 'N/log', 'N/render
             instructionField.defaultValue = '<div style="background-color: #f0f8ff; padding: 10px; border: 1px solid #ccc; margin: 10px 0;">' +
                 '<strong>Fraud Analysis Tool</strong><br/>' +
                 'Click the button below to perform an AI-powered fraud risk analysis on this sales order. ' +
-                'The system will analyze customer data, order patterns, and other risk factors to generate a comprehensive report.' +
+                'The system will analyze customer data, order patterns, and other risk factors to generate a comprehensive report.<br/><br/>' +
+                '<strong>Note:</strong> IP address is optional but recommended for enhanced geolocation analysis.' +
                 '</div>';
 
             // Add submit button
@@ -150,20 +168,29 @@ define(['N/ui/serverWidget', 'N/https', 'N/file', 'N/record', 'N/log', 'N/render
          */
         function performFraudAnalysis(context) {
             const salesOrderId = context.request.parameters.custpage_order_id;
+            const ipAddress = context.request.parameters.custpage_ip_address || ''; // Get IP address from form
 
             if (!salesOrderId) {
                 return createErrorResponse(context, 'Missing sales order ID');
             }
 
             try {
-                log.debug('Starting fraud analysis', 'Sales Order ID: ' + salesOrderId);
+                log.debug('Starting fraud analysis', {
+                    salesOrderId: salesOrderId,
+                    ipAddress: ipAddress || 'Not provided'
+                });
 
                 // Load sales order data
                 const orderData = getSalesOrderData(salesOrderId);
+                
+                // Add IP address to order data
+                orderData.ipAddress = ipAddress;
+                
                 log.debug('Order data loaded', {
                     orderNumber: orderData.orderNumber,
                     customerName: orderData.customerName,
-                    total: orderData.total
+                    total: orderData.total,
+                    ipAddress: orderData.ipAddress || 'N/A'
                 });
 
                 // Perform AI analysis
@@ -215,6 +242,8 @@ define(['N/ui/serverWidget', 'N/https', 'N/file', 'N/record', 'N/log', 'N/render
          * Create fallback analysis when API fails
          */
         function createFallbackAnalysis(orderData) {
+            const ipInfo = orderData.ipAddress ? `\n- IP Address: ${orderData.ipAddress}` : '';
+            
             return `AUTOMATED FRAUD ANALYSIS UNAVAILABLE
 
 The AI fraud analysis service did not return results. Manual review required.
@@ -223,7 +252,7 @@ Order Summary:
 - Order Number: ${orderData.orderNumber || 'N/A'}
 - Customer: ${orderData.customerName || 'N/A'}
 - Amount: ${orderData.currency || '$'}${orderData.total || '0.00'}
-- Status: ${orderData.status || 'N/A'}
+- Status: ${orderData.status || 'N/A'}${ipInfo}
 
 Please perform manual fraud review considering:
 1. Customer verification
@@ -231,6 +260,7 @@ Please perform manual fraud review considering:
 3. Payment method validation
 4. Order pattern analysis
 5. Geographic risk factors
+6. IP address geolocation (if provided)
 
 RECOMMENDATION: Manual review required due to system unavailability.`;
         }
@@ -258,7 +288,8 @@ RECOMMENDATION: Manual review required due to system unavailability.`;
                     shippingAddress: {},
                     paymentTerms: salesOrder.getText('terms') || salesOrder.getValue('terms') || '',
                     shippingMethod: salesOrder.getText('shipmethod') || salesOrder.getValue('shipmethod') || '',
-                    lineItems: []
+                    lineItems: [],
+                    ipAddress: '' // Will be set later from form input
                 };
 
                 // Get payment method
@@ -545,6 +576,11 @@ RECOMMENDATION: Manual review required due to system unavailability.`;
          * Create fraud analysis prompt
          */
         function createFraudAnalysisPrompt(orderData) {
+            // Include IP address in the prompt if provided
+            const ipAddressInfo = orderData.ipAddress ? 
+                `Customer IP Address: ${orderData.ipAddress}` : 
+                'Customer IP Address: Not provided';
+
             return `You are an experienced e-commerce fraud detection analyst. Analyze the following sales order for potential fraud. Provide a comprehensive, structured report in the following format:
 
 Order Overview: Summarize the order, including customer name, company (if applicable), product(s), cost, shipping method, and whether this is a first-time customer.
@@ -553,14 +589,19 @@ Address Consistency: Compare billing vs. shipping addresses, checking for mismat
 
 Email & Phone Verification: Analyze the email address to determine if it uses a corporate domain, free provider, or disposable service. Review the domain reputation and whether it is personalized. Examine the phone number to see if the area code matches the location and confirm whether it is valid.
 
+IP Address & Geolocation Analysis: ${orderData.ipAddress ? 
+    'Analyze the provided IP address for geographic consistency with billing/shipping addresses. Check for VPN usage, proxy services, or high-risk geographic locations. Verify if the IP location matches the customer\'s stated location.' : 
+    'IP address not provided - recommend collecting this information for enhanced fraud detection in future orders.'}
+
 Payment & Credit Card Indicators: Determine if the card type and BIN align with the customer's location. Consider whether the payment appears to be from a personal, corporate, or prepaid card and note any patterns suggesting card testing.
 
-Identity & Profile Plausibility – Evaluate whether the customer’s name, company, email, phone, and address logically align and appear on public business records (e.g., DUNS, Secretary-of-State or other government registry).
+Identity & Profile Plausibility – Evaluate whether the customer's name, company, email, phone, and address logically align and appear on public business records (e.g., DUNS, Secretary-of-State or other government registry).
 
 Social & External Verification –
- Search LinkedIn, Facebook, X/Twitter, and other social platforms to confirm the person’s employment at the stated company.
-Check the company’s presence on Google Maps, Yelp, BBB, or industry directories to verify legitimacy, operating hours, and reviews.
+ Search LinkedIn, Facebook, X/Twitter, and other social platforms to confirm the person's employment at the stated company.
+Check the company's presence on Google Maps, Yelp, BBB, or industry directories to verify legitimacy, operating hours, and reviews.
 Note any absence of online footprint or mismatches in business names, locations, or employees.
+
 Order Patterns & Behavioral Clues: Analyze quantity, product type, and total value for fraud indicators. Note if there are high-value items, first-time purchases, or suspicious order timing.
 
 List of Potential Red Flags: Explicitly list any suspicious findings.
@@ -577,6 +618,7 @@ Shipping Address: ${orderData.shippingAddress.address1 || 'N/A'}, ${orderData.sh
 
 Email: ${orderData.customerInfo?.email || 'N/A'}
 Phone: ${orderData.customerInfo?.phone || 'N/A'}
+${ipAddressInfo}
 Payment Terms: ${orderData.paymentTerms || 'N/A'}
 Shipping Method: ${orderData.shippingMethod || 'N/A'}
 
@@ -696,6 +738,7 @@ ${orderData.lineItems.map(item => `- ${item.item}: Qty ${item.quantity} @ $${ite
                     status: escapeXml(orderData.status || 'N/A'),
                     email: escapeXml(orderData.customerInfo?.email || 'N/A'),
                     phone: escapeXml(orderData.customerInfo?.phone || 'N/A'),
+                    ipAddress: escapeXml(orderData.ipAddress || 'Not provided'),
                     customerSince: escapeXml(orderData.customerInfo?.dateCreated ? new Date(orderData.customerInfo.dateCreated).toLocaleDateString() : 'N/A'),
                     paymentTerms: escapeXml(orderData.paymentTerms || 'N/A'),
                     paymentMethod: escapeXml(orderData.paymentMethod || 'N/A'),
@@ -1099,6 +1142,10 @@ ${orderData.lineItems.map(item => `- ${item.item}: Qty ${item.quantity} @ $${ite
                         <td>${templateData.phone}</td>
                     </tr>
                     <tr>
+                        <td>🌐 IP Address</td>
+                        <td>${templateData.ipAddress}</td>
+                    </tr>
+                    <tr>
                         <td>📅 Customer Since</td>
                         <td>${templateData.customerSince}</td>
                     </tr>
@@ -1151,7 +1198,7 @@ ${orderData.lineItems.map(item => `- ${item.item}: Qty ${item.quantity} @ $${ite
                 <div class="footer-title">🛡️ NetSuite Fraud Analysis System</div>
                 <p>This report was generated using advanced AI-powered fraud detection algorithms.<br/>
                 The analysis combines multiple risk factors including customer behavior, order patterns,<br/>
-                geographic data, and payment verification to provide comprehensive fraud assessment.</p>
+                geographic data, payment verification, and IP geolocation to provide comprehensive fraud assessment.</p>
                 <p><strong>For questions or concerns regarding this analysis, please contact the security team.</strong></p>
             </div>
         </div>

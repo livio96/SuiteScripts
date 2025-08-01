@@ -10,8 +10,9 @@ define(['N/ui/serverWidget', 'N/https', 'N/file', 'N/record', 'N/log', 'N/render
         // Configuration - Replace with your actual OpenRouter API key
         const OPENROUTER_API_KEY = '';
         const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
-        const MODEL_NAME = 'deepseek/deepseek-r1:free';
-        //const MODEL_NAME = 'anthropic/claude-sonnet-4'
+        //const MODEL_NAME = 'deepseek/deepseek-r1:free';
+        const MODEL_NAME = 'anthropic/claude-sonnet-4'
+
         function onRequest(context) {
             try {
                 if (context.request.method === 'GET') {
@@ -554,8 +555,12 @@ Email & Phone Verification: Analyze the email address to determine if it uses a 
 
 Payment & Credit Card Indicators: Determine if the card type and BIN align with the customer's location. Consider whether the payment appears to be from a personal, corporate, or prepaid card and note any patterns suggesting card testing.
 
-Identity & Profile Plausibility: Evaluate whether the customer's name, company, email, phone, and address logically align. Determine if the order context makes sense and check for verifiable business footprint.
+Identity & Profile Plausibility – Evaluate whether the customer’s name, company, email, phone, and address logically align and appear on public business records (e.g., DUNS, Secretary-of-State or other government registry).
 
+Social & External Verification –
+ Search LinkedIn, Facebook, X/Twitter, and other social platforms to confirm the person’s employment at the stated company.
+Check the company’s presence on Google Maps, Yelp, BBB, or industry directories to verify legitimacy, operating hours, and reviews.
+Note any absence of online footprint or mismatches in business names, locations, or employees.
 Order Patterns & Behavioral Clues: Analyze quantity, product type, and total value for fraud indicators. Note if there are high-value items, first-time purchases, or suspicious order timing.
 
 List of Potential Red Flags: Explicitly list any suspicious findings.

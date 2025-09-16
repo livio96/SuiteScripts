@@ -22,18 +22,31 @@ define(['N/record', 'N/search', 'N/log', 'N/error'], function(record, search, lo
             
             var successCount = 0;
             var errorCount = 0;
+            var skippedCount = 0;
             var errorDetails = [];
+            var skippedDetails = [];
             
             // Process each parsed PDF record
             parsedPdfRecords.forEach(function(pdfRecord) {
                 try {
                     log.debug('Processing Record', `Starting to process parsed PDF ID: ${pdfRecord.id}`);
-                    var salesOrderId = createSalesOrderFromParsedPdf(pdfRecord);
-                    if (salesOrderId) {
+                    var result = createSalesOrderFromParsedPdf(pdfRecord);
+                    
+                    if (result && result.salesOrderId) {
                         // Mark the parsed PDF as processed
-                        markAsProcessed(pdfRecord.id, salesOrderId);
+                        markAsProcessed(pdfRecord.id, result.salesOrderId);
                         successCount++;
-                        log.audit('Sales Order Created', `Created SO ${salesOrderId} from parsed PDF ${pdfRecord.id}`);
+                        log.audit('Sales Order Created', `Created SO ${result.salesOrderId} from parsed PDF ${pdfRecord.id}`);
+                    } else if (result && result.skipped) {
+                        // Customer not found - mark as skipped
+                        skippedCount++;
+                        skippedDetails.push({
+                            recordId: pdfRecord.id,
+                            companyName: pdfRecord.companyName,
+                            reason: result.reason
+                        });
+                        markAsSkipped(pdfRecord.id, result.reason);
+                        log.audit('Record Skipped', `Skipped parsed PDF ${pdfRecord.id}: ${result.reason}`);
                     }
                 } catch (e) {
                     errorCount++;
@@ -54,7 +67,9 @@ define(['N/record', 'N/search', 'N/log', 'N/error'], function(record, search, lo
                 message: 'Processing complete',
                 successCount: successCount,
                 errorCount: errorCount,
-                errors: errorDetails
+                skippedCount: skippedCount,
+                errors: errorDetails,
+                skipped: skippedDetails
             });
             
         } catch (e) {
@@ -75,17 +90,9 @@ define(['N/record', 'N/search', 'N/log', 'N/error'], function(record, search, lo
         try {
             log.debug('getParsedPdfRecords', 'Creating search for unprocessed parsed PDF records');
             
-            // FIX: The filter was malformed. In NetSuite 2.1, boolean fields should use 'is' with T/F values
             var filters = [
                 ['custrecord_parse_pdf_processed', 'is', 'F']
             ];
-            
-            // Add 'AND' if you need multiple filters
-            // filters = [
-            //     ['custrecord_parse_pdf_processed', 'is', 'F'],
-            //     'AND',
-            //     ['isinactive', 'is', 'F']
-            // ];
             
             log.debug('Search Filters', JSON.stringify(filters));
             
@@ -183,9 +190,68 @@ define(['N/record', 'N/search', 'N/log', 'N/error'], function(record, search, lo
     }
     
     /**
+     * Get the sales rep for a customer
+     * @param {string} customerId - Internal ID of the customer
+     * @returns {Object} Object containing salesRepId and source
+     */
+    function getCustomerSalesRep(customerId) {
+        try {
+            log.debug('getCustomerSalesRep', `Looking up sales rep for customer ID: ${customerId}`);
+            
+            // Look up the customer record to check for sales rep
+            var customerFields = search.lookupFields({
+                type: search.Type.CUSTOMER,
+                id: customerId,
+                columns: ['salesrep', 'custentity_unassigned_from']
+            });
+            
+            // First check if custentity_unassigned_from has a value
+            var unassignedFrom = customerFields.custentity_unassigned_from;
+            if (unassignedFrom && unassignedFrom.length > 0) {
+                var unassignedFromId = unassignedFrom[0].value;
+                log.debug('Sales Rep from Unassigned Field', `Found sales rep in custentity_unassigned_from: ${unassignedFromId}`);
+                return {
+                    salesRepId: unassignedFromId,
+                    source: 'custentity_unassigned_from'
+                };
+            }
+            
+            // If no unassigned_from value, check the regular sales rep field
+            var salesRep = customerFields.salesrep;
+            if (salesRep && salesRep.length > 0) {
+                var salesRepId = salesRep[0].value;
+                log.debug('Sales Rep from Customer', `Found sales rep on customer record: ${salesRepId}`);
+                return {
+                    salesRepId: salesRepId,
+                    source: 'customer_salesrep'
+                };
+            }
+            
+            // No sales rep found on customer, return default
+            log.debug('No Sales Rep on Customer', `No sales rep found for customer ${customerId}, will use default`);
+            return {
+                salesRepId: 1706846, // Default hardcoded sales rep
+                source: 'default'
+            };
+            
+        } catch (e) {
+            log.error('getCustomerSalesRep Error', {
+                customerId: customerId,
+                error: e.message,
+                stack: e.stack
+            });
+            // Return default on error
+            return {
+                salesRepId: 1706846,
+                source: 'default_error'
+            };
+        }
+    }
+    
+    /**
      * Create a sales order from parsed PDF data
      * @param {Object} pdfRecord - Parsed PDF record data
-     * @returns {string} Internal ID of created sales order
+     * @returns {Object} Result object with salesOrderId or skipped status
      */
     function createSalesOrderFromParsedPdf(pdfRecord) {
         try {
@@ -201,6 +267,21 @@ define(['N/record', 'N/search', 'N/log', 'N/error'], function(record, search, lo
             
             log.debug('Line Items to Process', JSON.stringify(lineItems));
             
+            // Try to find existing customer - DO NOT CREATE if not found
+            var customerId = findExistingCustomer(pdfRecord.companyName, pdfRecord.website);
+            
+            if (!customerId) {
+                // Customer not found - skip this record
+                log.audit('Customer Not Found', `No matching customer found for "${pdfRecord.companyName}" - skipping record ${pdfRecord.id}`);
+                return {
+                    skipped: true,
+                    reason: `No matching customer found for "${pdfRecord.companyName}"`
+                };
+            }
+            
+            // Get the sales rep for this customer
+            var salesRepInfo = getCustomerSalesRep(customerId);
+            
             // Create the sales order record
             var salesOrder = record.create({
                 type: record.Type.SALES_ORDER,
@@ -208,23 +289,21 @@ define(['N/record', 'N/search', 'N/log', 'N/error'], function(record, search, lo
             });
             
             // Set header fields
-            var customerId = getOrCreateCustomer(pdfRecord.companyName);
             salesOrder.setValue('entity', customerId);
             
-            // Set sales rep field (1706846 = specific employee ID)
+            // Set sales rep field based on customer lookup
             try {
-                salesOrder.setValue('salesrep', 1706846);
-                log.debug('Sales Rep Set', 'Set salesrep to 1706846');
+                salesOrder.setValue('salesrep', salesRepInfo.salesRepId);
+                log.audit('Sales Rep Set', `Set salesrep to ${salesRepInfo.salesRepId} (source: ${salesRepInfo.source})`);
             } catch (e) {
                 log.error('Sales Rep Error', `Failed to set salesrep: ${e.message}`);
             }
 
-
-             // Set custom order origin field (28 = specific origin value)
+            // Set custom order contact email
             try {
                 salesOrder.setValue('custbody_order_contact_email', 'website@telquestintl.com');
             } catch (e) {
-                log.error('Order Origin Error', `Failed to set custbody_order_contact_email: ${e.message}`);
+                log.error('Order Contact Email Error', `Failed to set custbody_order_contact_email: ${e.message}`);
             }
             
             // Set custom order origin field (28 = specific origin value)
@@ -332,9 +411,9 @@ define(['N/record', 'N/search', 'N/log', 'N/error'], function(record, search, lo
             // Save the sales order
             log.debug('Saving Sales Order', `Attempting to save SO with ${addedItems} line items`);
             var salesOrderId = salesOrder.save();
-            log.audit('Sales Order Saved', `Successfully saved SO ${salesOrderId}`);
+            log.audit('Sales Order Saved', `Successfully saved SO ${salesOrderId} with sales rep ${salesRepInfo.salesRepId} (${salesRepInfo.source})`);
             
-            return salesOrderId;
+            return { salesOrderId: salesOrderId };
             
         } catch (e) {
             log.error('Sales Order Creation Error', {
@@ -349,44 +428,144 @@ define(['N/record', 'N/search', 'N/log', 'N/error'], function(record, search, lo
     }
     
     /**
-     * Modify item name based on condition
-     * @param {string} itemName - Original item name
-     * @param {string} condition - Item condition (New/Used)
-     * @returns {string} Modified item name
+     * Find existing customer record with fuzzy matching - DO NOT CREATE NEW
+     * @param {string} companyName - Company name from parsed PDF
+     * @param {string} website - Website from parsed PDF (optional)
+     * @returns {string|null} Customer internal ID or null if not found
      */
-    function getModifiedItemName(itemName, condition) {
-        if (!itemName) return itemName;
-        
-        var suffix = '';
-        if (condition && condition.toLowerCase() === 'new') {
-            suffix = '-N';
-        } else if (condition && condition.toLowerCase() === 'used') {
-            suffix = '-LN';
+    function findExistingCustomer(companyName, website) {
+        try {
+            if (!companyName) {
+                log.warn('findExistingCustomer', 'No company name provided');
+                return null;
+            }
+            
+            log.debug('findExistingCustomer', `Searching for customer: ${companyName}, Website: ${website}`);
+            
+            // Strategy 1: Try domain-based search first if website is provided
+            if (website) {
+                var customerId = searchCustomerByDomain(website);
+                if (customerId) {
+                    log.audit('Customer Found by Domain', `Found customer by domain ${website} with ID ${customerId}`);
+                    return customerId;
+                }
+            }
+            
+            // Strategy 2: Exact match search
+            var exactMatchId = searchCustomerExactMatch(companyName);
+            if (exactMatchId) {
+                log.debug('Customer Found - Exact Match', `Found customer ${companyName} with ID ${exactMatchId}`);
+                return exactMatchId;
+            }
+            
+            // Strategy 3: Fuzzy match search
+            var fuzzyMatchId = searchCustomerFuzzyMatch(companyName);
+            if (fuzzyMatchId) {
+                log.audit('Customer Found - Fuzzy Match', `Found customer using fuzzy match for ${companyName} with ID ${fuzzyMatchId}`);
+                return fuzzyMatchId;
+            }
+            
+            // Strategy 4: Search by normalized name patterns
+            var patternMatchId = searchCustomerByPatterns(companyName);
+            if (patternMatchId) {
+                log.audit('Customer Found - Pattern Match', `Found customer using pattern match for ${companyName} with ID ${patternMatchId}`);
+                return patternMatchId;
+            }
+            
+            // No customer found - return null (DO NOT CREATE)
+            log.debug('Customer Not Found', `No matching customer found for "${companyName}" - will skip this record`);
+            return null;
+            
+        } catch (e) {
+            log.error('findExistingCustomer Error', {
+                companyName: companyName,
+                website: website,
+                error: e.message,
+                stack: e.stack
+            });
+            return null;
         }
-        
-        var modifiedName = itemName + suffix;
-        log.debug('Item Name Modified', `Original: ${itemName}, Condition: ${condition}, Modified: ${modifiedName}`);
-        
-        return modifiedName;
     }
     
     /**
-     * Get or create customer record
-     * @param {string} companyName - Company name
-     * @returns {string} Customer internal ID
+     * Search customer by domain name
+     * @param {string} website - Website URL
+     * @returns {string|null} Customer internal ID or null
      */
-    function getOrCreateCustomer(companyName) {
+    function searchCustomerByDomain(website) {
         try {
-            if (!companyName) {
-                throw error.create({
-                    name: 'MISSING_COMPANY_NAME',
-                    message: 'Company name is required to create sales order'
-                });
+            if (!website) return null;
+            
+            // Extract domain from website
+            var domain = extractDomain(website);
+            if (!domain) return null;
+            
+            log.debug('Domain Search', `Searching for customer with domain: ${domain}`);
+            
+            // Search in the web address field - adjust field ID as needed
+            var customerSearch = search.create({
+                type: search.Type.CUSTOMER,
+                filters: [
+                    ['url', 'contains', domain]
+                    // If you have a custom field for website, add it here:
+                    // 'OR',
+                    // ['custentity_web_address', 'contains', domain]
+                ],
+                columns: ['internalid', 'companyname']
+            });
+            
+            var results = customerSearch.run().getRange({
+                start: 0,
+                end: 1
+            });
+            
+            if (results.length > 0) {
+                var customerId = results[0].getValue('internalid');
+                var customerName = results[0].getValue('companyname');
+                log.debug('Domain Match Found', `Found customer "${customerName}" (ID: ${customerId}) by domain ${domain}`);
+                return customerId;
             }
             
-            log.debug('getOrCreateCustomer', `Searching for customer: ${companyName}`);
+            return null;
+        } catch (e) {
+            log.error('Domain Search Error', e.message);
+            return null;
+        }
+    }
+    
+    /**
+     * Extract domain from URL
+     * @param {string} url - Full URL or domain
+     * @returns {string} Clean domain name
+     */
+    function extractDomain(url) {
+        try {
+            if (!url) return null;
             
-            // Search for existing customer
+            // Remove protocol if present
+            var domain = url.replace(/^https?:\/\//, '');
+            // Remove www. if present
+            domain = domain.replace(/^www\./, '');
+            // Remove path if present
+            domain = domain.split('/')[0];
+            // Remove port if present
+            domain = domain.split(':')[0];
+            
+            log.debug('Domain Extraction', `Extracted domain "${domain}" from "${url}"`);
+            return domain.toLowerCase();
+        } catch (e) {
+            log.error('Domain Extraction Error', e.message);
+            return null;
+        }
+    }
+    
+    /**
+     * Search for exact customer name match
+     * @param {string} companyName - Company name
+     * @returns {string|null} Customer internal ID or null
+     */
+    function searchCustomerExactMatch(companyName) {
+        try {
             var customerSearch = search.create({
                 type: search.Type.CUSTOMER,
                 filters: [
@@ -395,39 +574,298 @@ define(['N/record', 'N/search', 'N/log', 'N/error'], function(record, search, lo
                 columns: ['internalid']
             });
             
-            var customerResult = customerSearch.run().getRange({
+            var results = customerSearch.run().getRange({
                 start: 0,
                 end: 1
             });
             
-            if (customerResult.length > 0) {
-                var existingId = customerResult[0].getValue('internalid');
-                log.debug('Customer Found', `Found existing customer ${companyName} with ID ${existingId}`);
-                return existingId;
+            return results.length > 0 ? results[0].getValue('internalid') : null;
+        } catch (e) {
+            log.error('Exact Match Search Error', e.message);
+            return null;
+        }
+    }
+    
+    /**
+     * Search for customer using fuzzy matching
+     * @param {string} companyName - Company name
+     * @returns {string|null} Customer internal ID or null
+     */
+    function searchCustomerFuzzyMatch(companyName) {
+        try {
+            // Normalize the search term
+            var normalizedName = normalizeCompanyName(companyName);
+            
+            log.debug('Fuzzy Search', `Searching with normalized name: ${normalizedName}`);
+            
+            // Try contains search
+            var customerSearch = search.create({
+                type: search.Type.CUSTOMER,
+                filters: [
+                    ['companyname', 'contains', normalizedName]
+                ],
+                columns: ['internalid', 'companyname']
+            });
+            
+            var results = customerSearch.run().getRange({
+                start: 0,
+                end: 10 // Get more results for fuzzy matching
+            });
+            
+            if (results.length === 1) {
+                // If only one result, return it
+                return results[0].getValue('internalid');
+            } else if (results.length > 1) {
+                // If multiple results, try to find best match
+                var bestMatch = findBestMatch(companyName, results);
+                if (bestMatch) {
+                    return bestMatch;
+                }
             }
             
-            // Create new customer if not found
-            log.debug('Creating Customer', `Customer ${companyName} not found, creating new record`);
-            
-            var customerRecord = record.create({
-                type: record.Type.CUSTOMER
+            // Try starts with search
+            var startsWithSearch = search.create({
+                type: search.Type.CUSTOMER,
+                filters: [
+                    ['companyname', 'startswith', normalizedName.substring(0, Math.min(normalizedName.length, 10))]
+                ],
+                columns: ['internalid', 'companyname']
             });
             
-            customerRecord.setValue('companyname', companyName);
-            customerRecord.setValue('subsidiary', 1); // Adjust subsidiary as needed
+            results = startsWithSearch.run().getRange({
+                start: 0,
+                end: 5
+            });
             
-            var customerId = customerRecord.save();
-            log.audit('Customer Created', `Created new customer ${companyName} with ID ${customerId}`);
+            if (results.length > 0) {
+                return findBestMatch(companyName, results);
+            }
             
-            return customerId;
+            return null;
         } catch (e) {
-            log.error('getOrCreateCustomer Error', {
-                companyName: companyName,
-                error: e.message,
-                stack: e.stack
-            });
-            throw e;
+            log.error('Fuzzy Match Search Error', e.message);
+            return null;
         }
+    }
+    
+    /**
+     * Search customer by various name patterns
+     * @param {string} companyName - Company name
+     * @returns {string|null} Customer internal ID or null
+     */
+    function searchCustomerByPatterns(companyName) {
+        try {
+            var patterns = generateSearchPatterns(companyName);
+            
+            for (var i = 0; i < patterns.length; i++) {
+                var pattern = patterns[i];
+                log.debug('Pattern Search', `Trying pattern: ${pattern}`);
+                
+                var customerSearch = search.create({
+                    type: search.Type.CUSTOMER,
+                    filters: [
+                        ['companyname', 'contains', pattern]
+                    ],
+                    columns: ['internalid', 'companyname']
+                });
+                
+                var results = customerSearch.run().getRange({
+                    start: 0,
+                    end: 5
+                });
+                
+                if (results.length === 1) {
+                    log.debug('Pattern Match Found', `Found customer with pattern "${pattern}": ${results[0].getValue('companyname')}`);
+                    return results[0].getValue('internalid');
+                } else if (results.length > 1) {
+                    var bestMatch = findBestMatch(companyName, results);
+                    if (bestMatch) {
+                        return bestMatch;
+                    }
+                }
+            }
+            
+            return null;
+        } catch (e) {
+            log.error('Pattern Search Error', e.message);
+            return null;
+        }
+    }
+    
+    /**
+     * Generate search patterns from company name
+     * @param {string} companyName - Company name
+     * @returns {Array} Array of search patterns
+     */
+    function generateSearchPatterns(companyName) {
+        var patterns = [];
+        
+        // Remove common suffixes and normalize
+        var baseName = companyName
+            .replace(/\s*(inc|llc|ltd|corp|corporation|company|co|group|&\s*co)\.?\s*$/i, '')
+            .trim();
+        
+        patterns.push(baseName);
+        
+        // Try without spaces
+        patterns.push(baseName.replace(/\s+/g, ''));
+        
+        // Try with spaces replaced by different characters
+        patterns.push(baseName.replace(/\s+/g, '-'));
+        
+        // Try first significant word (if multi-word)
+        var words = baseName.split(/\s+/);
+        if (words.length > 1 && words[0].length > 3) {
+            patterns.push(words[0]);
+        }
+        
+        // Try acronym for multi-word names
+        if (words.length > 1) {
+            var acronym = words.map(function(w) { return w.charAt(0); }).join('');
+            if (acronym.length > 1) {
+                patterns.push(acronym);
+            }
+        }
+        
+        return patterns;
+    }
+    
+    /**
+     * Normalize company name for searching
+     * @param {string} name - Company name
+     * @returns {string} Normalized name
+     */
+    function normalizeCompanyName(name) {
+        return name
+            .toLowerCase()
+            .replace(/[^\w\s]/g, '') // Remove special characters
+            .replace(/\s+/g, ' ') // Normalize spaces
+            .trim();
+    }
+    
+    /**
+     * Find best match from multiple results
+     * @param {string} searchTerm - Original search term
+     * @param {Array} results - Search results
+     * @returns {string|null} Best matching customer ID or null
+     */
+    function findBestMatch(searchTerm, results) {
+        try {
+            var normalizedSearch = normalizeCompanyName(searchTerm);
+            var bestMatch = null;
+            var bestScore = 0;
+            
+            results.forEach(function(result) {
+                var resultName = result.getValue('companyname');
+                var normalizedResult = normalizeCompanyName(resultName);
+                var score = calculateSimilarity(normalizedSearch, normalizedResult);
+                
+                log.debug('Match Score', `"${resultName}" score: ${score}`);
+                
+                if (score > bestScore && score > 0.7) { // 70% similarity threshold
+                    bestScore = score;
+                    bestMatch = result.getValue('internalid');
+                }
+            });
+            
+            if (bestMatch) {
+                log.debug('Best Match Selected', `Best match ID: ${bestMatch} with score: ${bestScore}`);
+            }
+            
+            return bestMatch;
+        } catch (e) {
+            log.error('Find Best Match Error', e.message);
+            return null;
+        }
+    }
+    
+    /**
+     * Calculate similarity between two strings (simple implementation)
+     * @param {string} str1 - First string
+     * @param {string} str2 - Second string
+     * @returns {number} Similarity score between 0 and 1
+     */
+    function calculateSimilarity(str1, str2) {
+        if (str1 === str2) return 1;
+        if (!str1 || !str2) return 0;
+        
+        // Check if one contains the other
+        if (str1.indexOf(str2) !== -1 || str2.indexOf(str1) !== -1) {
+            return 0.9;
+        }
+        
+        // Simple character overlap calculation
+        var longer = str1.length > str2.length ? str1 : str2;
+        var shorter = str1.length > str2.length ? str2 : str1;
+        
+        if (longer.length === 0) return 1.0;
+        
+        var editDistance = getEditDistance(longer, shorter);
+        return (longer.length - editDistance) / parseFloat(longer.length);
+    }
+    
+    /**
+     * Calculate edit distance between two strings (Levenshtein distance)
+     * @param {string} str1 - First string
+     * @param {string} str2 - Second string
+     * @returns {number} Edit distance
+     */
+    function getEditDistance(str1, str2) {
+        var matrix = [];
+        
+        if (str1.length === 0) return str2.length;
+        if (str2.length === 0) return str1.length;
+        
+        for (var i = 0; i <= str2.length; i++) {
+            matrix[i] = [i];
+        }
+        
+        for (var j = 0; j <= str1.length; j++) {
+            matrix[0][j] = j;
+        }
+        
+        for (i = 1; i <= str2.length; i++) {
+            for (j = 1; j <= str1.length; j++) {
+                if (str2.charAt(i - 1) === str1.charAt(j - 1)) {
+                    matrix[i][j] = matrix[i - 1][j - 1];
+                } else {
+                    matrix[i][j] = Math.min(
+                        matrix[i - 1][j - 1] + 1, // substitution
+                        matrix[i][j - 1] + 1,     // insertion
+                        matrix[i - 1][j] + 1      // deletion
+                    );
+                }
+            }
+        }
+        
+        return matrix[str2.length][str1.length];
+    }
+    
+    /**
+     * Modify item name based on condition
+     * @param {string} itemName - Original item name
+     * @param {string} condition - Item condition (New/Used/empty)
+     * @returns {string} Modified item name
+     */
+    function getModifiedItemName(itemName, condition) {
+        if (!itemName) return itemName;
+        
+        var suffix = '-N'; // Default to New
+        
+        if (condition) {
+            if (condition.toLowerCase() === 'used') {
+                suffix = '-LN';
+            } else {
+                // Any other value including 'new' gets -N suffix
+                suffix = '-N';
+            }
+        }
+        // If no condition specified, defaults to -N (New)
+        
+        var modifiedName = itemName + suffix;
+        log.debug('Item Name Modified', `Original: ${itemName}, Condition: ${condition || 'Not specified (defaulting to New)'}, Modified: ${modifiedName}`);
+        
+        return modifiedName;
     }
     
     /**
@@ -546,6 +984,38 @@ define(['N/record', 'N/search', 'N/log', 'N/error'], function(record, search, lo
                 message: `Failed to mark parsed PDF ${parsedPdfId} as processed`,
                 parsedPdfId: parsedPdfId,
                 salesOrderId: salesOrderId,
+                error: e.message,
+                stack: e.stack
+            });
+        }
+    }
+    
+    /**
+     * Mark parsed PDF record as skipped
+     * @param {string} parsedPdfId - Internal ID of parsed PDF record
+     * @param {string} reason - Reason for skipping
+     */
+    function markAsSkipped(parsedPdfId, reason) {
+        try {
+            log.debug('markAsSkipped', `Marking parsed PDF ${parsedPdfId} as skipped: ${reason}`);
+            
+            // You may want to add a custom field to track skipped records and reasons
+            // For now, we'll add a note to the memo field
+            var updatedRecord = record.submitFields({
+                type: 'customrecord_parsed_pdf',
+                id: parsedPdfId,
+                values: {
+                    'custrecord_parse_pdf_processed': true, // Mark as processed to avoid reprocessing
+                    'custrecord_special_instructions': `SKIPPED: ${reason}` // Or use a dedicated field
+                }
+            });
+            
+            log.debug('Record Skipped', `Successfully marked parsed PDF ${parsedPdfId} as skipped`);
+        } catch (e) {
+            log.error('Skip Update Error', {
+                message: `Failed to mark parsed PDF ${parsedPdfId} as skipped`,
+                parsedPdfId: parsedPdfId,
+                reason: reason,
                 error: e.message,
                 stack: e.stack
             });

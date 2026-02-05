@@ -82,19 +82,30 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
 
         /**
          * Derive the Like New item name from the current item name.
-         * Strips the suffix after the last '-' and replaces with 'LN'.
-         * If no '-' exists, appends '-LN'.
+         * - If item ends with '-N', replace '-N' with '-LN'
+         * - If item ends with '-RF', replace '-RF' with '-LN'
+         * - Otherwise, append '-LN'
          *
-         * ABC-N    → ABC-LN
-         * PART-123-N → PART-123-LN
-         * GADGET   → GADGET-LN
+         * ABC-N           → ABC-LN
+         * PART-123-N      → PART-123-LN
+         * PART-123-RF     → PART-123-LN
+         * 2200-48820-025  → 2200-48820-025-LN
+         * GADGET          → GADGET-LN
          */
         function getLikeNewItemName(itemName) {
             if (!itemName) return '';
-            const lastDash = itemName.lastIndexOf('-');
-            if (lastDash >= 0) {
-                return itemName.substring(0, lastDash) + '-LN';
+
+            // Check if ends with -N (case sensitive)
+            if (itemName.endsWith('-N')) {
+                return itemName.slice(0, -2) + '-LN';
             }
+
+            // Check if ends with -RF (case sensitive)
+            if (itemName.endsWith('-RF')) {
+                return itemName.slice(0, -3) + '-LN';
+            }
+
+            // Otherwise just append -LN
             return itemName + '-LN';
         }
 
@@ -250,48 +261,57 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
          *   Phase 2 – enrich with bin/location via inventoryNumberBinOnHand join (best-effort)
          * Returns { valid: [...], invalid: [...] }
          */
+        // Location ID to restrict serial number searches
+        const SERIAL_LOOKUP_LOCATION_ID = '1';
+
         function lookupSerialDetails(serialTexts) {
             if (!serialTexts || serialTexts.length === 0) {
                 return { valid: [], invalid: [] };
             }
 
-            const filterExpression = [];
+            // Build serial number filter
+            const serialFilterExpression = [];
             serialTexts.forEach((serial, index) => {
-                if (index > 0) filterExpression.push('OR');
-                filterExpression.push(['inventorynumber', 'is', serial]);
+                if (index > 0) serialFilterExpression.push('OR');
+                serialFilterExpression.push(['inventorynumber', 'is', serial]);
             });
 
             const foundSerials = {};
 
-            // --- Phase 1: Basic lookup (no join) ---
+            // --- Phase 1: Basic lookup to find inventory number records ---
             try {
                 search.create({
                     type: 'inventorynumber',
-                    filters: filterExpression,
+                    filters: serialFilterExpression,
                     columns: [
                         search.createColumn({ name: 'internalid' }),
                         search.createColumn({ name: 'inventorynumber' }),
                         search.createColumn({ name: 'item' }),
                         search.createColumn({ name: 'location' }),
-                        search.createColumn({ name: 'quantityonhand' }),
-                        search.createColumn({ name: 'quantityavailable' })
+                        search.createColumn({ name: 'quantityonhand' })
                     ]
                 }).run().each(result => {
                     const serial = result.getValue('inventorynumber');
-                    if (!foundSerials[serial]) {
-                        foundSerials[serial] = {
-                            serialNumber: serial,
-                            serialId: result.getValue('internalid'),
-                            itemId: result.getValue('item'),
-                            itemText: result.getText('item'),
-                            locationId: result.getValue('location'),
-                            locationText: result.getText('location') || '',
-                            binId: '',
-                            binText: '',
-                            statusId: '',
-                            statusText: '',
-                            quantityOnHand: parseFloat(result.getValue('quantityonhand')) || 0
-                        };
+                    const locId = String(result.getValue('location') || '');
+                    const qtyOnHand = parseFloat(result.getValue('quantityonhand')) || 0;
+
+                    // Only accept if in target location with quantity on hand
+                    if (locId === SERIAL_LOOKUP_LOCATION_ID && qtyOnHand > 0) {
+                        if (!foundSerials[serial]) {
+                            foundSerials[serial] = {
+                                serialNumber: serial,
+                                serialId: result.getValue('internalid'),
+                                itemId: result.getValue('item'),
+                                itemText: result.getText('item'),
+                                locationId: locId,
+                                locationText: result.getText('location') || '',
+                                binId: '',
+                                binText: '',
+                                statusId: '',
+                                statusText: '',
+                                quantityOnHand: qtyOnHand
+                            };
+                        }
                     }
                     return true;
                 });
@@ -299,39 +319,39 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                 log.error('lookupSerialDetails Phase1 Error', e.message);
             }
 
-            // --- Phase 2: Enrich with bin info (best-effort) ---
-            try {
-                search.create({
-                    type: 'inventorynumber',
-                    filters: filterExpression,
-                    columns: [
-                        search.createColumn({ name: 'inventorynumber' }),
-                        search.createColumn({ name: 'location', join: 'inventoryNumberBinOnHand' }),
-                        search.createColumn({ name: 'binnumber', join: 'inventoryNumberBinOnHand' }),
-                        search.createColumn({ name: 'quantityonhand', join: 'inventoryNumberBinOnHand' }),
-                        search.createColumn({ name: 'status', join: 'inventoryNumberBinOnHand' })
-                    ]
-                }).run().each(result => {
-                    const serial = result.getValue('inventorynumber');
-                    const binQty = parseFloat(result.getValue({ name: 'quantityonhand', join: 'inventoryNumberBinOnHand' })) || 0;
+            // --- Phase 2: Enrich with bin/status info using inventoryNumberBinOnHand join ---
+            if (Object.keys(foundSerials).length > 0) {
+                try {
+                    search.create({
+                        type: 'inventorynumber',
+                        filters: serialFilterExpression,
+                        columns: [
+                            search.createColumn({ name: 'inventorynumber' }),
+                            search.createColumn({ name: 'location', join: 'inventoryNumberBinOnHand' }),
+                            search.createColumn({ name: 'binnumber', join: 'inventoryNumberBinOnHand' }),
+                            search.createColumn({ name: 'quantityonhand', join: 'inventoryNumberBinOnHand' }),
+                            search.createColumn({ name: 'status', join: 'inventoryNumberBinOnHand' })
+                        ]
+                    }).run().each(result => {
+                        const serial = result.getValue('inventorynumber');
+                        const binQty = parseFloat(result.getValue({ name: 'quantityonhand', join: 'inventoryNumberBinOnHand' })) || 0;
+                        const locId = String(result.getValue({ name: 'location', join: 'inventoryNumberBinOnHand' }) || '');
 
-                    if (binQty > 0 && foundSerials[serial]) {
-                        const locId = result.getValue({ name: 'location', join: 'inventoryNumberBinOnHand' });
-                        const locText = result.getText({ name: 'location', join: 'inventoryNumberBinOnHand' });
-                        if (locId) {
+                        // Only enrich if this serial was found in Phase 1 and bin is in location 1 with qty
+                        if (binQty > 0 && locId === SERIAL_LOOKUP_LOCATION_ID && foundSerials[serial]) {
                             foundSerials[serial].locationId = locId;
-                            foundSerials[serial].locationText = locText || foundSerials[serial].locationText;
+                            foundSerials[serial].locationText = result.getText({ name: 'location', join: 'inventoryNumberBinOnHand' }) || foundSerials[serial].locationText;
+                            foundSerials[serial].binId = result.getValue({ name: 'binnumber', join: 'inventoryNumberBinOnHand' }) || '';
+                            foundSerials[serial].binText = result.getText({ name: 'binnumber', join: 'inventoryNumberBinOnHand' }) || '';
+                            foundSerials[serial].statusId = result.getValue({ name: 'status', join: 'inventoryNumberBinOnHand' }) || '';
+                            foundSerials[serial].statusText = result.getText({ name: 'status', join: 'inventoryNumberBinOnHand' }) || '';
                         }
-                        foundSerials[serial].binId = result.getValue({ name: 'binnumber', join: 'inventoryNumberBinOnHand' }) || '';
-                        foundSerials[serial].binText = result.getText({ name: 'binnumber', join: 'inventoryNumberBinOnHand' }) || '';
-                        foundSerials[serial].statusId = result.getValue({ name: 'status', join: 'inventoryNumberBinOnHand' }) || '';
-                        foundSerials[serial].statusText = result.getText({ name: 'status', join: 'inventoryNumberBinOnHand' }) || '';
-                    }
-                    return true;
-                });
-            } catch (e) {
-                // Bin join not available – Phase 1 data is still usable
-                log.debug('lookupSerialDetails Phase2 (bin enrichment) skipped', e.message);
+                        return true;
+                    });
+                } catch (e) {
+                    // Bin join not available – Phase 1 data is still usable
+                    log.debug('lookupSerialDetails Phase2 (bin enrichment) skipped', e.message);
+                }
             }
 
             const valid = [];

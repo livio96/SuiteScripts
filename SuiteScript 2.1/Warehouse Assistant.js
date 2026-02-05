@@ -1835,10 +1835,12 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                                     <option value="back_to_stock">Back to Stock</option>
                                     <option value="likenew">Change to Like New</option>
                                     <option value="likenew_stock">Change to Like New &amp; Back to Stock</option>
+                                    <option value="serial_change_stock">Change Serial &amp; Back to Stock</option>
                                     <option value="defective">Defective</option>
                                     <option value="move_refurbishing">Move to Refurbishing</option>
                                     <option value="move_testing">Move to Testing</option>
                                     <option value="return_to_vendor">Return to Vendor</option>
+                                    <option value="serial_change">Serial Number Change</option>
                                     <option value="trash">Trash</option>
                                 </select>
                                 <div>

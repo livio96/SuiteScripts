@@ -25,6 +25,14 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
         // Inventory status internal ID for "Back to Stock" (1 = typically default/good status)
         const BACK_TO_STOCK_STATUS_ID = 1;
 
+        // Bin and status for "Move to Testing"
+        const TESTING_BIN_ID = 3549;
+        const TESTING_STATUS_ID = 6;
+
+        // Bin and status for "Move to Refurbishing"
+        const REFURBISHING_BIN_ID = 3550;
+        const REFURBISHING_STATUS_ID = 9;
+
         // ====================================================================
         // UTILITY FUNCTIONS
         // ====================================================================
@@ -127,6 +135,100 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                 log.error('getItemDetails Error', e.message);
                 return null;
             }
+        }
+
+        /**
+         * Search for items matching a query string.
+         * Returns array of { id, itemid, displayname, description }
+         */
+        function searchItems(query, maxResults) {
+            const results = [];
+            maxResults = maxResults || 50;
+            try {
+                const filters = [];
+                if (query && query.trim()) {
+                    filters.push(['itemid', 'contains', query.trim()]);
+                    filters.push('OR');
+                    filters.push(['displayname', 'contains', query.trim()]);
+                }
+                // Only show inventory items
+                filters.push('AND');
+                filters.push(['type', 'anyof', ['InvtPart', 'Assembly']]);
+
+                search.create({
+                    type: search.Type.ITEM,
+                    filters: filters,
+                    columns: [
+                        search.createColumn({ name: 'internalid' }),
+                        search.createColumn({ name: 'itemid', sort: search.Sort.ASC }),
+                        search.createColumn({ name: 'displayname' }),
+                        search.createColumn({ name: 'salesdescription' })
+                    ]
+                }).run().each(function(r) {
+                    results.push({
+                        id: r.getValue('internalid'),
+                        itemid: r.getValue('itemid'),
+                        displayname: r.getValue('displayname') || r.getValue('itemid'),
+                        description: r.getValue('salesdescription') || ''
+                    });
+                    return results.length < maxResults;
+                });
+            } catch (e) {
+                log.error('searchItems Error', e.message);
+            }
+            return results;
+        }
+
+        /**
+         * Get available bins for a location.
+         */
+        function getBinsForLocation(locationId) {
+            const bins = [];
+            try {
+                search.create({
+                    type: 'bin',
+                    filters: [['location', 'anyof', locationId]],
+                    columns: [
+                        search.createColumn({ name: 'internalid' }),
+                        search.createColumn({ name: 'binnumber', sort: search.Sort.ASC })
+                    ]
+                }).run().each(function(r) {
+                    bins.push({
+                        id: r.getValue('internalid'),
+                        name: r.getValue('binnumber')
+                    });
+                    return bins.length < 100;
+                });
+            } catch (e) {
+                log.error('getBinsForLocation Error', e.message);
+            }
+            return bins;
+        }
+
+        /**
+         * Get all locations.
+         */
+        function getLocations() {
+            const locations = [];
+            try {
+                search.create({
+                    type: 'location',
+                    filters: [['isinactive', 'is', false]],
+                    columns: [
+                        search.createColumn({ name: 'internalid' }),
+                        search.createColumn({ name: 'name', sort: search.Sort.ASC })
+                    ]
+                }).run().each(function(r) {
+                    locations.push({
+                        id: r.getValue('internalid'),
+                        name: r.getValue('name')
+                    });
+                    return locations.length < 100;
+                });
+            } catch (e) {
+                log.error('getLocations Error', e.message);
+            }
+            return locations;
         }
 
         /**
@@ -238,48 +340,89 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
         // LABEL PDF GENERATION
         // ====================================================================
 
-        function generateLabelsPdf(labelData) {
-            const itemName = escapeXml(labelData.itemText || '');
-            const description = escapeXml(labelData.description || '');
-            const recordId = labelData.recordId || '';
-
+        /**
+         * Generate label PDF for multiple item groups.
+         * @param {Array} labelGroups - Array of { itemText, description, serialNumbers, quantity }
+         * @param {string} recordId - The adjustment tranid to show on all labels
+         */
+        function generateLabelsPdf(labelGroups, recordId) {
             let bodyContent = '';
 
-            if (labelData.serialNumbers && labelData.serialNumbers.length > 0) {
-                labelData.serialNumbers.forEach(serialNumber => {
-                    const escapedSerial = escapeXml(serialNumber);
-                    bodyContent += `
-                    <body width="101.6mm" height="76.2mm" padding="0.0in 0.1in 0.0in 0.15in">
-                        <table align="right" width="98%" height="50%">
-                            <tr height="12%">
-                                <td align="center">
-                                    <table width="100%">
-                                        <tr>
-                                            <td style="font-size:18px;">${itemName}</td>
-                                            <td align="right"><table style="border:1px;"><tr><td style="font-size:16px;">${recordId}</td></tr></table></td>
-                                        </tr>
-                                    </table>
-                                </td>
-                            </tr>
-                            <tr height="25%">
-                                <td align="center"><table width="100%"><tr><td style="font-size:11px;">${description}</td></tr></table></td>
-                            </tr>
-                        </table>
-                        <table align="left" width="100%" height="50%" v-align="bottom">
-                            <tr height="60px">
-                                <td height="60px" align="left" style="font-size:10px;">
-                                    <barcode height="60px" width="240px" codetype="code128" showtext="true" value="${escapedSerial}"/>
-                                </td>
-                            </tr>
-                            <tr>
-                                <td align="left" style="font-size:25px;">
-                                    <barcode height="60px" width="220px" codetype="code128" showtext="true" value="${itemName}"/>
-                                </td>
-                            </tr>
-                        </table>
-                    </body>`;
-                });
-            }
+            labelGroups.forEach(group => {
+                const itemName = escapeXml(group.itemText || '');
+                const description = escapeXml(group.description || '');
+                const escapedRecordId = escapeXml(recordId || '');
+
+                if (group.serialNumbers && group.serialNumbers.length > 0) {
+                    // Serialized items - one label per serial number
+                    group.serialNumbers.forEach(serialNumber => {
+                        const escapedSerial = escapeXml(serialNumber);
+                        bodyContent += `
+                        <body width="101.6mm" height="76.2mm" padding="0.0in 0.1in 0.0in 0.15in">
+                            <table align="right" width="98%" height="50%">
+                                <tr height="12%">
+                                    <td align="center">
+                                        <table width="100%">
+                                            <tr>
+                                                <td style="font-size:18px;">${itemName}</td>
+                                                <td align="right"><table style="border:1px;"><tr><td style="font-size:16px;">${escapedRecordId}</td></tr></table></td>
+                                            </tr>
+                                        </table>
+                                    </td>
+                                </tr>
+                                <tr height="25%">
+                                    <td align="center"><table width="100%"><tr><td style="font-size:11px;">${description}</td></tr></table></td>
+                                </tr>
+                            </table>
+                            <table align="left" width="100%" height="50%" v-align="bottom">
+                                <tr height="60px">
+                                    <td height="60px" align="left" style="font-size:10px;">
+                                        <barcode height="60px" width="240px" codetype="code128" showtext="true" value="${escapedSerial}"/>
+                                    </td>
+                                </tr>
+                                <tr>
+                                    <td align="left" style="font-size:25px;">
+                                        <barcode height="60px" width="220px" codetype="code128" showtext="true" value="${itemName}"/>
+                                    </td>
+                                </tr>
+                            </table>
+                        </body>`;
+                    });
+                } else if (group.quantity && group.quantity > 0) {
+                    // Non-serialized items - one label per quantity unit
+                    for (let i = 0; i < group.quantity; i++) {
+                        bodyContent += `
+                        <body width="101.6mm" height="76.2mm" padding="0.0in 0.1in 0.0in 0.15in">
+                            <table align="right" width="98%" height="50%">
+                                <tr height="12%">
+                                    <td align="center">
+                                        <table width="100%">
+                                            <tr>
+                                                <td style="font-size:18px;">${itemName}</td>
+                                                <td align="right"><table style="border:1px;"><tr><td style="font-size:16px;">${escapedRecordId}</td></tr></table></td>
+                                            </tr>
+                                        </table>
+                                    </td>
+                                </tr>
+                                <tr height="25%">
+                                    <td align="center"><table width="100%"><tr><td style="font-size:11px;">${description}</td></tr></table></td>
+                                </tr>
+                            </table>
+                            <table align="left" width="100%" height="50%" v-align="bottom">
+                                <tr height="60px">
+                                    <td height="60px" align="left">
+                                    </td>
+                                </tr>
+                                <tr>
+                                    <td align="left" style="font-size:25px;">
+                                        <barcode height="60px" width="220px" codetype="code128" showtext="true" value="${itemName}"/>
+                                    </td>
+                                </tr>
+                            </table>
+                        </body>`;
+                    }
+                }
+            });
 
             const xml = `<?xml version="1.0"?>
 <!DOCTYPE pdf PUBLIC "-//big.faceless.org//report" "report-1.1.dtd">
@@ -318,7 +461,7 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
             if (ADJUSTMENT_ACCOUNT_ID) {
                 adjRecord.setValue({ fieldId: 'account', value: ADJUSTMENT_ACCOUNT_ID });
             }
-            adjRecord.setValue({ fieldId: 'memo', value: memo || 'Condition Change to Like New' });
+            adjRecord.setValue({ fieldId: 'memo', value: memo || 'Created through Warehouse Assistant Dashboard.' });
 
             // Look up average cost for each source item so the adjust-in matches the adjust-out
             const costCache = {};
@@ -449,6 +592,304 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
             }
 
             return { adjId: adjId, tranId: tranId };
+        }
+
+        /**
+         * Create bin transfer for moving serials to Testing or Refurbishing.
+         * Item does not change, only bin and status.
+         *
+         * @param {Array} groups - Grouped transfer data:
+         *   { itemId, itemText, locationId, action, serials: [{ serialNumber, serialId, binId }] }
+         * @param {string} memo - Transaction memo
+         * @returns {Object} { tranId }
+         */
+        function createBinTransfer(groups, memo) {
+            const transferRecord = record.create({
+                type: record.Type.BIN_TRANSFER,
+                isDynamic: true
+            });
+
+            // Set header fields
+            transferRecord.setValue({ fieldId: 'subsidiary', value: '1' });
+            transferRecord.setValue({ fieldId: 'memo', value: memo || 'Via Warehouse Assistant Dashboard' });
+
+            // Set location from first group (all should be same location for bin transfer)
+            if (groups.length > 0 && groups[0].locationId) {
+                transferRecord.setValue({ fieldId: 'location', value: groups[0].locationId });
+            }
+
+            groups.forEach(group => {
+                const serialCount = group.serials.length;
+
+                // Determine destination bin and status based on action
+                let toBinId, toStatusId;
+                if (group.action === 'move_testing') {
+                    toBinId = TESTING_BIN_ID;
+                    toStatusId = TESTING_STATUS_ID;
+                } else if (group.action === 'move_refurbishing') {
+                    toBinId = REFURBISHING_BIN_ID;
+                    toStatusId = REFURBISHING_STATUS_ID;
+                }
+
+                transferRecord.selectNewLine({ sublistId: 'inventory' });
+                transferRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'item', value: group.itemId });
+                transferRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'quantity', value: serialCount });
+
+                const invDetail = transferRecord.getCurrentSublistSubrecord({
+                    sublistId: 'inventory',
+                    fieldId: 'inventorydetail'
+                });
+
+                group.serials.forEach(serial => {
+                    invDetail.selectNewLine({ sublistId: 'inventoryassignment' });
+                    invDetail.setCurrentSublistValue({
+                        sublistId: 'inventoryassignment',
+                        fieldId: 'issueinventorynumber',
+                        value: serial.serialId
+                    });
+                    invDetail.setCurrentSublistValue({
+                        sublistId: 'inventoryassignment',
+                        fieldId: 'quantity',
+                        value: 1
+                    });
+                    // Source bin
+                    if (serial.binId) {
+                        invDetail.setCurrentSublistValue({
+                            sublistId: 'inventoryassignment',
+                            fieldId: 'binnumber',
+                            value: serial.binId
+                        });
+                    }
+                    // Destination bin
+                    invDetail.setCurrentSublistValue({
+                        sublistId: 'inventoryassignment',
+                        fieldId: 'tobinnumber',
+                        value: toBinId
+                    });
+                    // Destination status
+                    invDetail.setCurrentSublistValue({
+                        sublistId: 'inventoryassignment',
+                        fieldId: 'toinventorystatus',
+                        value: toStatusId
+                    });
+                    invDetail.commitLine({ sublistId: 'inventoryassignment' });
+                });
+
+                transferRecord.commitLine({ sublistId: 'inventory' });
+            });
+
+            const transferId = transferRecord.save({ enableSourcing: true, ignoreMandatoryFields: false });
+
+            // Look up the tranid for display
+            let tranId = String(transferId);
+            try {
+                const lookup = search.lookupFields({
+                    type: record.Type.BIN_TRANSFER,
+                    id: transferId,
+                    columns: ['tranid']
+                });
+                tranId = lookup.tranid || String(transferId);
+            } catch (e) {
+                log.debug('Could not look up bin transfer tranid', e.message);
+            }
+
+            return { transferId: transferId, tranId: tranId };
+        }
+
+        /**
+         * Create inventory adjustment for non-serialized condition change.
+         *
+         * @param {Object} data - { sourceItemId, sourceItemName, targetItemId, targetItemName, locationId, quantity, fromBinId, toBinId }
+         * @param {string} memo - Transaction memo
+         * @returns {Object} { adjId, tranId }
+         */
+        function createNonSerializedAdjustment(data, memo) {
+            const adjRecord = record.create({
+                type: record.Type.INVENTORY_ADJUSTMENT,
+                isDynamic: true
+            });
+
+            adjRecord.setValue({ fieldId: 'subsidiary', value: '1' });
+
+            if (ADJUSTMENT_ACCOUNT_ID) {
+                adjRecord.setValue({ fieldId: 'account', value: ADJUSTMENT_ACCOUNT_ID });
+            }
+            adjRecord.setValue({ fieldId: 'memo', value: memo || 'Created through Warehouse Assistant Dashboard.' });
+
+            // Look up average cost for the source item
+            let itemCost = 0;
+            try {
+                const costLookup = search.lookupFields({
+                    type: search.Type.ITEM,
+                    id: data.sourceItemId,
+                    columns: ['averagecost']
+                });
+                itemCost = parseFloat(costLookup.averagecost) || 0;
+            } catch (e) {
+                log.debug('Cost lookup failed for item ' + data.sourceItemId, e.message);
+            }
+
+            // --- REMOVAL LINE: take quantity out of source item ---
+            adjRecord.selectNewLine({ sublistId: 'inventory' });
+            adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'item', value: data.sourceItemId });
+            adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'location', value: data.locationId });
+            adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'adjustqtyby', value: -data.quantity });
+            if (itemCost > 0) {
+                adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'unitcost', value: itemCost });
+            }
+
+            // Set bin for removal if using bins
+            if (data.fromBinId) {
+                const removeDetail = adjRecord.getCurrentSublistSubrecord({
+                    sublistId: 'inventory',
+                    fieldId: 'inventorydetail'
+                });
+                removeDetail.selectNewLine({ sublistId: 'inventoryassignment' });
+                removeDetail.setCurrentSublistValue({
+                    sublistId: 'inventoryassignment',
+                    fieldId: 'quantity',
+                    value: -data.quantity
+                });
+                removeDetail.setCurrentSublistValue({
+                    sublistId: 'inventoryassignment',
+                    fieldId: 'binnumber',
+                    value: data.fromBinId
+                });
+                removeDetail.commitLine({ sublistId: 'inventoryassignment' });
+            }
+
+            adjRecord.commitLine({ sublistId: 'inventory' });
+
+            // --- ADDITION LINE: add quantity to target -LN item ---
+            adjRecord.selectNewLine({ sublistId: 'inventory' });
+            adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'item', value: data.targetItemId });
+            adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'location', value: data.locationId });
+            adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'adjustqtyby', value: data.quantity });
+            if (itemCost > 0) {
+                adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'unitcost', value: itemCost });
+            }
+
+            // Set bin for addition if using bins
+            if (data.toBinId) {
+                const addDetail = adjRecord.getCurrentSublistSubrecord({
+                    sublistId: 'inventory',
+                    fieldId: 'inventorydetail'
+                });
+                addDetail.selectNewLine({ sublistId: 'inventoryassignment' });
+                addDetail.setCurrentSublistValue({
+                    sublistId: 'inventoryassignment',
+                    fieldId: 'quantity',
+                    value: data.quantity
+                });
+                addDetail.setCurrentSublistValue({
+                    sublistId: 'inventoryassignment',
+                    fieldId: 'binnumber',
+                    value: data.toBinId
+                });
+                if (data.toStatusId) {
+                    addDetail.setCurrentSublistValue({
+                        sublistId: 'inventoryassignment',
+                        fieldId: 'inventorystatus',
+                        value: data.toStatusId
+                    });
+                }
+                addDetail.commitLine({ sublistId: 'inventoryassignment' });
+            }
+
+            adjRecord.commitLine({ sublistId: 'inventory' });
+
+            const adjId = adjRecord.save({ enableSourcing: true, ignoreMandatoryFields: false });
+
+            // Look up the tranid for display
+            let tranId = String(adjId);
+            try {
+                const adjLookup = search.lookupFields({
+                    type: search.Type.INVENTORY_ADJUSTMENT,
+                    id: adjId,
+                    columns: ['tranid']
+                });
+                tranId = adjLookup.tranid || String(adjId);
+            } catch (e) {
+                log.debug('Could not look up adjustment tranid', e.message);
+            }
+
+            return { adjId: adjId, tranId: tranId };
+        }
+
+        /**
+         * Create bin transfer for non-serialized items.
+         *
+         * @param {Object} data - { itemId, locationId, quantity, fromBinId, toBinId, toStatusId }
+         * @param {string} memo - Transaction memo
+         * @returns {Object} { transferId, tranId }
+         */
+        function createNonSerializedBinTransfer(data, memo) {
+            const transferRecord = record.create({
+                type: record.Type.BIN_TRANSFER,
+                isDynamic: true
+            });
+
+            transferRecord.setValue({ fieldId: 'subsidiary', value: '1' });
+            transferRecord.setValue({ fieldId: 'memo', value: memo || 'Via Warehouse Assistant Dashboard' });
+            transferRecord.setValue({ fieldId: 'location', value: data.locationId });
+
+            transferRecord.selectNewLine({ sublistId: 'inventory' });
+            transferRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'item', value: data.itemId });
+            transferRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'quantity', value: data.quantity });
+
+            const invDetail = transferRecord.getCurrentSublistSubrecord({
+                sublistId: 'inventory',
+                fieldId: 'inventorydetail'
+            });
+
+            invDetail.selectNewLine({ sublistId: 'inventoryassignment' });
+            invDetail.setCurrentSublistValue({
+                sublistId: 'inventoryassignment',
+                fieldId: 'quantity',
+                value: data.quantity
+            });
+            // Source bin
+            if (data.fromBinId) {
+                invDetail.setCurrentSublistValue({
+                    sublistId: 'inventoryassignment',
+                    fieldId: 'binnumber',
+                    value: data.fromBinId
+                });
+            }
+            // Destination bin
+            invDetail.setCurrentSublistValue({
+                sublistId: 'inventoryassignment',
+                fieldId: 'tobinnumber',
+                value: data.toBinId
+            });
+            // Destination status
+            if (data.toStatusId) {
+                invDetail.setCurrentSublistValue({
+                    sublistId: 'inventoryassignment',
+                    fieldId: 'toinventorystatus',
+                    value: data.toStatusId
+                });
+            }
+            invDetail.commitLine({ sublistId: 'inventoryassignment' });
+
+            transferRecord.commitLine({ sublistId: 'inventory' });
+
+            const transferId = transferRecord.save({ enableSourcing: true, ignoreMandatoryFields: false });
+
+            // Look up the tranid for display
+            let tranId = String(transferId);
+            try {
+                const lookup = search.lookupFields({
+                    type: record.Type.BIN_TRANSFER,
+                    id: transferId,
+                    columns: ['tranid']
+                });
+                tranId = lookup.tranid || String(transferId);
+            } catch (e) {
+                log.debug('Could not look up bin transfer tranid', e.message);
+            }
+
+            return { transferId: transferId, tranId: tranId };
         }
 
         // ====================================================================
@@ -675,6 +1116,43 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                     font-size: 18px;
                     color: #1e3c72;
                 }
+
+                .mode-toggle {
+                    display: flex;
+                    gap: 0;
+                    margin-bottom: 24px;
+                    background: #f1f5f9;
+                    border-radius: 12px;
+                    padding: 4px;
+                }
+                .mode-btn {
+                    flex: 1;
+                    padding: 14px 20px;
+                    border: none;
+                    background: transparent;
+                    color: #64748b;
+                    font-weight: 600;
+                    font-size: 14px;
+                    cursor: pointer;
+                    border-radius: 10px;
+                    transition: all 0.2s;
+                }
+                .mode-btn.active {
+                    background: #1e3c72;
+                    color: white;
+                    box-shadow: 0 2px 8px rgba(30, 60, 114, 0.3);
+                }
+                .mode-btn:hover:not(.active) {
+                    background: #e2e8f0;
+                    color: #475569;
+                }
+
+                .form-section {
+                    display: none;
+                }
+                .form-section.active {
+                    display: block;
+                }
             </style>
             `;
         }
@@ -688,6 +1166,30 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                 <script>
                     window.onbeforeunload = null;
                     if (typeof setWindowChanged === 'function') setWindowChanged(window, false);
+
+                    var currentMode = 'serialized';
+
+                    function switchMode(mode) {
+                        currentMode = mode;
+                        var serialSection = document.getElementById('serialized-section');
+                        var nonSerialSection = document.getElementById('non-serialized-section');
+                        var serialBtn = document.getElementById('mode-serialized');
+                        var nonSerialBtn = document.getElementById('mode-nonserialized');
+
+                        if (mode === 'serialized') {
+                            serialSection.classList.add('active');
+                            nonSerialSection.classList.remove('active');
+                            serialBtn.classList.add('active');
+                            nonSerialBtn.classList.remove('active');
+                            var field = document.getElementById('custpage_serial_numbers');
+                            if (field) field.focus();
+                        } else {
+                            serialSection.classList.remove('active');
+                            nonSerialSection.classList.add('active');
+                            serialBtn.classList.remove('active');
+                            nonSerialBtn.classList.add('active');
+                        }
+                    }
 
                     function updateCount() {
                         var field = document.getElementById('custpage_serial_numbers');
@@ -708,10 +1210,76 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                         form.submit();
                     }
 
+                    function submitNonSerialized() {
+                        // NetSuite renders select fields with source differently
+                        // Server-side will validate all fields, so just do basic checks here
+                        var form = document.forms[0];
+
+                        // For quantity, try to get the value for validation
+                        var qtyValue = '';
+                        var qtyField = document.getElementById('custpage_ns_quantity');
+                        if (qtyField) qtyValue = qtyField.value;
+                        if (!qtyValue) {
+                            var qtyInputs = document.querySelectorAll('input[name="custpage_ns_quantity"]');
+                            if (qtyInputs.length > 0) qtyValue = qtyInputs[0].value;
+                        }
+                        if (!qtyValue || parseInt(qtyValue) <= 0) {
+                            alert('Please enter a valid quantity');
+                            return;
+                        }
+
+                        // For action, check if selected - try multiple ways to find the value
+                        var actionValue = '';
+                        // Try direct ID
+                        var actionField = document.getElementById('custpage_ns_action');
+                        if (actionField) actionValue = actionField.value;
+                        // Try display field (NetSuite pattern)
+                        if (!actionValue) {
+                            var actionDisplay = document.getElementById('inpt_custpage_ns_action');
+                            if (actionDisplay && actionDisplay.value) actionValue = actionDisplay.value;
+                        }
+                        // Try by name
+                        if (!actionValue) {
+                            var actionByName = document.getElementsByName('custpage_ns_action')[0];
+                            if (actionByName) actionValue = actionByName.value;
+                        }
+                        // Try hidden field pattern
+                        if (!actionValue) {
+                            var actionHidden = document.getElementById('hddn_custpage_ns_action');
+                            if (actionHidden) actionValue = actionHidden.value;
+                        }
+                        if (!actionValue) {
+                            alert('Please select an action');
+                            return;
+                        }
+
+                        // For item - check display field has text (user selected something)
+                        var itemDisplay = document.getElementById('inpt_custpage_ns_item');
+                        if (itemDisplay && !itemDisplay.value.trim()) {
+                            alert('Please select an item');
+                            return;
+                        }
+
+                        window.onbeforeunload = null;
+                        var action = document.createElement('input');
+                        action.type = 'hidden'; action.name = 'custpage_action'; action.value = 'process_nonserialized';
+                        form.appendChild(action);
+                        form.submit();
+                    }
+
                     function clearForm() {
-                        var field = document.getElementById('custpage_serial_numbers');
-                        if (field) field.value = '';
-                        updateCount();
+                        if (currentMode === 'serialized') {
+                            var field = document.getElementById('custpage_serial_numbers');
+                            if (field) field.value = '';
+                            updateCount();
+                        } else {
+                            var itemField = document.getElementById('custpage_ns_item');
+                            var qtyField = document.getElementById('custpage_ns_quantity');
+                            var actionField = document.getElementById('custpage_ns_action');
+                            if (itemField) itemField.value = '';
+                            if (qtyField) qtyField.value = '';
+                            if (actionField) actionField.value = '';
+                        }
                     }
 
                     document.addEventListener('DOMContentLoaded', function() {
@@ -790,18 +1358,10 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
             `;
         }
 
-        function getSuccessPageScript(suiteletUrl, printUrls) {
-            // printUrls is an array of { label, url }
-            let printFunctions = '';
-            printUrls.forEach((pu, idx) => {
-                printFunctions += `
-                    function printLabels${idx}() { window.open('${escapeForJs(pu.url)}', '_blank'); }
-                `;
-            });
-
+        function getSuccessPageScript(suiteletUrl, printUrl) {
             return `
                 <script>
-                    ${printFunctions}
+                    function printLabels() { window.open('${escapeForJs(printUrl)}', '_blank'); }
                     function createAnother() { window.location.href = '${escapeForJs(suiteletUrl)}'; }
                 </script>
             `;
@@ -812,7 +1372,7 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
         // ====================================================================
 
         function createEntryForm(context, message, messageType) {
-            const form = serverWidget.createForm({ title: 'Condition Change' });
+            const form = serverWidget.createForm({ title: 'Warehouse Assistant Dashboard' });
 
             const styleField = form.addField({ id: 'custpage_styles', type: serverWidget.FieldType.INLINEHTML, label: ' ' });
             styleField.defaultValue = getStyles() + getEntryFormScript();
@@ -829,17 +1389,49 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                     ${msgHtml}
                     <div class="main-card">
                         <div class="card-header">
-                            <h1>Condition Change</h1>
-                            <p>Scan serial numbers to change item condition</p>
+                            <h1>Warehouse Assistant Dashboard</h1>
+                            <p>I'm here to help.</p>
                         </div>
                         <div class="form-body">
-                            <div class="input-group">
-                                <label class="custom-label">Serial Numbers <span class="badge-count"><span id="serial_count">0</span> scanned</span></label>
-                                <div id="serial-field-wrap"></div>
+                            <div class="mode-toggle">
+                                <button type="button" id="mode-serialized" class="mode-btn active" onclick="switchMode('serialized')">Serialized Items</button>
+                                <button type="button" id="mode-nonserialized" class="mode-btn" onclick="switchMode('nonserialized')">Non-Serialized Items</button>
                             </div>
-                            <div class="btn-area">
-                                <button type="button" class="custom-btn btn-success" onclick="submitSerials()">Submit</button>
-                                <button type="button" class="custom-btn btn-outline" onclick="clearForm()">Clear</button>
+
+                            <!-- Serialized Items Section -->
+                            <div id="serialized-section" class="form-section active">
+                                <div class="input-group">
+                                    <label class="custom-label">Serial Numbers <span class="badge-count"><span id="serial_count">0</span> scanned</span></label>
+                                    <div id="serial-field-wrap"></div>
+                                </div>
+                                <div class="btn-area">
+                                    <button type="button" class="custom-btn btn-success" onclick="submitSerials()">Submit</button>
+                                    <button type="button" class="custom-btn btn-outline" onclick="clearForm()">Clear</button>
+                                </div>
+                            </div>
+
+                            <!-- Non-Serialized Items Section -->
+                            <div id="non-serialized-section" class="form-section">
+                                <div class="input-group">
+                                    <label class="custom-label">Item</label>
+                                    <div id="ns-item-wrap"></div>
+                                </div>
+                                <div class="input-group">
+                                    <label class="custom-label">From Bin</label>
+                                    <div id="ns-bin-wrap"></div>
+                                </div>
+                                <div class="input-group">
+                                    <label class="custom-label">Quantity</label>
+                                    <div id="ns-qty-wrap"></div>
+                                </div>
+                                <div class="input-group">
+                                    <label class="custom-label">Action</label>
+                                    <div id="ns-action-wrap"></div>
+                                </div>
+                                <div class="btn-area">
+                                    <button type="button" class="custom-btn btn-success" onclick="submitNonSerialized()">Submit</button>
+                                    <button type="button" class="custom-btn btn-outline" onclick="clearForm()">Clear</button>
+                                </div>
                             </div>
                         </div>
                     </div>
@@ -847,16 +1439,52 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                 <div style="display:none;">
             `;
 
+            // Serialized field
             const serialField = form.addField({ id: 'custpage_serial_numbers', type: serverWidget.FieldType.TEXTAREA, label: 'Serials' });
             serialField.updateDisplaySize({ height: 10, width: 60 });
+
+            // Non-serialized fields
+            const nsItemField = form.addField({ id: 'custpage_ns_item', type: serverWidget.FieldType.SELECT, label: 'Item', source: 'item' });
+            nsItemField.updateDisplaySize({ height: 1, width: 60 });
+
+            const nsBinField = form.addField({ id: 'custpage_ns_bin', type: serverWidget.FieldType.SELECT, label: 'From Bin', source: 'bin' });
+            nsBinField.updateDisplaySize({ height: 1, width: 60 });
+
+            const nsQtyField = form.addField({ id: 'custpage_ns_quantity', type: serverWidget.FieldType.INTEGER, label: 'Quantity' });
+
+            const nsActionField = form.addField({ id: 'custpage_ns_action', type: serverWidget.FieldType.SELECT, label: 'Action' });
+            nsActionField.addSelectOption({ value: '', text: '-- Select Action --' });
+            nsActionField.addSelectOption({ value: 'likenew', text: 'Change to Like New' });
+            nsActionField.addSelectOption({ value: 'likenew_stock', text: 'Change to Like New & Back to Stock' });
+            nsActionField.addSelectOption({ value: 'move_testing', text: 'Move to Testing' });
+            nsActionField.addSelectOption({ value: 'move_refurbishing', text: 'Move to Refurbishing' });
 
             const containerEnd = form.addField({ id: 'custpage_container_end', type: serverWidget.FieldType.INLINEHTML, label: ' ' });
             containerEnd.defaultValue = `</div>
             <script>
                 document.addEventListener('DOMContentLoaded', function() {
+                    // Move serialized field to its wrapper
                     var serialWrap = document.getElementById('serial-field-wrap');
                     var serialLabel = document.getElementById('custpage_serial_numbers_fs_lbl_uir_label');
                     if (serialWrap && serialLabel) serialWrap.appendChild(serialLabel.parentNode);
+
+                    // Move non-serialized fields to their wrappers
+                    var nsItemWrap = document.getElementById('ns-item-wrap');
+                    var nsItemLabel = document.getElementById('custpage_ns_item_fs_lbl_uir_label');
+                    if (nsItemWrap && nsItemLabel) nsItemWrap.appendChild(nsItemLabel.parentNode);
+
+                    var nsBinWrap = document.getElementById('ns-bin-wrap');
+                    var nsBinLabel = document.getElementById('custpage_ns_bin_fs_lbl_uir_label');
+                    if (nsBinWrap && nsBinLabel) nsBinWrap.appendChild(nsBinLabel.parentNode);
+
+                    var nsQtyWrap = document.getElementById('ns-qty-wrap');
+                    var nsQtyLabel = document.getElementById('custpage_ns_quantity_fs_lbl_uir_label');
+                    if (nsQtyWrap && nsQtyLabel) nsQtyWrap.appendChild(nsQtyLabel.parentNode);
+
+                    var nsActionWrap = document.getElementById('ns-action-wrap');
+                    var nsActionLabel = document.getElementById('custpage_ns_action_fs_lbl_uir_label');
+                    if (nsActionWrap && nsActionLabel) nsActionWrap.appendChild(nsActionLabel.parentNode);
+
                     updateCount();
                 });
             </script>`;
@@ -888,6 +1516,8 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                             <option value="">-- No Action --</option>
                             <option value="likenew">Change to Like New</option>
                             <option value="likenew_stock">Change to Like New &amp; Back to Stock</option>
+                            <option value="move_testing">Move to Testing</option>
+                            <option value="move_refurbishing">Move to Refurbishing</option>
                         </select>
                     </td>
                 </tr>`;
@@ -926,6 +1556,8 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                                     <option value="">-- No Action --</option>
                                     <option value="likenew">Change to Like New</option>
                                     <option value="likenew_stock">Change to Like New &amp; Back to Stock</option>
+                                    <option value="move_testing">Move to Testing</option>
+                                    <option value="move_refurbishing">Move to Refurbishing</option>
                                 </select>
                                 <div>
                                     <span style="color:#64748b; font-weight:500;">With Action:</span>
@@ -967,8 +1599,8 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
             context.response.writePage(form);
         }
 
-        function createSuccessPage(context, adjTranId, labelGroups) {
-            const form = serverWidget.createForm({ title: 'Condition Change Complete' });
+        function createSuccessPage(context, adjustmentTranId, binTransferTranId, labelGroups) {
+            const form = serverWidget.createForm({ title: 'Transactions Created' });
 
             const suiteletUrl = url.resolveScript({
                 scriptId: runtime.getCurrentScript().id,
@@ -976,60 +1608,72 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                 returnExternalUrl: true
             });
 
-            // Build print URLs for each label group
-            const printUrls = [];
+            // Create print label records for each group
             labelGroups.forEach((group, idx) => {
-                const serialsParam = group.serialNumbers.join('\n');
-
-                // Create print label record
-                let recordId = '';
                 try {
                     const rec = record.create({ type: 'customrecord_print_label', isDynamic: true });
                     rec.setValue({ fieldId: 'custrecord_pl_item_number', value: group.itemId });
                     rec.setValue({ fieldId: 'custrecord_express_entry', value: group.serialNumbers.join('<br>') });
-                    recordId = rec.save({ enableSourcing: true, ignoreMandatoryFields: false });
+                    const recordId = rec.save({ enableSourcing: true, ignoreMandatoryFields: false });
+                    group.recordId = recordId;
                     log.audit('Print Label Created', 'ID: ' + recordId + ', Item: ' + group.itemText + ', Labels: ' + group.serialNumbers.length);
                 } catch (e) {
                     log.error('Print Label Record Error', e.message);
-                    recordId = 'ERR';
+                    group.recordId = 'ERR';
                 }
-
-                group.recordId = recordId;
-
-                // Use adjustment tranid on the label instead of internal record ID
-                const printUrl = suiteletUrl +
-                    '&ajax_action=printpage' +
-                    '&record_id=' + encodeURIComponent(adjTranId) +
-                    '&item_text=' + encodeURIComponent(group.itemText || '') +
-                    '&description=' + encodeURIComponent(group.description || '') +
-                    '&serials=' + encodeURIComponent(serialsParam);
-
-                printUrls.push({ label: group.itemText, url: printUrl });
             });
 
-            const styleField = form.addField({ id: 'custpage_styles', type: serverWidget.FieldType.INLINEHTML, label: ' ' });
-            styleField.defaultValue = getStyles() + getSuccessPageScript(suiteletUrl, printUrls);
+            // Build combined label data for single print job
+            const printData = labelGroups.map(g => ({
+                itemText: g.itemText || '',
+                description: g.description || '',
+                serialNumbers: g.serialNumbers
+            }));
 
-            // Build label group sections
+            // Use whichever transaction ID is available for the print job
+            const recordIdForPrint = adjustmentTranId || binTransferTranId || '';
+
+            const printUrl = suiteletUrl +
+                '&ajax_action=printpage' +
+                '&record_id=' + encodeURIComponent(recordIdForPrint) +
+                '&label_data=' + encodeURIComponent(JSON.stringify(printData));
+
+            const styleField = form.addField({ id: 'custpage_styles', type: serverWidget.FieldType.INLINEHTML, label: ' ' });
+            styleField.defaultValue = getStyles() + getSuccessPageScript(suiteletUrl, printUrl);
+
+            // Build label group sections (display only, no individual print buttons)
             let groupsHtml = '';
             labelGroups.forEach((group, idx) => {
                 const serialListHtml = group.serialNumbers.map(s => `<li>${escapeXml(s)}</li>`).join('');
+                const actionLabel = {
+                    'likenew': 'Like New',
+                    'likenew_stock': 'Like New + Back to Stock',
+                    'move_testing': 'Move to Testing',
+                    'move_refurbishing': 'Move to Refurbishing'
+                }[group.action] || group.action;
+
                 groupsHtml += `
                     <div class="label-group">
                         <h3>${escapeXml(group.itemText)}</h3>
                         <p style="color:#64748b; margin:0 0 12px; font-size:14px;">
-                            Record #${group.recordId} &bull; ${group.serialNumbers.length} label${group.serialNumbers.length !== 1 ? 's' : ''}
-                            &bull; ${group.action === 'likenew_stock' ? 'Like New + Back to Stock' : 'Like New'}
+                            ${group.serialNumbers.length} label${group.serialNumbers.length !== 1 ? 's' : ''}
+                            &bull; ${actionLabel}
                         </p>
                         <ul class="serial-list">${serialListHtml}</ul>
-                        <button type="button" class="custom-btn btn-primary" onclick="printLabels${idx}()" style="width:100%;">
-                            Print Labels - ${escapeXml(group.itemText)}
-                        </button>
                     </div>
                 `;
             });
 
             const totalSerials = labelGroups.reduce((sum, g) => sum + g.serialNumbers.length, 0);
+
+            // Build transaction info lines
+            let transactionInfoHtml = '';
+            if (adjustmentTranId) {
+                transactionInfoHtml += `<p style="font-size:16px; margin:8px 0; color:#1e3c72;"><strong>Inventory Adjustment:</strong> ${escapeXml(String(adjustmentTranId))}</p>`;
+            }
+            if (binTransferTranId) {
+                transactionInfoHtml += `<p style="font-size:16px; margin:8px 0; color:#1e3c72;"><strong>Bin Transfer:</strong> ${escapeXml(String(binTransferTranId))}</p>`;
+            }
 
             const contentField = form.addField({ id: 'custpage_content', type: serverWidget.FieldType.INLINEHTML, label: ' ' });
             contentField.defaultValue = `
@@ -1037,12 +1681,14 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                     <div class="main-card">
                         <div class="success-card">
                             <div class="success-icon">&#10003;</div>
-                            <h2>Condition Change Complete</h2>
-                            <p>Inventory Adjustment ${escapeXml(String(adjTranId))} &bull; ${totalSerials} serial${totalSerials !== 1 ? 's' : ''} processed</p>
+                            <h2>Transactions have been created!</h2>
+                            ${transactionInfoHtml}
+                            <p style="color:#64748b; margin-top:16px;">${totalSerials} serial${totalSerials !== 1 ? 's' : ''} processed</p>
 
                             ${groupsHtml}
 
-                            <button type="button" class="custom-btn btn-outline" style="width:100%; margin-top:16px;" onclick="createAnother()">Process More</button>
+                            <button type="button" class="custom-btn btn-success" style="width:100%; margin-top:16px;" onclick="printLabels()">Print Labels (${totalSerials})</button>
+                            <button type="button" class="custom-btn btn-outline" style="width:100%; margin-top:12px;" onclick="createAnother()">Process More</button>
                         </div>
                     </div>
                 </div>
@@ -1105,75 +1751,101 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                 return;
             }
 
-            // For each serial with an action, look up source item details and find -LN target
-            const errors = [];
-            const targetItemCache = {}; // sourceItemId → { found, targetItem }
+            // Separate actions into adjustment vs bin transfer
+            const ADJUSTMENT_ACTIONS = ['likenew', 'likenew_stock'];
+            const BIN_TRANSFER_ACTIONS = ['move_testing', 'move_refurbishing'];
 
-            // Collect serials with actions and their group keys
-            const groupMap = {}; // key → group object
+            const errors = [];
+            const itemDetailsCache = {}; // itemId → { itemid, displayname, description }
+            const targetItemCache = {}; // sourceItemId → { found, targetItem } (for adjustment actions)
+
+            // Groups for inventory adjustment (condition change)
+            const adjustmentGroupMap = {};
+            // Groups for bin transfer (move to testing/refurbishing)
+            const binTransferGroupMap = {};
 
             for (const [idxStr, action] of Object.entries(actionMap)) {
                 const idx = parseInt(idxStr, 10);
                 const serial = serialData.valid[idx];
                 if (!serial) continue;
 
-                const sourceItemId = serial.itemId;
+                const itemId = serial.itemId;
 
-                // Look up source item name if not cached
-                if (!targetItemCache[sourceItemId]) {
-                    const itemDetails = getItemDetails(sourceItemId);
-                    if (!itemDetails) {
+                // Cache item details
+                if (!itemDetailsCache[itemId]) {
+                    const details = getItemDetails(itemId);
+                    if (details) {
+                        itemDetailsCache[itemId] = details;
+                    } else {
                         errors.push('Could not look up item details for: ' + serial.itemText);
-                        targetItemCache[sourceItemId] = { found: false };
                         continue;
                     }
+                }
 
-                    const likeNewName = getLikeNewItemName(itemDetails.itemid);
-                    const targetItem = findItemByName(likeNewName);
+                const itemDetails = itemDetailsCache[itemId];
 
-                    if (!targetItem) {
-                        errors.push('Like New item not found: ' + likeNewName + ' (source: ' + itemDetails.itemid + ')');
-                        targetItemCache[sourceItemId] = { found: false };
-                        continue;
+                if (ADJUSTMENT_ACTIONS.includes(action)) {
+                    // --- ADJUSTMENT ACTION: Need to find -LN target item ---
+                    if (!targetItemCache[itemId]) {
+                        const likeNewName = getLikeNewItemName(itemDetails.itemid);
+                        const targetItem = findItemByName(likeNewName);
+
+                        if (!targetItem) {
+                            errors.push('Like New item not found: ' + likeNewName + ' (source: ' + itemDetails.itemid + ')');
+                            targetItemCache[itemId] = { found: false };
+                        } else {
+                            targetItemCache[itemId] = { found: true, targetItem: targetItem };
+                        }
                     }
 
-                    targetItemCache[sourceItemId] = {
-                        found: true,
-                        sourceItemName: itemDetails.itemid,
-                        targetItem: targetItem
-                    };
+                    const cache = targetItemCache[itemId];
+                    if (!cache.found) continue;
+
+                    const key = itemId + '_' + serial.locationId + '_' + action;
+                    if (!adjustmentGroupMap[key]) {
+                        adjustmentGroupMap[key] = {
+                            sourceItemId: itemId,
+                            sourceItemName: itemDetails.itemid,
+                            targetItemId: cache.targetItem.id,
+                            targetItemName: cache.targetItem.itemid,
+                            targetDisplayName: cache.targetItem.displayname,
+                            targetDescription: cache.targetItem.description,
+                            locationId: serial.locationId,
+                            action: action,
+                            serials: []
+                        };
+                    }
+                    adjustmentGroupMap[key].serials.push({
+                        serialNumber: serial.serialNumber,
+                        serialId: serial.serialId,
+                        binId: serial.binId
+                    });
+
+                } else if (BIN_TRANSFER_ACTIONS.includes(action)) {
+                    // --- BIN TRANSFER ACTION: Same item, just move bin/status ---
+                    const key = itemId + '_' + serial.locationId + '_' + action;
+                    if (!binTransferGroupMap[key]) {
+                        binTransferGroupMap[key] = {
+                            itemId: itemId,
+                            itemText: itemDetails.displayname || itemDetails.itemid,
+                            itemDescription: itemDetails.description,
+                            locationId: serial.locationId,
+                            action: action,
+                            serials: []
+                        };
+                    }
+                    binTransferGroupMap[key].serials.push({
+                        serialNumber: serial.serialNumber,
+                        serialId: serial.serialId,
+                        binId: serial.binId
+                    });
                 }
-
-                const cache = targetItemCache[sourceItemId];
-                if (!cache.found) continue;
-
-                // Group key: sourceItem + location + action
-                const key = sourceItemId + '_' + serial.locationId + '_' + action;
-
-                if (!groupMap[key]) {
-                    groupMap[key] = {
-                        sourceItemId: sourceItemId,
-                        sourceItemName: cache.sourceItemName,
-                        targetItemId: cache.targetItem.id,
-                        targetItemName: cache.targetItem.itemid,
-                        targetDisplayName: cache.targetItem.displayname,
-                        targetDescription: cache.targetItem.description,
-                        locationId: serial.locationId,
-                        action: action,
-                        serials: []
-                    };
-                }
-
-                groupMap[key].serials.push({
-                    serialNumber: serial.serialNumber,
-                    serialId: serial.serialId,
-                    binId: serial.binId
-                });
             }
 
-            const groups = Object.values(groupMap);
+            const adjustmentGroups = Object.values(adjustmentGroupMap);
+            const binTransferGroups = Object.values(binTransferGroupMap);
 
-            if (groups.length === 0) {
+            if (adjustmentGroups.length === 0 && binTransferGroups.length === 0) {
                 const errMsg = errors.length > 0
                     ? 'Could not process: ' + errors.join('; ')
                     : 'No valid serials to process.';
@@ -1181,44 +1853,267 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                 return;
             }
 
-            // Show errors as warning but still process what we can
             if (errors.length > 0) {
-                log.audit('Condition Change Warnings', errors.join(' | '));
+                log.audit('Process Actions Warnings', errors.join(' | '));
             }
 
-            // Create inventory adjustment
-            let adjResult;
-            try {
-                const memoItems = groups.map(g => g.sourceItemName + ' → ' + g.targetItemName).join(', ');
-                adjResult = createConditionChangeAdjustment(groups, 'Condition Change: ' + memoItems);
-                log.audit('Inventory Adjustment Created', 'TranID: ' + adjResult.tranId + ' (Internal: ' + adjResult.adjId + ')');
-            } catch (e) {
-                log.error('Inventory Adjustment Error', e.message + ' | ' + e.stack);
-                createResultsPage(context, serialData, 'Inventory adjustment failed: ' + e.message, 'error');
+            // Track transaction IDs for display
+            let adjustmentTranId = null;
+            let binTransferTranId = null;
+            const labelGroups = [];
+
+            // --- Process Inventory Adjustments (condition change to -LN) ---
+            if (adjustmentGroups.length > 0) {
+                try {
+                    const adjResult = createConditionChangeAdjustment(adjustmentGroups, 'Created through Warehouse Assistant Dashboard.');
+                    log.audit('Inventory Adjustment Created', 'TranID: ' + adjResult.tranId);
+                    adjustmentTranId = adjResult.tranId;
+
+                    // Build label groups for adjustment (use target -LN item)
+                    adjustmentGroups.forEach(group => {
+                        const tKey = group.targetItemId + '_' + group.action;
+                        let existing = labelGroups.find(lg => lg.itemId === group.targetItemId && lg.action === group.action);
+                        if (!existing) {
+                            existing = {
+                                itemId: group.targetItemId,
+                                itemText: group.targetDisplayName || group.targetItemName,
+                                description: group.targetDescription,
+                                action: group.action,
+                                serialNumbers: []
+                            };
+                            labelGroups.push(existing);
+                        }
+                        group.serials.forEach(s => existing.serialNumbers.push(s.serialNumber));
+                    });
+                } catch (e) {
+                    log.error('Inventory Adjustment Error', e.message + ' | ' + e.stack);
+                    createResultsPage(context, serialData, 'Inventory adjustment failed: ' + e.message, 'error');
+                    return;
+                }
+            }
+
+            // --- Process Bin Transfers (move to testing/refurbishing) ---
+            if (binTransferGroups.length > 0) {
+                try {
+                    const transferResult = createBinTransfer(binTransferGroups, 'Via Warehouse Assistant Dashboard');
+                    log.audit('Bin Transfer Created', 'TranID: ' + transferResult.tranId);
+                    binTransferTranId = transferResult.tranId;
+
+                    // Build label groups for bin transfer (same item)
+                    binTransferGroups.forEach(group => {
+                        let existing = labelGroups.find(lg => lg.itemId === group.itemId && lg.action === group.action);
+                        if (!existing) {
+                            existing = {
+                                itemId: group.itemId,
+                                itemText: group.itemText,
+                                description: group.itemDescription,
+                                action: group.action,
+                                serialNumbers: []
+                            };
+                            labelGroups.push(existing);
+                        }
+                        group.serials.forEach(s => existing.serialNumbers.push(s.serialNumber));
+                    });
+                } catch (e) {
+                    log.error('Bin Transfer Error', e.message + ' | ' + e.stack);
+                    createResultsPage(context, serialData, 'Bin transfer failed: ' + e.message, 'error');
+                    return;
+                }
+            }
+
+            createSuccessPage(context, adjustmentTranId, binTransferTranId, labelGroups);
+        }
+
+        /**
+         * Handle non-serialized item processing.
+         */
+        function handleProcessNonSerialized(context) {
+            const itemId = context.request.parameters.custpage_ns_item;
+            const fromBinId = context.request.parameters.custpage_ns_bin;
+            const quantity = parseInt(context.request.parameters.custpage_ns_quantity) || 0;
+            const action = context.request.parameters.custpage_ns_action;
+
+            // Validate inputs
+            if (!itemId) {
+                createEntryForm(context, 'Please select an item.', 'warning');
+                return;
+            }
+            if (!fromBinId) {
+                createEntryForm(context, 'Please select a From Bin.', 'warning');
+                return;
+            }
+            if (quantity <= 0) {
+                createEntryForm(context, 'Please enter a valid quantity.', 'warning');
+                return;
+            }
+            if (!action) {
+                createEntryForm(context, 'Please select an action.', 'warning');
                 return;
             }
 
-            // Build label groups for the success page (grouped by target item)
-            const labelGroupMap = {};
-            groups.forEach(group => {
-                const tKey = group.targetItemId + '_' + group.action;
-                if (!labelGroupMap[tKey]) {
-                    labelGroupMap[tKey] = {
-                        itemId: group.targetItemId,
-                        itemText: group.targetDisplayName || group.targetItemName,
-                        description: group.targetDescription,
-                        action: group.action,
-                        serialNumbers: []
-                    };
+            // Get item details
+            const itemDetails = getItemDetails(itemId);
+            if (!itemDetails) {
+                createEntryForm(context, 'Could not find item details.', 'error');
+                return;
+            }
+
+            const ADJUSTMENT_ACTIONS = ['likenew', 'likenew_stock'];
+            const BIN_TRANSFER_ACTIONS = ['move_testing', 'move_refurbishing'];
+
+            let adjustmentTranId = null;
+            let binTransferTranId = null;
+
+            // Default location - using 1 as default, you may want to make this configurable
+            const locationId = '1';
+
+            if (ADJUSTMENT_ACTIONS.includes(action)) {
+                // Find the -LN target item
+                const likeNewName = getLikeNewItemName(itemDetails.itemid);
+                const targetItem = findItemByName(likeNewName);
+
+                if (!targetItem) {
+                    createEntryForm(context, 'Like New item not found: ' + likeNewName, 'error');
+                    return;
                 }
-                group.serials.forEach(s => {
-                    labelGroupMap[tKey].serialNumbers.push(s.serialNumber);
-                });
+
+                // Determine destination bin and status for 'likenew_stock' action
+                let toBinId = null;
+                let toStatusId = null;
+                if (action === 'likenew_stock') {
+                    toBinId = BACK_TO_STOCK_BIN_ID;
+                    toStatusId = BACK_TO_STOCK_STATUS_ID;
+                }
+
+                try {
+                    const adjResult = createNonSerializedAdjustment({
+                        sourceItemId: itemId,
+                        sourceItemName: itemDetails.itemid,
+                        targetItemId: targetItem.id,
+                        targetItemName: targetItem.itemid,
+                        locationId: locationId,
+                        quantity: quantity,
+                        fromBinId: fromBinId,
+                        toBinId: toBinId || fromBinId,
+                        toStatusId: toStatusId
+                    }, 'Created through Warehouse Assistant Dashboard.');
+
+                    adjustmentTranId = adjResult.tranId;
+                    log.audit('Non-Serialized Inventory Adjustment Created', 'TranID: ' + adjResult.tranId);
+                } catch (e) {
+                    log.error('Non-Serialized Adjustment Error', e.message + ' | ' + e.stack);
+                    createEntryForm(context, 'Inventory adjustment failed: ' + e.message, 'error');
+                    return;
+                }
+            } else if (BIN_TRANSFER_ACTIONS.includes(action)) {
+                // Determine destination bin and status
+                let toBinId, toStatusId;
+                if (action === 'move_testing') {
+                    toBinId = TESTING_BIN_ID;
+                    toStatusId = TESTING_STATUS_ID;
+                } else if (action === 'move_refurbishing') {
+                    toBinId = REFURBISHING_BIN_ID;
+                    toStatusId = REFURBISHING_STATUS_ID;
+                }
+
+                try {
+                    const transferResult = createNonSerializedBinTransfer({
+                        itemId: itemId,
+                        locationId: locationId,
+                        quantity: quantity,
+                        fromBinId: fromBinId,
+                        toBinId: toBinId,
+                        toStatusId: toStatusId
+                    }, 'Via Warehouse Assistant Dashboard');
+
+                    binTransferTranId = transferResult.tranId;
+                    log.audit('Non-Serialized Bin Transfer Created', 'TranID: ' + transferResult.tranId);
+                } catch (e) {
+                    log.error('Non-Serialized Bin Transfer Error', e.message + ' | ' + e.stack);
+                    createEntryForm(context, 'Bin transfer failed: ' + e.message, 'error');
+                    return;
+                }
+            }
+
+            // Show success page for non-serialized
+            createNonSerializedSuccessPage(context, adjustmentTranId, binTransferTranId, itemDetails, quantity, action);
+        }
+
+        /**
+         * Success page for non-serialized items (no serial list to display).
+         */
+        function createNonSerializedSuccessPage(context, adjustmentTranId, binTransferTranId, itemDetails, quantity, action) {
+            const form = serverWidget.createForm({ title: 'Transactions Created' });
+
+            const suiteletUrl = url.resolveScript({
+                scriptId: runtime.getCurrentScript().id,
+                deploymentId: runtime.getCurrentScript().deploymentId,
+                returnExternalUrl: true
             });
 
-            const labelGroups = Object.values(labelGroupMap);
+            // Build label data for printing
+            const printData = [{
+                itemText: itemDetails.displayname || itemDetails.itemid,
+                description: itemDetails.description || '',
+                quantity: quantity
+            }];
 
-            createSuccessPage(context, adjResult.tranId, labelGroups);
+            // Use whichever transaction ID is available for the print job
+            const recordIdForPrint = adjustmentTranId || binTransferTranId || '';
+
+            const printUrl = suiteletUrl +
+                '&ajax_action=printpage' +
+                '&record_id=' + encodeURIComponent(recordIdForPrint) +
+                '&label_data=' + encodeURIComponent(JSON.stringify(printData));
+
+            const styleField = form.addField({ id: 'custpage_styles', type: serverWidget.FieldType.INLINEHTML, label: ' ' });
+            styleField.defaultValue = getStyles() + `
+                <script>
+                    function printLabels() { window.open('${escapeForJs(printUrl)}', '_blank'); }
+                    function createAnother() { window.location.href = '${escapeForJs(suiteletUrl)}'; }
+                </script>
+            `;
+
+            // Build transaction info lines
+            let transactionInfoHtml = '';
+            if (adjustmentTranId) {
+                transactionInfoHtml += `<p style="font-size:16px; margin:8px 0; color:#1e3c72;"><strong>Inventory Adjustment:</strong> ${escapeXml(String(adjustmentTranId))}</p>`;
+            }
+            if (binTransferTranId) {
+                transactionInfoHtml += `<p style="font-size:16px; margin:8px 0; color:#1e3c72;"><strong>Bin Transfer:</strong> ${escapeXml(String(binTransferTranId))}</p>`;
+            }
+
+            const actionLabel = {
+                'likenew': 'Change to Like New',
+                'likenew_stock': 'Change to Like New & Back to Stock',
+                'move_testing': 'Move to Testing',
+                'move_refurbishing': 'Move to Refurbishing'
+            }[action] || action;
+
+            const contentField = form.addField({ id: 'custpage_content', type: serverWidget.FieldType.INLINEHTML, label: ' ' });
+            contentField.defaultValue = `
+                <div class="app-container">
+                    <div class="main-card">
+                        <div class="success-card">
+                            <div class="success-icon">&#10003;</div>
+                            <h2>Transactions have been created!</h2>
+                            ${transactionInfoHtml}
+
+                            <div class="label-group" style="margin-top:24px;">
+                                <h3>${escapeXml(itemDetails.displayname || itemDetails.itemid)}</h3>
+                                <p style="color:#64748b; margin:0 0 12px; font-size:14px;">
+                                    Quantity: ${quantity} &bull; ${actionLabel}
+                                </p>
+                            </div>
+
+                            <button type="button" class="custom-btn btn-success" style="width:100%; margin-top:16px;" onclick="printLabels()">Print Labels (${quantity})</button>
+                            <button type="button" class="custom-btn btn-outline" style="width:100%; margin-top:12px;" onclick="createAnother()">Process More</button>
+                        </div>
+                    </div>
+                </div>
+            `;
+
+            context.response.writePage(form);
         }
 
         // ====================================================================
@@ -1226,19 +2121,17 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
         // ====================================================================
 
         function handlePrintPdf(context) {
-            const recordId = context.request.parameters.record_id;
-            const itemText = context.request.parameters.item_text || '';
-            const description = context.request.parameters.description || '';
-            const serialsRaw = context.request.parameters.serials || '';
+            const recordId = context.request.parameters.record_id || '';
+            const labelDataRaw = context.request.parameters.label_data || '';
 
-            if (!recordId) {
-                context.response.write('Error: No record ID');
+            if (!labelDataRaw) {
+                context.response.write('Error: No label data');
                 return;
             }
 
             try {
-                const serialNumbers = serialsRaw.split('\n').map(s => s.trim()).filter(s => s !== '');
-                const pdfFile = generateLabelsPdf({ itemText, description, serialNumbers, recordId });
+                const labelGroups = JSON.parse(labelDataRaw);
+                const pdfFile = generateLabelsPdf(labelGroups, recordId);
 
                 context.response.setHeader({ name: 'Content-Type', value: 'application/pdf' });
                 context.response.setHeader({ name: 'Content-Disposition', value: 'inline; filename="Labels_' + recordId + '.pdf"' });
@@ -1251,9 +2144,7 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
 
         function handlePrintPage(context) {
             const recordId = context.request.parameters.record_id || '';
-            const itemText = context.request.parameters.item_text || '';
-            const description = context.request.parameters.description || '';
-            const serials = context.request.parameters.serials || '';
+            const labelData = context.request.parameters.label_data || '';
 
             const pdfUrl = url.resolveScript({
                 scriptId: runtime.getCurrentScript().id,
@@ -1262,9 +2153,7 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                 params: {
                     ajax_action: 'printpdf',
                     record_id: recordId,
-                    item_text: itemText,
-                    description: description,
-                    serials: serials
+                    label_data: labelData
                 }
             });
 
@@ -1316,6 +2205,11 @@ setTimeout(doPrint, 2000);
 
                     if (action === 'process_actions') {
                         handleProcessActions(context);
+                        return;
+                    }
+
+                    if (action === 'process_nonserialized') {
+                        handleProcessNonSerialized(context);
                         return;
                     }
 

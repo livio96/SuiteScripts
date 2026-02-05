@@ -686,10 +686,11 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
 
                 group.serials.forEach(serial => {
                     invDetail.selectNewLine({ sublistId: 'inventoryassignment' });
-                    invDetail.setCurrentSublistValue({
+                    // Use serial number text for bin transfers
+                    invDetail.setCurrentSublistText({
                         sublistId: 'inventoryassignment',
                         fieldId: 'issueinventorynumber',
-                        value: serial.serialId
+                        text: serial.serialNumber
                     });
                     invDetail.setCurrentSublistValue({
                         sublistId: 'inventoryassignment',
@@ -1529,7 +1530,8 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                             alert('Serial change actions must be set individually for each serial.');
                             return;
                         }
-                        var selects = document.querySelectorAll('table .action-select');
+                        // Select only row dropdowns (those with data-index attribute)
+                        var selects = document.querySelectorAll('select.action-select[data-index]');
                         for (var i = 0; i < selects.length; i++) {
                             selects[i].value = value;
                             handleActionChange(selects[i]);
@@ -1554,7 +1556,8 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                     }
 
                     function updateActionCount() {
-                        var selects = document.querySelectorAll('table .action-select');
+                        // Select only row dropdowns (those with data-index attribute)
+                        var selects = document.querySelectorAll('select.action-select[data-index]');
                         var count = 0;
                         for (var i = 0; i < selects.length; i++) {
                             if (selects[i].value !== '') count++;
@@ -1564,7 +1567,8 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                     }
 
                     function submitActions() {
-                        var selects = document.querySelectorAll('table .action-select');
+                        // Select only row dropdowns (those with data-index attribute)
+                        var selects = document.querySelectorAll('select.action-select[data-index]');
                         var actions = [];
                         var hasAction = false;
                         var missingNewSerial = false;
@@ -1610,7 +1614,8 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
 
                     document.addEventListener('DOMContentLoaded', function() {
                         window.onbeforeunload = null;
-                        var selects = document.querySelectorAll('table .action-select');
+                        // Select only row dropdowns (those with data-index attribute)
+                        var selects = document.querySelectorAll('select.action-select[data-index]');
                         for (var i = 0; i < selects.length; i++) {
                             selects[i].addEventListener('change', function() { handleActionChange(this); });
                         }

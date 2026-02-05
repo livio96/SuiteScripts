@@ -320,14 +320,36 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
             }
             adjRecord.setValue({ fieldId: 'memo', value: memo || 'Condition Change to Like New' });
 
+            // Look up average cost for each source item so the adjust-in matches the adjust-out
+            const costCache = {};
+            groups.forEach(group => {
+                if (!costCache[group.sourceItemId]) {
+                    try {
+                        const costLookup = search.lookupFields({
+                            type: search.Type.ITEM,
+                            id: group.sourceItemId,
+                            columns: ['averagecost']
+                        });
+                        costCache[group.sourceItemId] = parseFloat(costLookup.averagecost) || 0;
+                    } catch (e) {
+                        log.debug('Cost lookup failed for item ' + group.sourceItemId, e.message);
+                        costCache[group.sourceItemId] = 0;
+                    }
+                }
+            });
+
             groups.forEach(group => {
                 const serialCount = group.serials.length;
+                const itemCost = costCache[group.sourceItemId] || 0;
 
                 // --- REMOVAL LINE: take serials out of source item ---
                 adjRecord.selectNewLine({ sublistId: 'inventory' });
                 adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'item', value: group.sourceItemId });
                 adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'location', value: group.locationId });
                 adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'adjustqtyby', value: -serialCount });
+                if (itemCost > 0) {
+                    adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'unitcost', value: itemCost });
+                }
 
                 const removeDetail = adjRecord.getCurrentSublistSubrecord({
                     sublistId: 'inventory',
@@ -359,10 +381,14 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                 adjRecord.commitLine({ sublistId: 'inventory' });
 
                 // --- ADDITION LINE: add serials under target -LN item ---
+                // Use same unit cost as removal so the adjustment nets to zero
                 adjRecord.selectNewLine({ sublistId: 'inventory' });
                 adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'item', value: group.targetItemId });
                 adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'location', value: group.locationId });
                 adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'adjustqtyby', value: serialCount });
+                if (itemCost > 0) {
+                    adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'unitcost', value: itemCost });
+                }
 
                 const addDetail = adjRecord.getCurrentSublistSubrecord({
                     sublistId: 'inventory',

@@ -5,104 +5,56 @@
  *
  * Print Label UI Suitelet with PO Search
  */
-define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtime', 'N/render', 'N/encode'],
-    function(serverWidget, record, search, log, url, runtime, render, encode) {
+define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtime', 'N/render'],
+    function(serverWidget, record, search, log, url, runtime, render) {
 
-        function validateSerialNumbers(serialNumbers, itemId) {
-            if (!serialNumbers) return { valid: [], invalid: [], invalidReasons: {} };
+        function validateSerialNumbers(serialNumbers) {
+            if (!serialNumbers) return { valid: [], invalid: [], details: {} };
 
             const cleanedSerials = serialNumbers
                 .replace(/\r\n/g, '\n')
                 .replace(/\r/g, '\n')
                 .replace(/<br\s*\/?>/gi, '\n')
                 .split('\n')
-                .map(sn => sn.trim().toUpperCase())
+                .map(sn => sn.trim())
                 .filter(sn => sn !== '');
 
-            if (cleanedSerials.length === 0) return { valid: [], invalid: [], invalidReasons: {} };
+            if (cleanedSerials.length === 0) return { valid: [], invalid: [], details: {} };
 
-            const valid = [];
-            const invalid = [];
-            const invalidReasons = {};
-
-            // Build filter for all serial numbers
-            const serialFilterExpression = [];
+            const filterExpression = [];
             cleanedSerials.forEach((serial, index) => {
-                if (index > 0) serialFilterExpression.push('OR');
-                serialFilterExpression.push(['inventorynumber', 'is', serial]);
+                if (index > 0) filterExpression.push('OR');
+                filterExpression.push(['inventorynumber', 'is', serial]);
             });
 
-            // Track all serials found in the system (any item, any qty)
-            const allFoundSerials = {};
+            const foundSerials = {};
 
             try {
-                // First search: find all matching serials regardless of item/qty
                 search.create({
                     type: 'inventorynumber',
-                    filters: serialFilterExpression,
-                    columns: [
-                        'inventorynumber',
-                        'item',
-                        'quantityonhand'
-                    ]
+                    filters: filterExpression,
+                    columns: ['inventorynumber']
                 }).run().each(result => {
                     const sn = result.getValue('inventorynumber');
-                    const serialItemId = result.getValue('item');
-                    const qtyOnHand = parseFloat(result.getValue('quantityonhand')) || 0;
-
-                    if (!allFoundSerials[sn]) {
-                        allFoundSerials[sn] = [];
-                    }
-                    allFoundSerials[sn].push({
-                        itemId: serialItemId,
-                        itemName: result.getText('item'),
-                        qtyOnHand: qtyOnHand
-                    });
+                    foundSerials[sn] = true;
                     return true;
                 });
             } catch (e) {
-                log.error('Serial Validation Search Error', e.message);
+                log.error('Search Error', e.message);
             }
 
-            // Validate each serial
+            const valid = [];
+            const invalid = [];
+
             cleanedSerials.forEach(serial => {
-                const serialData = allFoundSerials[serial];
-
-                if (!serialData || serialData.length === 0) {
-                    // Serial doesn't exist at all
-                    invalid.push(serial);
-                    invalidReasons[serial] = 'Serial number not found in system';
-                    return;
-                }
-
-                // Check if serial exists under the selected item with qty > 0
-                const matchingItem = serialData.find(data =>
-                    String(data.itemId) === String(itemId) && data.qtyOnHand > 0
-                );
-
-                if (matchingItem) {
+                if (foundSerials[serial]) {
                     valid.push(serial);
-                    return;
-                }
-
-                // Serial exists but not valid for this item - determine why
-                const existsUnderSelectedItem = serialData.find(data =>
-                    String(data.itemId) === String(itemId)
-                );
-
-                if (existsUnderSelectedItem) {
-                    // Serial exists under correct item but qty is 0
-                    invalid.push(serial);
-                    invalidReasons[serial] = 'Serial has no quantity on hand (qty: ' + existsUnderSelectedItem.qtyOnHand + ')';
                 } else {
-                    // Serial exists but under a different item
-                    const otherItems = serialData.map(d => d.itemName).join(', ');
                     invalid.push(serial);
-                    invalidReasons[serial] = 'Serial belongs to different item: ' + otherItems;
                 }
             });
 
-            return { valid, invalid, invalidReasons };
+            return { valid, invalid };
         }
 
         function searchPOReceipts(poNumber) {
@@ -212,90 +164,73 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
         }
 
         function generateLabelsPdf(labelData) {
-            // Default recordId for legacy single-item calls
-            const defaultRecordId = labelData.recordId || '';
+            const itemName = escapeXml(labelData.itemText || labelData.item);
+            const description = escapeXml(labelData.description);
+            const recordId = labelData.recordId || '';
+
             let bodyContent = '';
 
-            // Handle multiple items - labelData.items is an array of {itemText, description, serialNumbers, recordId}
-            const items = labelData.items || [{
-                itemText: labelData.itemText || labelData.item,
-                description: labelData.description,
-                serialNumbers: labelData.serialNumbers,
-                recordId: defaultRecordId
-            }];
-
-            items.forEach(item => {
-                const itemName = escapeXml(item.itemText || '');
-                const description = escapeXml(item.description || '');
-                // Use item's own recordId, or fall back to default
-                const recordId = item.recordId || defaultRecordId;
-
-                if (item.serialNumbers && item.serialNumbers.length > 0) {
-                    item.serialNumbers.forEach(serialNumber => {
-                        const escapedSerial = escapeXml(serialNumber);
-                        bodyContent += `
-                        <body width="101.6mm" height="76.2mm" padding="0.0in 0.1in 0.0in 0.0in">
-                            <table align="right" width="98%" height="50%">
-                                <tr height="12%">
-                                    <td align="center">
-                                        <table width="100%">
-                                            <tr>
-                                                <td style="font-size:18px;">${itemName}</td>
-                                                <td align="right"><table style="border:1px;"><tr><td style="font-size:16px;">${recordId}</td></tr></table></td>
-                                            </tr>
-                                        </table>
-                                    </td>
-                                </tr>
-                                <tr height="25%">
-                                    <td align="center"><table width="100%"><tr><td style="font-size:11px;">${description}</td></tr></table></td>
-                                </tr>
-                            </table>
-                            <table align="left" width="100%" height="50%" v-align="bottom">
-                                <tr height="60px">
-                                    <td height="60px" align="left" style="font-size:10px;">
-                                        <barcode height="60px" width="240px" codetype="code128" showtext="true" value="${escapedSerial}"/>
-                                    </td>
-                                </tr>
-                                <tr>
-                                    <td align="left" style="font-size:25px;">
-                                        <barcode height="60px" width="220px" codetype="code128" showtext="true" value="${itemName}"/>
-                                    </td>
-                                </tr>
-                            </table>
-                        </body>`;
-                    });
-                } else {
-                    // Non-serialized: print labels based on quantity
-                    const labelCount = parseInt(item.quantity, 10) || 1;
-                    for (let i = 0; i < labelCount; i++) {
-                        bodyContent += `
-                        <body width="101.6mm" height="76.2mm" padding="0.0in 0.1in 0.0in 0.0in">
-                            <table align="right" width="98%" height="50%">
-                                <tr height="12%">
-                                    <td align="center">
-                                        <table width="100%">
-                                            <tr>
-                                                <td style="font-size:18px;">${itemName}</td>
-                                                <td align="right"><table style="border:1px;"><tr><td style="font-size:16px;">${recordId}</td></tr></table></td>
-                                            </tr>
-                                        </table>
-                                    </td>
-                                </tr>
-                                <tr height="25%">
-                                    <td align="center"><table width="100%"><tr><td style="font-size:11px;">${description}</td></tr></table></td>
-                                </tr>
-                            </table>
-                            <table align="left" width="100%" height="50%" v-align="bottom">
-                                <tr>
-                                    <td align="left" style="font-size:25px;">
-                                        <barcode height="60px" width="220px" codetype="code128" showtext="true" value="${itemName}"/>
-                                    </td>
-                                </tr>
-                            </table>
-                        </body>`;
-                    }
-                }
-            });
+            if (labelData.serialNumbers && labelData.serialNumbers.length > 0) {
+                labelData.serialNumbers.forEach(serialNumber => {
+                    const escapedSerial = escapeXml(serialNumber);
+                    bodyContent += `
+                    <body width="101.6mm" height="76.2mm" padding="0.0in 0.1in 0.0in 0.15in">
+                        <table align="right" width="98%" height="50%">
+                            <tr height="12%">
+                                <td align="center">
+                                    <table width="100%">
+                                        <tr>
+                                            <td style="font-size:18px;">${itemName}</td>
+                                            <td align="right"><table style="border:1px;"><tr><td style="font-size:16px;">${recordId}</td></tr></table></td>
+                                        </tr>
+                                    </table>
+                                </td>
+                            </tr>
+                            <tr height="25%">
+                                <td align="center"><table width="100%"><tr><td style="font-size:11px;">${description}</td></tr></table></td>
+                            </tr>
+                        </table>
+                        <table align="left" width="100%" height="50%" v-align="bottom">
+                            <tr height="60px">
+                                <td height="60px" align="left" style="font-size:10px;">
+                                    <barcode height="60px" width="240px" codetype="code128" showtext="true" value="${escapedSerial}"/>
+                                </td>
+                            </tr>
+                            <tr>
+                                <td align="left" style="font-size:25px;">
+                                    <barcode height="60px" width="220px" codetype="code128" showtext="true" value="${itemName}"/>
+                                </td>
+                            </tr>
+                        </table>
+                    </body>`;
+                });
+            } else {
+                bodyContent += `
+                <body width="101.6mm" height="76.2mm" padding="0.0in 0.1in 0.0in 0.15in">
+                    <table align="right" width="98%" height="50%">
+                        <tr height="12%">
+                            <td align="center">
+                                <table width="100%">
+                                    <tr>
+                                        <td style="font-size:18px;">${itemName}</td>
+                                        <td align="right"><table style="border:1px;"><tr><td style="font-size:16px;">${recordId}</td></tr></table></td>
+                                    </tr>
+                                </table>
+                            </td>
+                        </tr>
+                        <tr height="25%">
+                            <td align="center"><table width="100%"><tr><td style="font-size:11px;">${description}</td></tr></table></td>
+                        </tr>
+                    </table>
+                    <table align="left" width="100%" height="50%" v-align="bottom">
+                        <tr>
+                            <td align="left" style="font-size:25px;">
+                                <barcode height="60px" width="220px" codetype="code128" showtext="true" value="${itemName}"/>
+                            </td>
+                        </tr>
+                    </table>
+                </body>`;
+            }
 
             const xml = `<?xml version="1.0"?>
 <!DOCTYPE pdf PUBLIC "-//big.faceless.org//report" "report-1.1.dtd">
@@ -541,13 +476,26 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                         form.submit();
                     }
 
+                    function reprintLabels() {
+                        var reprintId = document.getElementById('custpage_reprint_id');
+                        if (!reprintId || !reprintId.value.trim()) { alert('Enter a Print Label record ID'); return; }
+                        window.onbeforeunload = null;
+                        var form = document.forms[0];
+                        var action = document.createElement('input');
+                        action.type = 'hidden'; action.name = 'custpage_action'; action.value = 'reprint';
+                        form.appendChild(action);
+                        form.submit();
+                    }
+
                     function clearForm() {
                         var item = document.getElementById('custpage_item');
                         var serial = document.getElementById('custpage_serial_numbers');
                         var po = document.getElementById('custpage_po_number');
+                        var reprintId = document.getElementById('custpage_reprint_id');
                         if (item) item.selectedIndex = 0;
                         if (serial) serial.value = '';
                         if (po) po.value = '';
+                        if (reprintId) reprintId.value = '';
                         updateCount();
                     }
 
@@ -571,36 +519,21 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
             return `
                 <script>
                     function toggleAll(cb) {
-                        var boxes = document.querySelectorAll('input[name="custpage_cb_item"]');
+                        var boxes = document.querySelectorAll('input[name="custpage_select_item"]');
                         for (var i = 0; i < boxes.length; i++) boxes[i].checked = cb.checked;
                         updateSelected();
                     }
 
                     function updateSelected() {
-                        var boxes = document.querySelectorAll('input[name="custpage_cb_item"]:checked');
+                        var boxes = document.querySelectorAll('input[name="custpage_select_item"]:checked');
                         var display = document.getElementById('selected_count');
                         if (display) display.textContent = boxes.length;
                     }
 
                     function printSelected() {
-                        var boxes = document.querySelectorAll('input[name="custpage_cb_item"]:checked');
+                        var boxes = document.querySelectorAll('input[name="custpage_select_item"]:checked');
                         if (boxes.length === 0) { alert('Select at least one item'); return; }
-
-                        // Collect all selected indexes as comma-separated string
-                        var selectedIndexes = [];
-                        for (var i = 0; i < boxes.length; i++) {
-                            selectedIndexes.push(boxes[i].value);
-                        }
-
                         var form = document.forms[0];
-
-                        // Add hidden field with comma-separated indexes
-                        var selectedField = document.createElement('input');
-                        selectedField.type = 'hidden';
-                        selectedField.name = 'custpage_selected_indexes';
-                        selectedField.value = selectedIndexes.join(',');
-                        form.appendChild(selectedField);
-
                         var action = document.createElement('input');
                         action.type = 'hidden'; action.name = 'custpage_action'; action.value = 'print_selected';
                         form.appendChild(action);
@@ -610,7 +543,7 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                     function goBack() { window.location.href = '${suiteletUrl}'; }
 
                     document.addEventListener('DOMContentLoaded', function() {
-                        var boxes = document.querySelectorAll('input[name="custpage_cb_item"]');
+                        var boxes = document.querySelectorAll('input[name="custpage_select_item"]');
                         for (var i = 0; i < boxes.length; i++) boxes[i].addEventListener('change', updateSelected);
                         updateSelected();
                     });
@@ -618,50 +551,10 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
             `;
         }
 
-        function getSuccessPageScript(suiteletUrl) {
+        function getSuccessPageScript(suiteletUrl, pdfUrl) {
             return `
                 <script>
-                    function printLabels() {
-                        // Open window first to avoid popup blocker
-                        var printWindow = window.open('', 'printLabels', 'width=800,height=600');
-                        if (!printWindow) {
-                            alert('Please allow popups for this site to print labels');
-                            return;
-                        }
-                        printWindow.document.write('<html><body><h2>Generating labels...</h2></body></html>');
-
-                        // Get values from hidden spans (avoid nested form issue)
-                        var recordId = document.getElementById('data_record_id').textContent;
-                        var itemsBase64 = document.getElementById('data_items_base64').textContent;
-
-                        // Create form dynamically outside NetSuite's form
-                        var form = document.createElement('form');
-                        form.method = 'POST';
-                        form.action = '${escapeForJs(suiteletUrl)}';
-                        form.target = 'printLabels';
-
-                        var actionInput = document.createElement('input');
-                        actionInput.type = 'hidden';
-                        actionInput.name = 'custpage_action';
-                        actionInput.value = 'print_labels_post';
-                        form.appendChild(actionInput);
-
-                        var recordInput = document.createElement('input');
-                        recordInput.type = 'hidden';
-                        recordInput.name = 'custpage_record_id';
-                        recordInput.value = recordId;
-                        form.appendChild(recordInput);
-
-                        var itemsInput = document.createElement('input');
-                        itemsInput.type = 'hidden';
-                        itemsInput.name = 'custpage_items_base64';
-                        itemsInput.value = itemsBase64;
-                        form.appendChild(itemsInput);
-
-                        document.body.appendChild(form);
-                        form.submit();
-                        document.body.removeChild(form);
-                    }
+                    function printLabels() { window.open('${escapeForJs(pdfUrl)}', '_blank'); }
                     function createAnother() { window.location.href = '${escapeForJs(suiteletUrl)}'; }
                 </script>
             `;
@@ -711,6 +604,15 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                                 <button type="button" class="custom-btn btn-success" onclick="createLabels()">Generate Labels</button>
                                 <button type="button" class="custom-btn btn-outline" onclick="clearForm()">Clear</button>
                             </div>
+
+                            <div style="border-top: 2px solid #e2e8f0; margin-top: 28px; padding-top: 24px;">
+                                <label class="custom-label">Reprint Labels</label>
+                                <p style="color:#64748b; font-size:13px; margin-bottom:12px;">Enter an existing Print Label record ID to reprint</p>
+                                <div class="input-row">
+                                    <div class="flex-grow" id="reprint-field-wrap"></div>
+                                    <button type="button" class="custom-btn btn-primary" onclick="reprintLabels()">Reprint</button>
+                                </div>
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -728,6 +630,8 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
             serialField.updateDisplaySize({ height: 8, width: 60 });
             if (prefill && prefill.serialNumbers) serialField.defaultValue = prefill.serialNumbers;
 
+            const reprintField = form.addField({ id: 'custpage_reprint_id', type: serverWidget.FieldType.TEXT, label: 'Reprint Record ID' });
+
             // Container End + Field mover script
             const containerEnd = form.addField({ id: 'custpage_container_end', type: serverWidget.FieldType.INLINEHTML, label: ' ' });
             containerEnd.defaultValue = `</div>
@@ -737,14 +641,17 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                     var poWrap = document.getElementById('po-field-wrap');
                     var itemWrap = document.getElementById('item-field-wrap');
                     var serialWrap = document.getElementById('serial-field-wrap');
+                    var reprintWrap = document.getElementById('reprint-field-wrap');
 
                     var poLabel = document.getElementById('custpage_po_number_fs_lbl_uir_label');
                     var itemLabel = document.getElementById('custpage_item_fs_lbl_uir_label');
                     var serialLabel = document.getElementById('custpage_serial_numbers_fs_lbl_uir_label');
+                    var reprintLabel = document.getElementById('custpage_reprint_id_fs_lbl_uir_label');
 
                     if (poWrap && poLabel) poWrap.appendChild(poLabel.parentNode);
                     if (itemWrap && itemLabel) itemWrap.appendChild(itemLabel.parentNode);
                     if (serialWrap && serialLabel) serialWrap.appendChild(serialLabel.parentNode);
+                    if (reprintWrap && reprintLabel) reprintWrap.appendChild(reprintLabel.parentNode);
 
                     updateCount();
                 });
@@ -773,7 +680,7 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                     ? `<span class="badge badge-success">${cnt}</span>`
                     : `<span class="badge badge-muted">0</span>`;
                 rows += `<tr>
-                    <td><input type="checkbox" name="custpage_cb_item" value="${idx}" /></td>
+                    <td><input type="checkbox" name="custpage_select_item" value="${idx}" /></td>
                     <td><strong>${escapeXml(item.itemText)}</strong></td>
                     <td>${escapeXml(item.receiptNumber)}</td>
                     <td>${item.quantity}</td>
@@ -841,69 +748,40 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                 returnExternalUrl: true
             });
 
-            // Handle both single item (legacy) and multiple items formats
-            const items = labelData.items || [{
-                itemText: labelData.itemText || '',
-                description: labelData.description || '',
-                serialNumbers: labelData.serialNumbers || []
-            }];
-
-            // Store items data as base64-encoded JSON to avoid escaping issues
-            const itemsJson = JSON.stringify(items);
-            const itemsBase64 = encode.convert({
-                string: itemsJson,
-                inputEncoding: encode.Encoding.UTF_8,
-                outputEncoding: encode.Encoding.BASE_64
-            });
+            const serialsParam = (labelData.serialNumbers || []).join('\n');
+            const printUrl = suiteletUrl +
+                '&ajax_action=printpage' +
+                '&record_id=' + encodeURIComponent(recordId) +
+                '&item_text=' + encodeURIComponent(labelData.itemText || '') +
+                '&description=' + encodeURIComponent(labelData.description || '') +
+                '&serials=' + encodeURIComponent(serialsParam);
 
             // Styles
             const styleField = form.addField({ id: 'custpage_styles', type: serverWidget.FieldType.INLINEHTML, label: ' ' });
-            styleField.defaultValue = getStyles() + getSuccessPageScript(suiteletUrl);
+            styleField.defaultValue = getStyles() + getSuccessPageScript(suiteletUrl, printUrl);
 
-            // Calculate total labels (1 per serial if serialized, otherwise use quantity)
-            const totalLabels = labelData.totalLabels || items.reduce((sum, item) => {
-                const hasSerials = item.serialNumbers && item.serialNumbers.length > 0;
-                const quantity = parseInt(item.quantity, 10) || 1;
-                return sum + (hasSerials ? item.serialNumbers.length : quantity);
-            }, 0) || 1;
+            const hasSerials = labelData.serialNumbers && labelData.serialNumbers.length > 0;
+            const count = hasSerials ? labelData.serialNumbers.length : 1;
+            const serialList = hasSerials ? labelData.serialNumbers.map(s => `<li>${escapeXml(s)}</li>`).join('') : '';
 
-            // Build items display - group serials by item
-            let itemsHtml = '';
-            items.forEach(item => {
-                const hasSerials = item.serialNumbers && item.serialNumbers.length > 0;
-                const serialList = hasSerials ? item.serialNumbers.map(s => `<li>${escapeXml(s)}</li>`).join('') : '';
-                const itemRecordId = item.recordId || '';
-                const quantity = parseInt(item.quantity, 10) || 1;
-                const labelInfo = hasSerials
-                    ? `${item.serialNumbers.length} serial${item.serialNumbers.length !== 1 ? 's' : ''}`
-                    : `${quantity} label${quantity !== 1 ? 's' : ''} (non-serialized)`;
-                itemsHtml += `
-                    <div style="background:#f8fafc; border-radius:12px; padding:20px; margin-bottom:16px; text-align:center;">
-                        <div style="font-size:20px; font-weight:700; color:#1e3c72;">${escapeXml(item.itemText)}</div>
-                        <div style="font-size:12px; color:#94a3b8; margin-top:4px;">Record #${itemRecordId}</div>
-                        <div style="font-size:13px; color:#64748b; margin-top:4px;">${labelInfo}</div>
-                    </div>
-                    ${hasSerials ? `<ul class="serial-list">${serialList}</ul>` : ''}
-                `;
-            });
-
-            // Content - buttons at the top
-            const recordCount = items.filter(i => i.recordId).length || 1;
+            // Content
             const contentField = form.addField({ id: 'custpage_content', type: serverWidget.FieldType.INLINEHTML, label: ' ' });
             contentField.defaultValue = `
-                <span id="data_record_id" style="display:none;">${recordId}</span>
-                <span id="data_items_base64" style="display:none;">${itemsBase64}</span>
                 <div class="app-container">
                     <div class="main-card">
                         <div class="success-card">
                             <div class="success-icon">✓</div>
                             <h2>Labels Ready</h2>
-                            <p>${recordCount} record${recordCount !== 1 ? 's' : ''} • ${totalLabels} label${totalLabels !== 1 ? 's' : ''} created</p>
+                            <p>Record #${recordId} • ${count} label${count !== 1 ? 's' : ''} created</p>
 
-                            <button type="button" class="custom-btn btn-success" style="width:100%; margin-bottom:12px; margin-top:24px;" onclick="printLabels()">Print Labels</button>
-                            <button type="button" class="custom-btn btn-outline" style="width:100%; margin-bottom:24px;" onclick="createAnother()">Create More</button>
+                            <div style="background:#f8fafc; border-radius:12px; padding:20px; margin:24px 0; text-align:center;">
+                                <div style="font-size:24px; font-weight:700; color:#1e3c72;">${escapeXml(labelData.itemText)}</div>
+                            </div>
 
-                            ${itemsHtml}
+                            ${hasSerials ? `<ul class="serial-list">${serialList}</ul>` : ''}
+
+                            <button type="button" class="custom-btn btn-success" style="width:100%; margin-bottom:12px;" onclick="printLabels()">Print Labels</button>
+                            <button type="button" class="custom-btn btn-outline" style="width:100%;" onclick="createAnother()">Create More</button>
                         </div>
                     </div>
                 </div>
@@ -914,9 +792,6 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
 
         function handlePrintPdf(context) {
             const recordId = context.request.parameters.record_id;
-            const itemsDataRaw = context.request.parameters.items_data || '';
-
-            // Legacy support for old single-item format
             const itemText = context.request.parameters.item_text || '';
             const description = context.request.parameters.description || '';
             const serialsRaw = context.request.parameters.serials || '';
@@ -927,20 +802,8 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
             }
 
             try {
-                let items;
-
-                if (itemsDataRaw) {
-                    // New multi-item format - parameter is already decoded by NetSuite
-                    items = JSON.parse(itemsDataRaw);
-                    log.debug('PDF Generation', 'Items count: ' + items.length + ', Data: ' + itemsDataRaw.substring(0, 200));
-                } else {
-                    // Legacy single-item format
-                    const serialNumbers = serialsRaw.split('\n').map(s => s.trim()).filter(s => s !== '');
-                    items = [{ itemText, description, serialNumbers }];
-                }
-
-                log.debug('PDF Generation', 'Generating PDF for ' + items.length + ' items');
-                const pdfFile = generateLabelsPdf({ items, recordId });
+                const serialNumbers = serialsRaw.split('\n').map(s => s.trim()).filter(s => s !== '');
+                const pdfFile = generateLabelsPdf({ itemText, description, serialNumbers, recordId });
 
                 context.response.setHeader({ name: 'Content-Type', value: 'application/pdf' });
                 context.response.setHeader({ name: 'Content-Disposition', value: 'inline; filename="Labels_' + recordId + '.pdf"' });
@@ -953,85 +816,32 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
 
         function handlePrintPage(context) {
             const recordId = context.request.parameters.record_id || '';
-            const itemsDataRaw = context.request.parameters.items_data || '';
-
-            // Legacy support
             const itemText = context.request.parameters.item_text || '';
             const description = context.request.parameters.description || '';
-            const serialsRaw = context.request.parameters.serials || '';
+            const serials = context.request.parameters.serials || '';
 
-            log.debug('Print Page', 'items_data length: ' + itemsDataRaw.length + ', recordId: ' + recordId);
+            const pdfUrl = url.resolveScript({
+                scriptId: runtime.getCurrentScript().id,
+                deploymentId: runtime.getCurrentScript().deploymentId,
+                returnExternalUrl: true,
+                params: { ajax_action: 'printpdf', record_id: recordId, item_text: itemText, description: description, serials: serials }
+            });
 
-            try {
-                let items;
-
-                if (itemsDataRaw) {
-                    items = JSON.parse(itemsDataRaw);
-                    log.debug('Print Page', 'Parsed ' + items.length + ' items from items_data');
-                } else {
-                    const serialNumbers = serialsRaw.split('\n').map(s => s.trim()).filter(s => s !== '');
-                    items = [{ itemText, description, serialNumbers }];
-                }
-
-                // Generate PDF directly instead of using iframe to avoid URL length issues
-                const pdfFile = generateLabelsPdf({ items, recordId });
-
-                // Embed PDF and auto-print using Blob URL for same-origin access
-                const pdfBase64 = pdfFile.getContents();
-                const html = `<!DOCTYPE html>
+            const html = `<!DOCTYPE html>
 <html><head><title>Print Labels</title>
-<style>
-html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; }
-iframe { width: 100%; height: 100%; border: none; }
-</style>
+<style>* { margin: 0; padding: 0; } html, body, iframe { width: 100%; height: 100%; border: none; }</style>
 </head><body>
-<iframe id="pdfFrame"></iframe>
+<iframe id="pdf" src="${escapeXml(pdfUrl)}"></iframe>
 <script>
-(function() {
-    var pdfBase64 = "${pdfBase64}";
-    var frame = document.getElementById('pdfFrame');
-    var printed = false;
-
-    // Convert base64 to Blob URL (same-origin, allows printing)
-    var byteCharacters = atob(pdfBase64);
-    var byteNumbers = new Array(byteCharacters.length);
-    for (var i = 0; i < byteCharacters.length; i++) {
-        byteNumbers[i] = byteCharacters.charCodeAt(i);
-    }
-    var byteArray = new Uint8Array(byteNumbers);
-    var blob = new Blob([byteArray], {type: 'application/pdf'});
-    var blobUrl = URL.createObjectURL(blob);
-
-    frame.src = blobUrl;
-
-    function triggerPrint() {
-        if (printed) return;
-        printed = true;
-        try {
-            frame.contentWindow.focus();
-            frame.contentWindow.print();
-        } catch (e) {
-            // Fallback: print the whole window
-            window.print();
-        }
-    }
-
-    // Try on iframe load
-    frame.onload = function() {
-        setTimeout(triggerPrint, 2000);
-    };
-
-    // Fallback timer in case onload doesn't fire
-    setTimeout(triggerPrint, 3500);
-})();
+var printed = false;
+function doPrint() { if (printed) return; printed = true; try { document.getElementById('pdf').contentWindow.print(); } catch(e) { window.print(); } }
+document.getElementById('pdf').onload = function() { setTimeout(doPrint, 500); };
+setTimeout(doPrint, 2000);
 </script>
 </body></html>`;
-                context.response.setHeader({ name: 'Content-Type', value: 'text/html' });
-                context.response.write(html);
-            } catch (e) {
-                log.error('Print Page Error', e.message);
-                context.response.write('Error generating print page: ' + e.message);
-            }
+
+            context.response.setHeader({ name: 'Content-Type', value: 'text/html' });
+            context.response.write(html);
         }
 
         function handlePOSearch(context) {
@@ -1059,9 +869,7 @@ iframe { width: 100%; height: 100%; border: none; }
 
         function handlePrintSelected(context) {
             const poDataRaw = context.request.parameters.custpage_po_data;
-            const selectedIndexesRaw = context.request.parameters.custpage_selected_indexes || '';
-
-            log.debug('handlePrintSelected', 'selectedIndexesRaw: ' + selectedIndexesRaw);
+            const selectedItems = context.request.parameters.custpage_select_item;
 
             if (!poDataRaw) {
                 createEntryForm(context, 'Error: PO data not found', 'error');
@@ -1076,92 +884,65 @@ iframe { width: 100%; height: 100%; border: none; }
                 return;
             }
 
-            // Parse comma-separated indexes
             let selectedIndexes = [];
-            if (selectedIndexesRaw) {
-                selectedIndexes = selectedIndexesRaw.split(',').map(i => parseInt(i.trim(), 10)).filter(i => !isNaN(i));
+            if (Array.isArray(selectedItems)) {
+                selectedIndexes = selectedItems.map(i => parseInt(i, 10));
+            } else if (selectedItems) {
+                selectedIndexes = [parseInt(selectedItems, 10)];
             }
-
-            log.debug('handlePrintSelected', 'Parsed indexes: ' + JSON.stringify(selectedIndexes));
 
             if (selectedIndexes.length === 0) {
                 createPOResultsPage(context, poResults, 'Select at least one item', 'warning');
                 return;
             }
 
-            // Collect items (both serialized and non-serialized)
-            const itemsToprint = [];
-            let totalLabels = 0;
+            const allSerials = [];
+            let firstItem = null;
 
             selectedIndexes.forEach(index => {
                 if (poResults.items[index]) {
                     const item = poResults.items[index];
-                    // Look up item details
-                    let itemText = item.itemText;
-                    let description = '';
-
-                    if (item.itemId) {
-                        try {
-                            const lookup = search.lookupFields({
-                                type: search.Type.ITEM,
-                                id: item.itemId,
-                                columns: ['itemid', 'displayname', 'salesdescription']
-                            });
-                            itemText = lookup.displayname || lookup.itemid || item.itemText;
-                            description = lookup.salesdescription || '';
-                        } catch (e) {
-                            log.debug('Item lookup failed', e.message);
-                        }
-                    }
-
-                    const hasSerials = item.serialNumbers && item.serialNumbers.length > 0;
-                    const quantity = parseInt(item.quantity, 10) || 1;
-                    // Convert serial numbers to uppercase for consistency
-                    const uppercaseSerials = hasSerials ? item.serialNumbers.map(sn => sn.toUpperCase()) : [];
-                    itemsToprint.push({
-                        itemId: item.itemId,
-                        itemText: itemText,
-                        description: description,
-                        serialNumbers: uppercaseSerials,
-                        quantity: quantity
-                    });
-                    // Count labels: 1 per serial if serialized, otherwise use quantity received
-                    totalLabels += hasSerials ? item.serialNumbers.length : quantity;
+                    if (!firstItem) firstItem = item;
+                    allSerials.push(...item.serialNumbers);
                 }
             });
 
-            if (itemsToprint.length === 0) {
-                createPOResultsPage(context, poResults, 'Select at least one item', 'warning');
+            if (allSerials.length === 0) {
+                createPOResultsPage(context, poResults, 'Selected items have no serial numbers', 'warning');
                 return;
             }
 
-            // Log collected items for debugging
-            log.debug('Items to Print', 'Count: ' + itemsToprint.length + ', Items: ' + JSON.stringify(itemsToprint.map(i => ({ name: i.itemText, serials: i.serialNumbers.length, qty: i.quantity }))));
+            let itemText = firstItem.itemText;
+            let description = '';
+
+            if (firstItem.itemId) {
+                try {
+                    const lookup = search.lookupFields({
+                        type: search.Type.ITEM,
+                        id: firstItem.itemId,
+                        columns: ['itemid', 'displayname', 'salesdescription']
+                    });
+                    itemText = lookup.displayname || lookup.itemid || firstItem.itemText;
+                    description = lookup.salesdescription || '';
+                } catch (e) {
+                    log.debug('Item lookup failed', e.message);
+                }
+            }
 
             try {
-                // Create one print label record PER item
-                const createdRecords = [];
+                const rec = record.create({ type: 'customrecord_print_label', isDynamic: true });
+                rec.setValue({ fieldId: 'custrecord_pl_item_number', value: firstItem.itemId });
+                rec.setValue({ fieldId: 'custrecord_express_entry', value: allSerials.join('<br>') });
 
-                itemsToprint.forEach(item => {
-                    const rec = record.create({ type: 'customrecord_print_label', isDynamic: true });
-                    rec.setValue({ fieldId: 'custrecord_pl_item_number', value: item.itemId });
-                    rec.setValue({ fieldId: 'custrecord_express_entry', value: item.serialNumbers.join('<br>') });
+                const recordId = rec.save({ enableSourcing: true, ignoreMandatoryFields: false });
 
-                    const recordId = rec.save({ enableSourcing: true, ignoreMandatoryFields: false });
+                log.audit('Print Label Created', 'ID: ' + recordId + ', PO: ' + poResults.poTranId + ', Labels: ' + allSerials.length);
 
-                    // Store record ID with the item for display
-                    item.recordId = recordId;
-                    createdRecords.push(recordId);
-
-                    const labelCount = item.serialNumbers.length > 0 ? item.serialNumbers.length : item.quantity;
-                    log.audit('Print Label Created', 'ID: ' + recordId + ', Item: ' + item.itemText + ', Labels: ' + labelCount);
-                });
-
-                log.audit('Print Labels Summary', 'PO: ' + poResults.poTranId + ', Records Created: ' + createdRecords.length + ', Total Labels: ' + totalLabels);
-
-                createSuccessPage(context, createdRecords.join(','), {
-                    items: itemsToprint,
-                    totalLabels: totalLabels
+                createSuccessPage(context, recordId, {
+                    item: firstItem.itemId,
+                    itemText: itemText,
+                    description: description,
+                    serialNumbers: allSerials
                 });
 
             } catch (e) {
@@ -1182,14 +963,9 @@ iframe { width: 100%; height: 100%; border: none; }
 
             let validSerials = [];
             if (serialNumbers.trim()) {
-                const result = validateSerialNumbers(serialNumbers, item);
+                const result = validateSerialNumbers(serialNumbers);
                 if (result.invalid.length > 0) {
-                    // Build detailed error message
-                    const errorDetails = result.invalid.map(sn => {
-                        const reason = result.invalidReasons[sn] || 'Unknown error';
-                        return sn + ' (' + reason + ')';
-                    }).join('<br>');
-                    createEntryForm(context, 'Invalid serials:<br>' + errorDetails, 'error', { item, serialNumbers, poNumber });
+                    createEntryForm(context, 'Invalid serials: ' + result.invalid.join(', '), 'error', { item, serialNumbers, poNumber });
                     return;
                 }
                 validSerials = result.valid;
@@ -1220,15 +996,64 @@ iframe { width: 100%; height: 100%; border: none; }
             createSuccessPage(context, recordId, { item, itemText, description, serialNumbers: validSerials });
         }
 
+        function handleReprint(context) {
+            const reprintId = context.request.parameters.custpage_reprint_id;
+
+            if (!reprintId || !reprintId.trim()) {
+                createEntryForm(context, 'Enter a Print Label record ID', 'warning');
+                return;
+            }
+
+            try {
+                const rec = record.load({ type: 'customrecord_print_label', id: reprintId.trim() });
+                const itemId = rec.getValue({ fieldId: 'custrecord_pl_item_number' });
+                const serialsRaw = rec.getValue({ fieldId: 'custrecord_express_entry' }) || '';
+
+                const serialNumbers = serialsRaw
+                    .replace(/<br\s*\/?>/gi, '\n')
+                    .split('\n')
+                    .map(s => s.trim())
+                    .filter(s => s !== '');
+
+                let itemText = '';
+                let description = '';
+
+                if (itemId) {
+                    try {
+                        const lookup = search.lookupFields({
+                            type: search.Type.ITEM,
+                            id: itemId,
+                            columns: ['itemid', 'displayname', 'salesdescription']
+                        });
+                        itemText = lookup.displayname || lookup.itemid || '';
+                        description = lookup.salesdescription || '';
+                    } catch (e) {
+                        log.debug('Item lookup failed on reprint', e.message);
+                    }
+                }
+
+                log.audit('Reprint Labels', 'Record ID: ' + reprintId + ', Labels: ' + (serialNumbers.length || 1));
+
+                createSuccessPage(context, reprintId.trim(), {
+                    item: itemId,
+                    itemText: itemText,
+                    description: description,
+                    serialNumbers: serialNumbers
+                });
+
+            } catch (e) {
+                log.error('Reprint Error', e.message);
+                createEntryForm(context, 'Could not load record #' + escapeXml(reprintId) + ': ' + e.message, 'error');
+            }
+        }
+
         function onRequest(context) {
             try {
                 if (context.request.method === 'GET') {
                     const ajaxAction = context.request.parameters.ajax_action;
 
                     if (ajaxAction === 'validate') {
-                        const serials = context.request.parameters.serials;
-                        const itemId = context.request.parameters.item;
-                        const result = validateSerialNumbers(serials, itemId);
+                        const result = validateSerialNumbers(context.request.parameters.serials);
                         context.response.setHeader({ name: 'Content-Type', value: 'application/json' });
                         context.response.write(JSON.stringify(result));
                         return;
@@ -1264,82 +1089,8 @@ iframe { width: 100%; height: 100%; border: none; }
                         return;
                     }
 
-                    if (action === 'print_labels_post') {
-                        // Handle POST from success page print button
-                        const recordId = context.request.parameters.custpage_record_id || '';
-                        const itemsBase64 = context.request.parameters.custpage_items_base64 || '';
-
-                        log.debug('Print Labels POST', 'recordId: ' + recordId + ', base64 length: ' + itemsBase64.length);
-
-                        try {
-                            // Decode base64 to JSON string
-                            const itemsJson = encode.convert({
-                                string: itemsBase64,
-                                inputEncoding: encode.Encoding.BASE_64,
-                                outputEncoding: encode.Encoding.UTF_8
-                            });
-
-                            const items = JSON.parse(itemsJson);
-                            log.debug('Print Labels POST', 'Parsed ' + items.length + ' items');
-
-                            const pdfFile = generateLabelsPdf({ items, recordId });
-
-                            // Embed PDF and auto-print using Blob URL for same-origin access
-                            const pdfBase64 = pdfFile.getContents();
-                            const html = `<!DOCTYPE html>
-<html><head><title>Print Labels</title>
-<style>
-html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; }
-iframe { width: 100%; height: 100%; border: none; }
-</style>
-</head><body>
-<iframe id="pdfFrame"></iframe>
-<script>
-(function() {
-    var pdfBase64 = "${pdfBase64}";
-    var frame = document.getElementById('pdfFrame');
-    var printed = false;
-
-    // Convert base64 to Blob URL (same-origin, allows printing)
-    var byteCharacters = atob(pdfBase64);
-    var byteNumbers = new Array(byteCharacters.length);
-    for (var i = 0; i < byteCharacters.length; i++) {
-        byteNumbers[i] = byteCharacters.charCodeAt(i);
-    }
-    var byteArray = new Uint8Array(byteNumbers);
-    var blob = new Blob([byteArray], {type: 'application/pdf'});
-    var blobUrl = URL.createObjectURL(blob);
-
-    frame.src = blobUrl;
-
-    function triggerPrint() {
-        if (printed) return;
-        printed = true;
-        try {
-            frame.contentWindow.focus();
-            frame.contentWindow.print();
-        } catch (e) {
-            // Fallback: print the whole window
-            window.print();
-        }
-    }
-
-    // Try on iframe load
-    frame.onload = function() {
-        setTimeout(triggerPrint, 2000);
-    };
-
-    // Fallback timer in case onload doesn't fire
-    setTimeout(triggerPrint, 3500);
-})();
-</script>
-</body></html>`;
-                            context.response.setHeader({ name: 'Content-Type', value: 'text/html' });
-                            context.response.write(html);
-                        } catch (e) {
-                            log.error('Print Labels POST Error', e.message);
-                            context.response.write('Error: ' + e.message);
-                        }
+                    if (action === 'reprint') {
+                        handleReprint(context);
                         return;
                     }
 

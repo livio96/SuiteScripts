@@ -33,6 +33,18 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
         const REFURBISHING_BIN_ID = 3550;
         const REFURBISHING_STATUS_ID = 9;
 
+        // Bin and status for "Defective"
+        const DEFECTIVE_BIN_ID = 3551;
+        const DEFECTIVE_STATUS_ID = 10;
+
+        // Bin and status for "Trash"
+        const TRASH_BIN_ID = 2645;
+        const TRASH_STATUS_ID = 10;
+
+        // Bin and status for "Return to Vendor"
+        const RETURN_TO_VENDOR_BIN_ID = 2143;
+        const RETURN_TO_VENDOR_STATUS_ID = 21;
+
         // ====================================================================
         // UTILITY FUNCTIONS
         // ====================================================================
@@ -629,6 +641,18 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                 } else if (group.action === 'move_refurbishing') {
                     toBinId = REFURBISHING_BIN_ID;
                     toStatusId = REFURBISHING_STATUS_ID;
+                } else if (group.action === 'back_to_stock') {
+                    toBinId = BACK_TO_STOCK_BIN_ID;
+                    toStatusId = BACK_TO_STOCK_STATUS_ID;
+                } else if (group.action === 'defective') {
+                    toBinId = DEFECTIVE_BIN_ID;
+                    toStatusId = DEFECTIVE_STATUS_ID;
+                } else if (group.action === 'trash') {
+                    toBinId = TRASH_BIN_ID;
+                    toStatusId = TRASH_STATUS_ID;
+                } else if (group.action === 'return_to_vendor') {
+                    toBinId = RETURN_TO_VENDOR_BIN_ID;
+                    toStatusId = RETURN_TO_VENDOR_STATUS_ID;
                 }
 
                 transferRecord.selectNewLine({ sublistId: 'inventory' });
@@ -1454,10 +1478,14 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
 
             const nsActionField = form.addField({ id: 'custpage_ns_action', type: serverWidget.FieldType.SELECT, label: 'Action' });
             nsActionField.addSelectOption({ value: '', text: '-- Select Action --' });
+            nsActionField.addSelectOption({ value: 'back_to_stock', text: 'Back to Stock' });
             nsActionField.addSelectOption({ value: 'likenew', text: 'Change to Like New' });
             nsActionField.addSelectOption({ value: 'likenew_stock', text: 'Change to Like New & Back to Stock' });
-            nsActionField.addSelectOption({ value: 'move_testing', text: 'Move to Testing' });
+            nsActionField.addSelectOption({ value: 'defective', text: 'Defective' });
             nsActionField.addSelectOption({ value: 'move_refurbishing', text: 'Move to Refurbishing' });
+            nsActionField.addSelectOption({ value: 'move_testing', text: 'Move to Testing' });
+            nsActionField.addSelectOption({ value: 'return_to_vendor', text: 'Return to Vendor' });
+            nsActionField.addSelectOption({ value: 'trash', text: 'Trash' });
 
             const containerEnd = form.addField({ id: 'custpage_container_end', type: serverWidget.FieldType.INLINEHTML, label: ' ' });
             containerEnd.defaultValue = `</div>
@@ -1514,10 +1542,14 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                     <td>
                         <select class="action-select" data-index="${idx}">
                             <option value="">-- No Action --</option>
+                            <option value="back_to_stock">Back to Stock</option>
                             <option value="likenew">Change to Like New</option>
                             <option value="likenew_stock">Change to Like New &amp; Back to Stock</option>
-                            <option value="move_testing">Move to Testing</option>
+                            <option value="defective">Defective</option>
                             <option value="move_refurbishing">Move to Refurbishing</option>
+                            <option value="move_testing">Move to Testing</option>
+                            <option value="return_to_vendor">Return to Vendor</option>
+                            <option value="trash">Trash</option>
                         </select>
                     </td>
                 </tr>`;
@@ -1554,10 +1586,14 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                                 <label>Apply to All:</label>
                                 <select class="action-select" onchange="setAllActions(this.value)" style="flex:1;">
                                     <option value="">-- No Action --</option>
+                                    <option value="back_to_stock">Back to Stock</option>
                                     <option value="likenew">Change to Like New</option>
                                     <option value="likenew_stock">Change to Like New &amp; Back to Stock</option>
-                                    <option value="move_testing">Move to Testing</option>
+                                    <option value="defective">Defective</option>
                                     <option value="move_refurbishing">Move to Refurbishing</option>
+                                    <option value="move_testing">Move to Testing</option>
+                                    <option value="return_to_vendor">Return to Vendor</option>
+                                    <option value="trash">Trash</option>
                                 </select>
                                 <div>
                                     <span style="color:#64748b; font-weight:500;">With Action:</span>
@@ -1646,10 +1682,14 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
             labelGroups.forEach((group, idx) => {
                 const serialListHtml = group.serialNumbers.map(s => `<li>${escapeXml(s)}</li>`).join('');
                 const actionLabel = {
+                    'back_to_stock': 'Back to Stock',
+                    'defective': 'Defective',
                     'likenew': 'Like New',
                     'likenew_stock': 'Like New + Back to Stock',
+                    'move_refurbishing': 'Move to Refurbishing',
                     'move_testing': 'Move to Testing',
-                    'move_refurbishing': 'Move to Refurbishing'
+                    'return_to_vendor': 'Return to Vendor',
+                    'trash': 'Trash'
                 }[group.action] || group.action;
 
                 groupsHtml += `
@@ -1753,7 +1793,7 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
 
             // Separate actions into adjustment vs bin transfer
             const ADJUSTMENT_ACTIONS = ['likenew', 'likenew_stock'];
-            const BIN_TRANSFER_ACTIONS = ['move_testing', 'move_refurbishing'];
+            const BIN_TRANSFER_ACTIONS = ['move_testing', 'move_refurbishing', 'back_to_stock', 'defective', 'trash', 'return_to_vendor'];
 
             const errors = [];
             const itemDetailsCache = {}; // itemId → { itemid, displayname, description }
@@ -1959,7 +1999,7 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
             }
 
             const ADJUSTMENT_ACTIONS = ['likenew', 'likenew_stock'];
-            const BIN_TRANSFER_ACTIONS = ['move_testing', 'move_refurbishing'];
+            const BIN_TRANSFER_ACTIONS = ['move_testing', 'move_refurbishing', 'back_to_stock', 'defective', 'trash', 'return_to_vendor'];
 
             let adjustmentTranId = null;
             let binTransferTranId = null;
@@ -2014,6 +2054,18 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                 } else if (action === 'move_refurbishing') {
                     toBinId = REFURBISHING_BIN_ID;
                     toStatusId = REFURBISHING_STATUS_ID;
+                } else if (action === 'back_to_stock') {
+                    toBinId = BACK_TO_STOCK_BIN_ID;
+                    toStatusId = BACK_TO_STOCK_STATUS_ID;
+                } else if (action === 'defective') {
+                    toBinId = DEFECTIVE_BIN_ID;
+                    toStatusId = DEFECTIVE_STATUS_ID;
+                } else if (action === 'trash') {
+                    toBinId = TRASH_BIN_ID;
+                    toStatusId = TRASH_STATUS_ID;
+                } else if (action === 'return_to_vendor') {
+                    toBinId = RETURN_TO_VENDOR_BIN_ID;
+                    toStatusId = RETURN_TO_VENDOR_STATUS_ID;
                 }
 
                 try {
@@ -2084,10 +2136,14 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
             }
 
             const actionLabel = {
+                'back_to_stock': 'Back to Stock',
+                'defective': 'Defective',
                 'likenew': 'Change to Like New',
                 'likenew_stock': 'Change to Like New & Back to Stock',
+                'move_refurbishing': 'Move to Refurbishing',
                 'move_testing': 'Move to Testing',
-                'move_refurbishing': 'Move to Refurbishing'
+                'return_to_vendor': 'Return to Vendor',
+                'trash': 'Trash'
             }[action] || action;
 
             const contentField = form.addField({ id: 'custpage_content', type: serverWidget.FieldType.INLINEHTML, label: ' ' });

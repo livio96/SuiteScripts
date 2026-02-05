@@ -916,6 +916,183 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
             return { transferId: transferId, tranId: tranId };
         }
 
+        /**
+         * Create inventory adjustment for serial number change.
+         * Removes old serial and adds new serial for the same item.
+         *
+         * @param {Array} changes - Array of serial change data:
+         *   { itemId, itemText, locationId, oldSerialNumber, oldSerialId, newSerialNumber, binId, statusId }
+         * @param {string} memo - Transaction memo
+         * @returns {Object} { adjId, tranId }
+         */
+        function createSerialNumberChangeAdjustment(changes, memo) {
+            const adjRecord = record.create({
+                type: record.Type.INVENTORY_ADJUSTMENT,
+                isDynamic: true
+            });
+
+            adjRecord.setValue({ fieldId: 'subsidiary', value: '1' });
+
+            if (ADJUSTMENT_ACCOUNT_ID) {
+                adjRecord.setValue({ fieldId: 'account', value: ADJUSTMENT_ACCOUNT_ID });
+            }
+            adjRecord.setValue({ fieldId: 'memo', value: memo || 'Serial Number Change via Warehouse Assistant Dashboard.' });
+
+            // Group changes by item, location, and action for efficiency
+            const groupMap = {};
+            changes.forEach(change => {
+                const key = change.itemId + '_' + change.locationId + '_' + change.action;
+                if (!groupMap[key]) {
+                    groupMap[key] = {
+                        itemId: change.itemId,
+                        locationId: change.locationId,
+                        action: change.action,
+                        changes: []
+                    };
+                }
+                groupMap[key].changes.push(change);
+            });
+
+            // Look up average cost for each item
+            const costCache = {};
+            Object.values(groupMap).forEach(group => {
+                if (!costCache[group.itemId]) {
+                    try {
+                        const costLookup = search.lookupFields({
+                            type: search.Type.ITEM,
+                            id: group.itemId,
+                            columns: ['averagecost']
+                        });
+                        costCache[group.itemId] = parseFloat(costLookup.averagecost) || 0;
+                    } catch (e) {
+                        log.debug('Cost lookup failed for item ' + group.itemId, e.message);
+                        costCache[group.itemId] = 0;
+                    }
+                }
+            });
+
+            Object.values(groupMap).forEach(group => {
+                const itemCost = costCache[group.itemId] || 0;
+                const changeCount = group.changes.length;
+
+                // --- REMOVAL LINE: remove old serials ---
+                adjRecord.selectNewLine({ sublistId: 'inventory' });
+                adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'item', value: group.itemId });
+                adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'location', value: group.locationId });
+                adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'adjustqtyby', value: -changeCount });
+                if (itemCost > 0) {
+                    adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'unitcost', value: itemCost });
+                }
+
+                const removeDetail = adjRecord.getCurrentSublistSubrecord({
+                    sublistId: 'inventory',
+                    fieldId: 'inventorydetail'
+                });
+
+                group.changes.forEach(change => {
+                    removeDetail.selectNewLine({ sublistId: 'inventoryassignment' });
+                    removeDetail.setCurrentSublistValue({
+                        sublistId: 'inventoryassignment',
+                        fieldId: 'issueinventorynumber',
+                        value: change.oldSerialId
+                    });
+                    removeDetail.setCurrentSublistValue({
+                        sublistId: 'inventoryassignment',
+                        fieldId: 'quantity',
+                        value: -1
+                    });
+                    if (change.binId) {
+                        removeDetail.setCurrentSublistValue({
+                            sublistId: 'inventoryassignment',
+                            fieldId: 'binnumber',
+                            value: change.binId
+                        });
+                    }
+                    removeDetail.commitLine({ sublistId: 'inventoryassignment' });
+                });
+
+                adjRecord.commitLine({ sublistId: 'inventory' });
+
+                // --- ADDITION LINE: add new serials (same item) ---
+                adjRecord.selectNewLine({ sublistId: 'inventory' });
+                adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'item', value: group.itemId });
+                adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'location', value: group.locationId });
+                adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'adjustqtyby', value: changeCount });
+                if (itemCost > 0) {
+                    adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'unitcost', value: itemCost });
+                }
+
+                const addDetail = adjRecord.getCurrentSublistSubrecord({
+                    sublistId: 'inventory',
+                    fieldId: 'inventorydetail'
+                });
+
+                group.changes.forEach(change => {
+                    addDetail.selectNewLine({ sublistId: 'inventoryassignment' });
+                    addDetail.setCurrentSublistValue({
+                        sublistId: 'inventoryassignment',
+                        fieldId: 'receiptinventorynumber',
+                        value: change.newSerialNumber
+                    });
+                    addDetail.setCurrentSublistValue({
+                        sublistId: 'inventoryassignment',
+                        fieldId: 'quantity',
+                        value: 1
+                    });
+
+                    if (change.action === 'serial_change_stock') {
+                        // Change Serial & Back to Stock: use bin 3555 and status 1
+                        addDetail.setCurrentSublistValue({
+                            sublistId: 'inventoryassignment',
+                            fieldId: 'binnumber',
+                            value: BACK_TO_STOCK_BIN_ID
+                        });
+                        addDetail.setCurrentSublistValue({
+                            sublistId: 'inventoryassignment',
+                            fieldId: 'inventorystatus',
+                            value: BACK_TO_STOCK_STATUS_ID
+                        });
+                    } else {
+                        // Serial Number Change only: keep same bin and status
+                        if (change.binId) {
+                            addDetail.setCurrentSublistValue({
+                                sublistId: 'inventoryassignment',
+                                fieldId: 'binnumber',
+                                value: change.binId
+                            });
+                        }
+                        if (change.statusId) {
+                            addDetail.setCurrentSublistValue({
+                                sublistId: 'inventoryassignment',
+                                fieldId: 'inventorystatus',
+                                value: change.statusId
+                            });
+                        }
+                    }
+                    addDetail.commitLine({ sublistId: 'inventoryassignment' });
+                });
+
+                adjRecord.commitLine({ sublistId: 'inventory' });
+            });
+
+            const adjId = adjRecord.save({ enableSourcing: true, ignoreMandatoryFields: false });
+
+            // Look up the tranid for display
+            let tranId = String(adjId);
+            try {
+                const adjLookup = search.lookupFields({
+                    type: search.Type.INVENTORY_ADJUSTMENT,
+                    id: adjId,
+                    columns: ['tranid']
+                });
+                tranId = adjLookup.tranid || String(adjId);
+            } catch (e) {
+                log.debug('Could not look up adjustment tranid', e.message);
+            }
+
+            return { adjId: adjId, tranId: tranId };
+        }
+
         // ====================================================================
         // STYLES
         // ====================================================================
@@ -1327,15 +1504,37 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                     window.onbeforeunload = null;
 
                     function setAllActions(value) {
-                        var selects = document.querySelectorAll('.action-select');
+                        // Don't apply serial change actions via bulk action since each needs unique new serial
+                        if (value === 'serial_change' || value === 'serial_change_stock') {
+                            alert('Serial change actions must be set individually for each serial.');
+                            return;
+                        }
+                        var selects = document.querySelectorAll('table .action-select');
                         for (var i = 0; i < selects.length; i++) {
                             selects[i].value = value;
+                            handleActionChange(selects[i]);
+                        }
+                        updateActionCount();
+                    }
+
+                    function handleActionChange(selectEl) {
+                        var idx = selectEl.getAttribute('data-index');
+                        var newSerialInput = document.querySelector('.new-serial-input[data-index="' + idx + '"]');
+                        if (newSerialInput) {
+                            if (selectEl.value === 'serial_change' || selectEl.value === 'serial_change_stock') {
+                                newSerialInput.style.display = 'block';
+                                newSerialInput.required = true;
+                            } else {
+                                newSerialInput.style.display = 'none';
+                                newSerialInput.required = false;
+                                newSerialInput.value = '';
+                            }
                         }
                         updateActionCount();
                     }
 
                     function updateActionCount() {
-                        var selects = document.querySelectorAll('.action-select');
+                        var selects = document.querySelectorAll('table .action-select');
                         var count = 0;
                         for (var i = 0; i < selects.length; i++) {
                             if (selects[i].value !== '') count++;
@@ -1345,16 +1544,35 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                     }
 
                     function submitActions() {
-                        var selects = document.querySelectorAll('.action-select');
+                        var selects = document.querySelectorAll('table .action-select');
                         var actions = [];
                         var hasAction = false;
+                        var missingNewSerial = false;
+
                         for (var i = 0; i < selects.length; i++) {
                             var idx = selects[i].getAttribute('data-index');
                             var val = selects[i].value;
-                            actions.push({ index: parseInt(idx), action: val });
+                            var newSerial = '';
+
+                            if (val === 'serial_change' || val === 'serial_change_stock') {
+                                var newSerialInput = document.querySelector('.new-serial-input[data-index="' + idx + '"]');
+                                if (newSerialInput) {
+                                    newSerial = newSerialInput.value.trim();
+                                    if (!newSerial) {
+                                        missingNewSerial = true;
+                                        newSerialInput.style.border = '2px solid #ef4444';
+                                    } else {
+                                        newSerialInput.style.border = '1px solid #e2e8f0';
+                                    }
+                                }
+                            }
+
+                            actions.push({ index: parseInt(idx), action: val, newSerial: newSerial });
                             if (val !== '') hasAction = true;
                         }
+
                         if (!hasAction) { alert('Select an action for at least one serial number'); return; }
+                        if (missingNewSerial) { alert('Please enter a new serial number for all Serial Number Change actions'); return; }
 
                         window.onbeforeunload = null;
                         var form = document.forms[0];
@@ -1372,9 +1590,9 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
 
                     document.addEventListener('DOMContentLoaded', function() {
                         window.onbeforeunload = null;
-                        var selects = document.querySelectorAll('.action-select');
+                        var selects = document.querySelectorAll('table .action-select');
                         for (var i = 0; i < selects.length; i++) {
-                            selects[i].addEventListener('change', updateActionCount);
+                            selects[i].addEventListener('change', function() { handleActionChange(this); });
                         }
                         updateActionCount();
                     });
@@ -1540,17 +1758,20 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                     <td>${escapeXml(s.binText) || '<span style="color:#94a3b8;">N/A</span>'}</td>
                     <td>${escapeXml(s.locationText) || '<span style="color:#94a3b8;">N/A</span>'}</td>
                     <td>
-                        <select class="action-select" data-index="${idx}">
+                        <select class="action-select" data-index="${idx}" onchange="handleActionChange(this)">
                             <option value="">-- No Action --</option>
                             <option value="back_to_stock">Back to Stock</option>
                             <option value="likenew">Change to Like New</option>
                             <option value="likenew_stock">Change to Like New &amp; Back to Stock</option>
+                            <option value="serial_change_stock">Change Serial &amp; Back to Stock</option>
                             <option value="defective">Defective</option>
                             <option value="move_refurbishing">Move to Refurbishing</option>
                             <option value="move_testing">Move to Testing</option>
                             <option value="return_to_vendor">Return to Vendor</option>
+                            <option value="serial_change">Serial Number Change</option>
                             <option value="trash">Trash</option>
                         </select>
+                        <input type="text" class="new-serial-input" data-index="${idx}" placeholder="Enter new serial" style="display:none; margin-top:8px; width:100%; padding:8px; border:1px solid #e2e8f0; border-radius:6px; font-size:13px;">
                     </td>
                 </tr>`;
             });
@@ -1635,7 +1856,7 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
             context.response.writePage(form);
         }
 
-        function createSuccessPage(context, adjustmentTranId, binTransferTranId, labelGroups) {
+        function createSuccessPage(context, adjustmentTranId, binTransferTranId, labelGroups, serialChangeTranId) {
             const form = serverWidget.createForm({ title: 'Transactions Created' });
 
             const suiteletUrl = url.resolveScript({
@@ -1667,7 +1888,7 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
             }));
 
             // Use whichever transaction ID is available for the print job
-            const recordIdForPrint = adjustmentTranId || binTransferTranId || '';
+            const recordIdForPrint = adjustmentTranId || binTransferTranId || serialChangeTranId || '';
 
             const printUrl = suiteletUrl +
                 '&ajax_action=printpage' +
@@ -1689,6 +1910,8 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                     'move_refurbishing': 'Move to Refurbishing',
                     'move_testing': 'Move to Testing',
                     'return_to_vendor': 'Return to Vendor',
+                    'serial_change': 'Serial Number Change',
+                    'serial_change_stock': 'Change Serial & Back to Stock',
                     'trash': 'Trash'
                 }[group.action] || group.action;
 
@@ -1713,6 +1936,9 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
             }
             if (binTransferTranId) {
                 transactionInfoHtml += `<p style="font-size:16px; margin:8px 0; color:#1e3c72;"><strong>Bin Transfer:</strong> ${escapeXml(String(binTransferTranId))}</p>`;
+            }
+            if (serialChangeTranId) {
+                transactionInfoHtml += `<p style="font-size:16px; margin:8px 0; color:#1e3c72;"><strong>Serial Number Change:</strong> ${escapeXml(String(serialChangeTranId))}</p>`;
             }
 
             const contentField = form.addField({ id: 'custpage_content', type: serverWidget.FieldType.INLINEHTML, label: ' ' });
@@ -1778,11 +2004,11 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                 return;
             }
 
-            // Build map of index → action
+            // Build map of index → action (including newSerial for serial_change)
             const actionMap = {};
             actions.forEach(a => {
                 if (a.action && a.action !== '') {
-                    actionMap[a.index] = a.action;
+                    actionMap[a.index] = { action: a.action, newSerial: a.newSerial || '' };
                 }
             });
 
@@ -1791,9 +2017,10 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                 return;
             }
 
-            // Separate actions into adjustment vs bin transfer
+            // Separate actions into adjustment vs bin transfer vs serial change
             const ADJUSTMENT_ACTIONS = ['likenew', 'likenew_stock'];
             const BIN_TRANSFER_ACTIONS = ['move_testing', 'move_refurbishing', 'back_to_stock', 'defective', 'trash', 'return_to_vendor'];
+            const SERIAL_CHANGE_ACTIONS = ['serial_change', 'serial_change_stock'];
 
             const errors = [];
             const itemDetailsCache = {}; // itemId → { itemid, displayname, description }
@@ -1803,12 +2030,16 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
             const adjustmentGroupMap = {};
             // Groups for bin transfer (move to testing/refurbishing)
             const binTransferGroupMap = {};
+            // List for serial number changes (each is processed individually)
+            const serialChangeList = [];
 
-            for (const [idxStr, action] of Object.entries(actionMap)) {
+            for (const [idxStr, actionData] of Object.entries(actionMap)) {
                 const idx = parseInt(idxStr, 10);
                 const serial = serialData.valid[idx];
                 if (!serial) continue;
 
+                const action = actionData.action;
+                const newSerial = actionData.newSerial;
                 const itemId = serial.itemId;
 
                 // Cache item details
@@ -1879,13 +2110,32 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                         serialId: serial.serialId,
                         binId: serial.binId
                     });
+
+                } else if (SERIAL_CHANGE_ACTIONS.includes(action)) {
+                    // --- SERIAL NUMBER CHANGE: Same item, remove old serial, add new serial ---
+                    if (!newSerial) {
+                        errors.push('New serial number required for: ' + serial.serialNumber);
+                        continue;
+                    }
+                    serialChangeList.push({
+                        itemId: itemId,
+                        itemText: itemDetails.displayname || itemDetails.itemid,
+                        itemDescription: itemDetails.description,
+                        locationId: serial.locationId,
+                        oldSerialNumber: serial.serialNumber,
+                        oldSerialId: serial.serialId,
+                        newSerialNumber: newSerial,
+                        binId: serial.binId,
+                        statusId: serial.statusId,
+                        action: action  // 'serial_change' or 'serial_change_stock'
+                    });
                 }
             }
 
             const adjustmentGroups = Object.values(adjustmentGroupMap);
             const binTransferGroups = Object.values(binTransferGroupMap);
 
-            if (adjustmentGroups.length === 0 && binTransferGroups.length === 0) {
+            if (adjustmentGroups.length === 0 && binTransferGroups.length === 0 && serialChangeList.length === 0) {
                 const errMsg = errors.length > 0
                     ? 'Could not process: ' + errors.join('; ')
                     : 'No valid serials to process.';
@@ -1900,6 +2150,7 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
             // Track transaction IDs for display
             let adjustmentTranId = null;
             let binTransferTranId = null;
+            let serialChangeTranId = null;
             const labelGroups = [];
 
             // --- Process Inventory Adjustments (condition change to -LN) ---
@@ -1961,7 +2212,36 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                 }
             }
 
-            createSuccessPage(context, adjustmentTranId, binTransferTranId, labelGroups);
+            // --- Process Serial Number Changes ---
+            if (serialChangeList.length > 0) {
+                try {
+                    const serialChangeResult = createSerialNumberChangeAdjustment(serialChangeList, 'Serial Number Change via Warehouse Assistant Dashboard');
+                    log.audit('Serial Number Change Adjustment Created', 'TranID: ' + serialChangeResult.tranId);
+                    serialChangeTranId = serialChangeResult.tranId;
+
+                    // Build label groups for serial changes (use new serial numbers)
+                    serialChangeList.forEach(change => {
+                        let existing = labelGroups.find(lg => lg.itemId === change.itemId && lg.action === change.action);
+                        if (!existing) {
+                            existing = {
+                                itemId: change.itemId,
+                                itemText: change.itemText,
+                                description: change.itemDescription,
+                                action: change.action,
+                                serialNumbers: []
+                            };
+                            labelGroups.push(existing);
+                        }
+                        existing.serialNumbers.push(change.newSerialNumber);
+                    });
+                } catch (e) {
+                    log.error('Serial Number Change Error', e.message + ' | ' + e.stack);
+                    createResultsPage(context, serialData, 'Serial number change failed: ' + e.message, 'error');
+                    return;
+                }
+            }
+
+            createSuccessPage(context, adjustmentTranId, binTransferTranId, labelGroups, serialChangeTranId);
         }
 
         /**

@@ -1866,7 +1866,7 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                             <p>${serialData.valid.length} serial${serialData.valid.length !== 1 ? 's' : ''} found in stock</p>
                         </div>
                         <div class="form-body">
-                            <div class="bulk-action-bar">
+                            <div class="bulk-action-bar" style="flex-wrap:wrap;">
                                 <label>Apply to All:</label>
                                 <select class="action-select" onchange="setAllActions(this.value)" style="flex:1;">
                                     <option value="">-- No Action --</option>
@@ -1881,9 +1881,11 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                                     <option value="serial_change">Serial Number Change</option>
                                     <option value="trash">Trash</option>
                                 </select>
-                                <div>
+                                <div style="display:flex; align-items:center; gap:12px;">
                                     <span style="color:#64748b; font-weight:500;">With Action:</span>
-                                    <span style="font-size:28px; font-weight:700; color:#1e3c72; margin-left:8px;" id="action_count">0</span>
+                                    <span style="font-size:22px; font-weight:700; color:#1e3c72;" id="action_count">0</span>
+                                    <button type="button" class="custom-btn btn-success" style="padding:10px 20px; margin:0;" onclick="submitActions()">Submit</button>
+                                    <button type="button" class="custom-btn btn-outline" style="padding:10px 20px; margin:0;" onclick="goBack()">Back</button>
                                 </div>
                             </div>
 
@@ -1899,10 +1901,6 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                                 </thead>
                                 <tbody>${rows}</tbody>
                             </table>
-                        </div>
-                        <div class="btn-area">
-                            <button type="button" class="custom-btn btn-success" onclick="submitActions()">Submit</button>
-                            <button type="button" class="custom-btn btn-outline" onclick="goBack()">Back</button>
                         </div>
                     </div>
                 </div>

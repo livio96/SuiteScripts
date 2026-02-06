@@ -1130,8 +1130,11 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                 .app-container {
                     font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
                     max-width: 900px;
-                    margin: 40px auto;
+                    margin: 20px auto;
                     padding: 0 20px;
+                    height: calc(100vh - 40px);
+                    display: flex;
+                    flex-direction: column;
                 }
 
                 .main-card {
@@ -1140,6 +1143,10 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                     box-shadow: 0 10px 40px rgba(0,0,0,0.08);
                     border: 1px solid #e1e8ed;
                     overflow: hidden;
+                    display: flex;
+                    flex-direction: column;
+                    min-height: 0;
+                    flex: 1;
                 }
 
                 .card-header {
@@ -1149,9 +1156,14 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                     text-align: center;
                 }
                 .card-header h1 { margin: 0; font-size: 24px; font-weight: 600; }
-                .card-header p { margin: 10px 0 0; opacity: 0.8; font-size: 15px; }
+                .card-header p { margin: 10px 0 0; opacity: 0.8; font-size: 14px; }
 
-                .form-body { padding: 32px; }
+                .form-body {
+                    padding: 32px;
+                    overflow-y: auto;
+                    flex: 1;
+                    min-height: 0;
+                }
 
                 .input-group { margin-bottom: 28px; }
 
@@ -1160,7 +1172,7 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                     font-weight: 600;
                     color: #475569;
                     margin-bottom: 10px;
-                    font-size: 14px;
+                    font-size: 13px;
                     text-transform: uppercase;
                     letter-spacing: 0.5px;
                 }
@@ -1169,10 +1181,10 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                 .input-group select,
                 .input-group textarea {
                     width: 100% !important;
-                    padding: 18px 20px !important;
+                    padding: 14px 16px !important;
                     border: 2px solid #e2e8f0 !important;
                     border-radius: 12px !important;
-                    font-size: 18px !important;
+                    font-size: 14px !important;
                     background: #f8fafc !important;
                     transition: all 0.2s !important;
                     box-sizing: border-box !important;
@@ -1193,18 +1205,19 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                 .btn-area {
                     display: flex;
                     gap: 12px;
-                    margin-top: 10px;
-                    padding-top: 24px;
-                    border-top: 1px solid #f1f5f9;
+                    padding: 20px 32px;
+                    border-top: 1px solid #e2e8f0;
+                    background: #fff;
+                    flex-shrink: 0;
                 }
 
                 .custom-btn {
-                    padding: 16px 28px;
+                    padding: 14px 24px;
                     border-radius: 12px;
                     font-weight: 600;
                     cursor: pointer;
                     border: none;
-                    font-size: 15px;
+                    font-size: 14px;
                     transition: all 0.2s;
                 }
                 .btn-primary { background: #1e3c72; color: white; }
@@ -1230,8 +1243,9 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                     padding: 16px 20px;
                     border-radius: 12px;
                     margin-bottom: 24px;
-                    font-size: 15px;
+                    font-size: 14px;
                     font-weight: 500;
+                    flex-shrink: 0;
                 }
                 .alert-error { background: #fef2f2; color: #b91c1c; border: 1px solid #fecaca; }
                 .alert-warning { background: #fffbeb; color: #92400e; border: 1px solid #fde68a; }
@@ -1240,7 +1254,7 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                 .results-table { width: 100%; border-collapse: collapse; margin-bottom: 24px; }
                 .results-table th {
                     background: #f8fafc;
-                    padding: 14px 16px;
+                    padding: 12px 14px;
                     text-align: left;
                     font-size: 12px;
                     font-weight: 700;
@@ -1248,11 +1262,14 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                     text-transform: uppercase;
                     letter-spacing: 0.5px;
                     border-bottom: 2px solid #e2e8f0;
+                    position: sticky;
+                    top: 0;
+                    z-index: 1;
                 }
                 .results-table td {
-                    padding: 16px;
+                    padding: 14px;
                     border-bottom: 1px solid #f1f5f9;
-                    font-size: 15px;
+                    font-size: 14px;
                     color: #334155;
                 }
                 .results-table tr:hover td { background: #f8fafc; }
@@ -1265,7 +1282,7 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                     background: #f8fafc;
                     color: #1e293b;
                     cursor: pointer;
-                    min-width: 200px;
+                    min-width: 220px;
                 }
                 .action-select:focus {
                     border-color: #1e3c72;
@@ -1286,9 +1303,9 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                 .badge-error { background: #ef4444; color: #fff; }
 
                 .success-icon { font-size: 60px; color: #10b981; margin-bottom: 16px; }
-                .success-card { text-align: center; padding: 48px 32px; }
-                .success-card h2 { margin: 0 0 8px; font-size: 26px; color: #1e293b; }
-                .success-card p { color: #64748b; margin-bottom: 32px; font-size: 16px; }
+                .success-card { text-align: center; padding: 32px 0 0; }
+                .success-card h2 { margin: 0 0 8px; font-size: 24px; color: #1e293b; }
+                .success-card p { color: #64748b; margin-bottom: 32px; font-size: 14px; }
 
                 .serial-list {
                     list-style: none;
@@ -1318,6 +1335,9 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                     justify-content: space-between;
                     align-items: center;
                     gap: 16px;
+                    position: sticky;
+                    top: 0;
+                    z-index: 2;
                 }
                 .bulk-action-bar label {
                     font-weight: 600;
@@ -1335,7 +1355,7 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                 }
                 .label-group h3 {
                     margin: 0 0 12px;
-                    font-size: 18px;
+                    font-size: 16px;
                     color: #1e3c72;
                 }
 
@@ -1397,12 +1417,16 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                         var nonSerialSection = document.getElementById('non-serialized-section');
                         var serialBtn = document.getElementById('mode-serialized');
                         var nonSerialBtn = document.getElementById('mode-nonserialized');
+                        var serialBtnArea = document.getElementById('serialized-btn-area');
+                        var nonSerialBtnArea = document.getElementById('nonserialized-btn-area');
 
                         if (mode === 'serialized') {
                             serialSection.classList.add('active');
                             nonSerialSection.classList.remove('active');
                             serialBtn.classList.add('active');
                             nonSerialBtn.classList.remove('active');
+                            if (serialBtnArea) serialBtnArea.style.display = 'flex';
+                            if (nonSerialBtnArea) nonSerialBtnArea.style.display = 'none';
                             var field = document.getElementById('custpage_serial_numbers');
                             if (field) field.focus();
                         } else {
@@ -1410,6 +1434,8 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                             nonSerialSection.classList.add('active');
                             serialBtn.classList.remove('active');
                             nonSerialBtn.classList.add('active');
+                            if (serialBtnArea) serialBtnArea.style.display = 'none';
+                            if (nonSerialBtnArea) nonSerialBtnArea.style.display = 'flex';
                         }
                     }
 
@@ -1625,10 +1651,21 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
             `;
         }
 
-        function getSuccessPageScript(suiteletUrl, printUrl) {
+        function getSuccessPageScript(suiteletUrl) {
             return `
                 <script>
-                    function printLabels() { window.open('${escapeForJs(printUrl)}', '_blank'); }
+                    function printLabels() {
+                        window.onbeforeunload = null;
+                        if (typeof setWindowChanged === 'function') setWindowChanged(window, false);
+                        var form = document.forms[0];
+                        form.target = '_blank';
+                        var action = document.createElement('input');
+                        action.type = 'hidden'; action.name = 'custpage_action'; action.value = 'printpdf';
+                        form.appendChild(action);
+                        form.submit();
+                        form.removeChild(action);
+                        form.target = '';
+                    }
                     function createAnother() { window.location.href = '${escapeForJs(suiteletUrl)}'; }
                 </script>
             `;
@@ -1671,10 +1708,6 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                                     <label class="custom-label">Serial Numbers <span class="badge-count"><span id="serial_count">0</span> scanned</span></label>
                                     <div id="serial-field-wrap"></div>
                                 </div>
-                                <div class="btn-area">
-                                    <button type="button" class="custom-btn btn-success" onclick="submitSerials()">Submit</button>
-                                    <button type="button" class="custom-btn btn-outline" onclick="clearForm()">Clear</button>
-                                </div>
                             </div>
 
                             <!-- Non-Serialized Items Section -->
@@ -1695,11 +1728,16 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                                     <label class="custom-label">Action</label>
                                     <div id="ns-action-wrap"></div>
                                 </div>
-                                <div class="btn-area">
-                                    <button type="button" class="custom-btn btn-success" onclick="submitNonSerialized()">Submit</button>
-                                    <button type="button" class="custom-btn btn-outline" onclick="clearForm()">Clear</button>
-                                </div>
                             </div>
+                        </div>
+                        <!-- Buttons pinned outside scrollable area -->
+                        <div id="serialized-btn-area" class="btn-area">
+                            <button type="button" class="custom-btn btn-success" onclick="submitSerials()">Submit</button>
+                            <button type="button" class="custom-btn btn-outline" onclick="clearForm()">Clear</button>
+                        </div>
+                        <div id="nonserialized-btn-area" class="btn-area" style="display:none;">
+                            <button type="button" class="custom-btn btn-success" onclick="submitNonSerialized()">Submit</button>
+                            <button type="button" class="custom-btn btn-outline" onclick="clearForm()">Clear</button>
                         </div>
                     </div>
                 </div>
@@ -1861,11 +1899,10 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                                 </thead>
                                 <tbody>${rows}</tbody>
                             </table>
-
-                            <div class="btn-area" style="border-top:none; padding-top:0;">
-                                <button type="button" class="custom-btn btn-success" onclick="submitActions()">Submit</button>
-                                <button type="button" class="custom-btn btn-outline" onclick="goBack()">Back</button>
-                            </div>
+                        </div>
+                        <div class="btn-area">
+                            <button type="button" class="custom-btn btn-success" onclick="submitActions()">Submit</button>
+                            <button type="button" class="custom-btn btn-outline" onclick="goBack()">Back</button>
                         </div>
                     </div>
                 </div>
@@ -1917,13 +1954,17 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
             // Use whichever transaction ID is available for the print job
             const recordIdForPrint = adjustmentTranId || binTransferTranId || serialChangeTranId || '';
 
-            const printUrl = suiteletUrl +
-                '&ajax_action=printpage' +
-                '&record_id=' + encodeURIComponent(recordIdForPrint) +
-                '&label_data=' + encodeURIComponent(JSON.stringify(printData));
-
             const styleField = form.addField({ id: 'custpage_styles', type: serverWidget.FieldType.INLINEHTML, label: ' ' });
-            styleField.defaultValue = getStyles() + getSuccessPageScript(suiteletUrl, printUrl);
+            styleField.defaultValue = getStyles() + getSuccessPageScript(suiteletUrl);
+
+            // Hidden fields for print data (submitted via POST to avoid URL length limits)
+            const printDataField = form.addField({ id: 'custpage_print_data', type: serverWidget.FieldType.LONGTEXT, label: 'Print Data' });
+            printDataField.updateDisplayType({ displayType: serverWidget.FieldDisplayType.HIDDEN });
+            printDataField.defaultValue = JSON.stringify(printData);
+
+            const printRecordIdField = form.addField({ id: 'custpage_print_record_id', type: serverWidget.FieldType.TEXT, label: 'Print Record ID' });
+            printRecordIdField.updateDisplayType({ displayType: serverWidget.FieldDisplayType.HIDDEN });
+            printRecordIdField.defaultValue = String(recordIdForPrint);
 
             // Build label group sections (display only, no individual print buttons)
             let groupsHtml = '';
@@ -1972,16 +2013,19 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
             contentField.defaultValue = `
                 <div class="app-container">
                     <div class="main-card">
-                        <div class="success-card">
-                            <div class="success-icon">&#10003;</div>
-                            <h2>Transactions have been created!</h2>
-                            ${transactionInfoHtml}
-                            <p style="color:#64748b; margin-top:16px;">${totalSerials} serial${totalSerials !== 1 ? 's' : ''} processed</p>
+                        <div class="form-body">
+                            <div class="success-card">
+                                <div class="success-icon">&#10003;</div>
+                                <h2>Transactions have been created!</h2>
+                                ${transactionInfoHtml}
+                                <p style="color:#64748b; margin-top:16px;">${totalSerials} serial${totalSerials !== 1 ? 's' : ''} processed</p>
 
-                            ${groupsHtml}
-
-                            <button type="button" class="custom-btn btn-success" style="width:100%; margin-top:16px;" onclick="printLabels()">Print Labels (${totalSerials})</button>
-                            <button type="button" class="custom-btn btn-outline" style="width:100%; margin-top:12px;" onclick="createAnother()">Process More</button>
+                                ${groupsHtml}
+                            </div>
+                        </div>
+                        <div class="btn-area" style="flex-direction:column;">
+                            <button type="button" class="custom-btn btn-success" style="width:100%;" onclick="printLabels()">Print Labels (${totalSerials})</button>
+                            <button type="button" class="custom-btn btn-outline" style="width:100%;" onclick="createAnother()">Process More</button>
                         </div>
                     </div>
                 </div>
@@ -2420,18 +2464,17 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
             // Use whichever transaction ID is available for the print job
             const recordIdForPrint = adjustmentTranId || binTransferTranId || '';
 
-            const printUrl = suiteletUrl +
-                '&ajax_action=printpage' +
-                '&record_id=' + encodeURIComponent(recordIdForPrint) +
-                '&label_data=' + encodeURIComponent(JSON.stringify(printData));
-
             const styleField = form.addField({ id: 'custpage_styles', type: serverWidget.FieldType.INLINEHTML, label: ' ' });
-            styleField.defaultValue = getStyles() + `
-                <script>
-                    function printLabels() { window.open('${escapeForJs(printUrl)}', '_blank'); }
-                    function createAnother() { window.location.href = '${escapeForJs(suiteletUrl)}'; }
-                </script>
-            `;
+            styleField.defaultValue = getStyles() + getSuccessPageScript(suiteletUrl);
+
+            // Hidden fields for print data (submitted via POST to avoid URL length limits)
+            const printDataField = form.addField({ id: 'custpage_print_data', type: serverWidget.FieldType.LONGTEXT, label: 'Print Data' });
+            printDataField.updateDisplayType({ displayType: serverWidget.FieldDisplayType.HIDDEN });
+            printDataField.defaultValue = JSON.stringify(printData);
+
+            const printRecordIdField = form.addField({ id: 'custpage_print_record_id', type: serverWidget.FieldType.TEXT, label: 'Print Record ID' });
+            printRecordIdField.updateDisplayType({ displayType: serverWidget.FieldDisplayType.HIDDEN });
+            printRecordIdField.defaultValue = String(recordIdForPrint);
 
             // Build transaction info lines
             let transactionInfoHtml = '';
@@ -2457,20 +2500,23 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
             contentField.defaultValue = `
                 <div class="app-container">
                     <div class="main-card">
-                        <div class="success-card">
-                            <div class="success-icon">&#10003;</div>
-                            <h2>Transactions have been created!</h2>
-                            ${transactionInfoHtml}
+                        <div class="form-body">
+                            <div class="success-card">
+                                <div class="success-icon">&#10003;</div>
+                                <h2>Transactions have been created!</h2>
+                                ${transactionInfoHtml}
 
-                            <div class="label-group" style="margin-top:24px;">
-                                <h3>${escapeXml(itemDetails.displayname || itemDetails.itemid)}</h3>
-                                <p style="color:#64748b; margin:0 0 12px; font-size:14px;">
-                                    Quantity: ${quantity} &bull; ${actionLabel}
-                                </p>
+                                <div class="label-group" style="margin-top:24px;">
+                                    <h3>${escapeXml(itemDetails.displayname || itemDetails.itemid)}</h3>
+                                    <p style="color:#64748b; margin:0 0 12px; font-size:14px;">
+                                        Quantity: ${quantity} &bull; ${actionLabel}
+                                    </p>
+                                </div>
                             </div>
-
-                            <button type="button" class="custom-btn btn-success" style="width:100%; margin-top:16px;" onclick="printLabels()">Print Labels (${quantity})</button>
-                            <button type="button" class="custom-btn btn-outline" style="width:100%; margin-top:12px;" onclick="createAnother()">Process More</button>
+                        </div>
+                        <div class="btn-area" style="flex-direction:column;">
+                            <button type="button" class="custom-btn btn-success" style="width:100%;" onclick="printLabels()">Print Labels (${quantity})</button>
+                            <button type="button" class="custom-btn btn-outline" style="width:100%;" onclick="createAnother()">Process More</button>
                         </div>
                     </div>
                 </div>
@@ -2528,13 +2574,40 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
 <script>
 var printed = false;
 function doPrint() { if (printed) return; printed = true; try { document.getElementById('pdf').contentWindow.print(); } catch(e) { window.print(); } }
-document.getElementById('pdf').onload = function() { setTimeout(doPrint, 500); };
-setTimeout(doPrint, 2000);
+document.getElementById('pdf').onload = function() { setTimeout(doPrint, 2500); };
+setTimeout(doPrint, 4000);
 </script>
 </body></html>`;
 
             context.response.setHeader({ name: 'Content-Type', value: 'text/html' });
             context.response.write(html);
+        }
+
+        /**
+         * Handle print PDF via POST (avoids URL length limits).
+         * Generates the PDF and returns an auto-print HTML page with the PDF
+         * embedded as a base64 data URL.
+         */
+        function handlePrintPdfPost(context) {
+            const recordId = context.request.parameters.custpage_print_record_id || '';
+            const labelDataRaw = context.request.parameters.custpage_print_data || '';
+
+            if (!labelDataRaw) {
+                context.response.write('Error: No label data');
+                return;
+            }
+
+            try {
+                const labelGroups = JSON.parse(labelDataRaw);
+                const pdfFile = generateLabelsPdf(labelGroups, recordId);
+
+                context.response.setHeader({ name: 'Content-Type', value: 'application/pdf' });
+                context.response.setHeader({ name: 'Content-Disposition', value: 'inline; filename="Labels_' + recordId + '.pdf"' });
+                context.response.write(pdfFile.getContents());
+            } catch (e) {
+                log.error('Print PDF POST Error', e.message);
+                context.response.write('Error generating PDF: ' + e.message);
+            }
         }
 
         // ====================================================================
@@ -2573,6 +2646,11 @@ setTimeout(doPrint, 2000);
 
                     if (action === 'process_nonserialized') {
                         handleProcessNonSerialized(context);
+                        return;
+                    }
+
+                    if (action === 'printpdf') {
+                        handlePrintPdfPost(context);
                         return;
                     }
 

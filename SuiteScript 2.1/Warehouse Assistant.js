@@ -938,6 +938,193 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
         }
 
         /**
+         * Create inventory adjustment for "Inventory Found" — adjust IN at warehouse average cost.
+         * Works for serialized items. Adjusts into bin 3555, status 1.
+         *
+         * @param {Array} groups - Grouped data:
+         *   { itemId, itemText, locationId, serials: [{ serialNumber, serialId, binId }] }
+         * @param {string} memo - Transaction memo
+         * @returns {Object} { adjId, tranId }
+         */
+        function createInventoryFoundAdjustment(groups, memo) {
+            const adjRecord = record.create({
+                type: record.Type.INVENTORY_ADJUSTMENT,
+                isDynamic: true
+            });
+
+            adjRecord.setValue({ fieldId: 'subsidiary', value: '1' });
+
+            if (ADJUSTMENT_ACCOUNT_ID) {
+                adjRecord.setValue({ fieldId: 'account', value: ADJUSTMENT_ACCOUNT_ID });
+            }
+            adjRecord.setValue({ fieldId: 'memo', value: memo || 'Inventory Found — via Warehouse Assistant Dashboard.' });
+
+            // Look up average cost for each item
+            const costCache = {};
+            groups.forEach(group => {
+                if (!costCache[group.itemId]) {
+                    try {
+                        const costLookup = search.lookupFields({
+                            type: search.Type.ITEM,
+                            id: group.itemId,
+                            columns: ['averagecost']
+                        });
+                        costCache[group.itemId] = parseFloat(costLookup.averagecost) || 0;
+                    } catch (e) {
+                        log.debug('Cost lookup failed for item ' + group.itemId, e.message);
+                        costCache[group.itemId] = 0;
+                    }
+                }
+            });
+
+            groups.forEach(group => {
+                const serialCount = group.serials.length;
+                const itemCost = costCache[group.itemId] || 0;
+
+                // --- ADDITION LINE ONLY: adjust the item in ---
+                adjRecord.selectNewLine({ sublistId: 'inventory' });
+                adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'item', value: group.itemId });
+                adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'location', value: group.locationId });
+                adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'adjustqtyby', value: serialCount });
+                if (itemCost > 0) {
+                    adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'unitcost', value: itemCost });
+                }
+
+                const addDetail = adjRecord.getCurrentSublistSubrecord({
+                    sublistId: 'inventory',
+                    fieldId: 'inventorydetail'
+                });
+
+                group.serials.forEach(serial => {
+                    addDetail.selectNewLine({ sublistId: 'inventoryassignment' });
+                    addDetail.setCurrentSublistValue({
+                        sublistId: 'inventoryassignment',
+                        fieldId: 'receiptinventorynumber',
+                        value: serial.serialNumber
+                    });
+                    addDetail.setCurrentSublistValue({
+                        sublistId: 'inventoryassignment',
+                        fieldId: 'quantity',
+                        value: 1
+                    });
+                    addDetail.setCurrentSublistValue({
+                        sublistId: 'inventoryassignment',
+                        fieldId: 'binnumber',
+                        value: BACK_TO_STOCK_BIN_ID
+                    });
+                    addDetail.setCurrentSublistValue({
+                        sublistId: 'inventoryassignment',
+                        fieldId: 'inventorystatus',
+                        value: BACK_TO_STOCK_STATUS_ID
+                    });
+                    addDetail.commitLine({ sublistId: 'inventoryassignment' });
+                });
+
+                adjRecord.commitLine({ sublistId: 'inventory' });
+            });
+
+            const adjId = adjRecord.save({ enableSourcing: true, ignoreMandatoryFields: false });
+
+            let tranId = String(adjId);
+            try {
+                const adjLookup = search.lookupFields({
+                    type: search.Type.INVENTORY_ADJUSTMENT,
+                    id: adjId,
+                    columns: ['tranid']
+                });
+                tranId = adjLookup.tranid || String(adjId);
+            } catch (e) {
+                log.debug('Could not look up adjustment tranid', e.message);
+            }
+
+            return { adjId: adjId, tranId: tranId };
+        }
+
+        /**
+         * Create inventory adjustment for "Inventory Found" — non-serialized items.
+         * Adjusts IN at warehouse average cost into bin 3555, status 1.
+         *
+         * @param {Object} data - { itemId, locationId, quantity }
+         * @param {string} memo - Transaction memo
+         * @returns {Object} { adjId, tranId }
+         */
+        function createNonSerializedInventoryFoundAdjustment(data, memo) {
+            const adjRecord = record.create({
+                type: record.Type.INVENTORY_ADJUSTMENT,
+                isDynamic: true
+            });
+
+            adjRecord.setValue({ fieldId: 'subsidiary', value: '1' });
+
+            if (ADJUSTMENT_ACCOUNT_ID) {
+                adjRecord.setValue({ fieldId: 'account', value: ADJUSTMENT_ACCOUNT_ID });
+            }
+            adjRecord.setValue({ fieldId: 'memo', value: memo || 'Inventory Found — via Warehouse Assistant Dashboard.' });
+
+            // Look up average cost for the item
+            let itemCost = 0;
+            try {
+                const costLookup = search.lookupFields({
+                    type: search.Type.ITEM,
+                    id: data.itemId,
+                    columns: ['averagecost']
+                });
+                itemCost = parseFloat(costLookup.averagecost) || 0;
+            } catch (e) {
+                log.debug('Cost lookup failed for item ' + data.itemId, e.message);
+            }
+
+            // --- ADDITION LINE ONLY: adjust the item in ---
+            adjRecord.selectNewLine({ sublistId: 'inventory' });
+            adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'item', value: data.itemId });
+            adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'location', value: data.locationId });
+            adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'adjustqtyby', value: data.quantity });
+            if (itemCost > 0) {
+                adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'unitcost', value: itemCost });
+            }
+
+            const addDetail = adjRecord.getCurrentSublistSubrecord({
+                sublistId: 'inventory',
+                fieldId: 'inventorydetail'
+            });
+            addDetail.selectNewLine({ sublistId: 'inventoryassignment' });
+            addDetail.setCurrentSublistValue({
+                sublistId: 'inventoryassignment',
+                fieldId: 'quantity',
+                value: data.quantity
+            });
+            addDetail.setCurrentSublistValue({
+                sublistId: 'inventoryassignment',
+                fieldId: 'binnumber',
+                value: BACK_TO_STOCK_BIN_ID
+            });
+            addDetail.setCurrentSublistValue({
+                sublistId: 'inventoryassignment',
+                fieldId: 'inventorystatus',
+                value: BACK_TO_STOCK_STATUS_ID
+            });
+            addDetail.commitLine({ sublistId: 'inventoryassignment' });
+
+            adjRecord.commitLine({ sublistId: 'inventory' });
+
+            const adjId = adjRecord.save({ enableSourcing: true, ignoreMandatoryFields: false });
+
+            let tranId = String(adjId);
+            try {
+                const adjLookup = search.lookupFields({
+                    type: search.Type.INVENTORY_ADJUSTMENT,
+                    id: adjId,
+                    columns: ['tranid']
+                });
+                tranId = adjLookup.tranid || String(adjId);
+            } catch (e) {
+                log.debug('Could not look up adjustment tranid', e.message);
+            }
+
+            return { adjId: adjId, tranId: tranId };
+        }
+
+        /**
          * Create inventory adjustment for serial number change.
          * Removes old serial and adds new serial for the same item.
          *
@@ -1075,6 +1262,184 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                         });
                     } else {
                         // Serial Number Change only: keep same bin and status
+                        if (change.binId) {
+                            addDetail.setCurrentSublistValue({
+                                sublistId: 'inventoryassignment',
+                                fieldId: 'binnumber',
+                                value: change.binId
+                            });
+                        }
+                        if (change.statusId) {
+                            addDetail.setCurrentSublistValue({
+                                sublistId: 'inventoryassignment',
+                                fieldId: 'inventorystatus',
+                                value: change.statusId
+                            });
+                        }
+                    }
+                    addDetail.commitLine({ sublistId: 'inventoryassignment' });
+                });
+
+                adjRecord.commitLine({ sublistId: 'inventory' });
+            });
+
+            const adjId = adjRecord.save({ enableSourcing: true, ignoreMandatoryFields: false });
+
+            // Look up the tranid for display
+            let tranId = String(adjId);
+            try {
+                const adjLookup = search.lookupFields({
+                    type: search.Type.INVENTORY_ADJUSTMENT,
+                    id: adjId,
+                    columns: ['tranid']
+                });
+                tranId = adjLookup.tranid || String(adjId);
+            } catch (e) {
+                log.debug('Could not look up adjustment tranid', e.message);
+            }
+
+            return { adjId: adjId, tranId: tranId };
+        }
+
+        /**
+         * Create inventory adjustment for part number change.
+         * Removes serial from old item and adds same serial to new (target) item.
+         *
+         * @param {Array} changes - Array of part number change data:
+         *   { oldItemId, newItemId, newItemName, locationId, serialNumber, serialId, binId, statusId, action }
+         * @param {string} memo - Transaction memo
+         * @returns {Object} { adjId, tranId }
+         */
+        function createPartNumberChangeAdjustment(changes, memo) {
+            const adjRecord = record.create({
+                type: record.Type.INVENTORY_ADJUSTMENT,
+                isDynamic: true
+            });
+
+            adjRecord.setValue({ fieldId: 'subsidiary', value: '1' });
+
+            if (ADJUSTMENT_ACCOUNT_ID) {
+                adjRecord.setValue({ fieldId: 'account', value: ADJUSTMENT_ACCOUNT_ID });
+            }
+            adjRecord.setValue({ fieldId: 'memo', value: memo || 'Part Number Change via Warehouse Assistant Dashboard.' });
+
+            // Group changes by oldItemId + newItemId + locationId + action
+            const groupMap = {};
+            changes.forEach(change => {
+                const key = change.oldItemId + '_' + change.newItemId + '_' + change.locationId + '_' + change.action;
+                if (!groupMap[key]) {
+                    groupMap[key] = {
+                        oldItemId: change.oldItemId,
+                        newItemId: change.newItemId,
+                        locationId: change.locationId,
+                        action: change.action,
+                        changes: []
+                    };
+                }
+                groupMap[key].changes.push(change);
+            });
+
+            // Look up average cost for old items (used on both removal and addition lines for zero variance)
+            const costCache = {};
+            Object.values(groupMap).forEach(group => {
+                if (!costCache[group.oldItemId]) {
+                    try {
+                        const costLookup = search.lookupFields({
+                            type: search.Type.ITEM,
+                            id: group.oldItemId,
+                            columns: ['averagecost']
+                        });
+                        costCache[group.oldItemId] = parseFloat(costLookup.averagecost) || 0;
+                    } catch (e) {
+                        log.debug('Cost lookup failed for item ' + group.oldItemId, e.message);
+                        costCache[group.oldItemId] = 0;
+                    }
+                }
+            });
+
+            Object.values(groupMap).forEach(group => {
+                const itemCost = costCache[group.oldItemId] || 0;
+                const changeCount = group.changes.length;
+
+                // --- REMOVAL LINE: remove serials from old item ---
+                adjRecord.selectNewLine({ sublistId: 'inventory' });
+                adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'item', value: group.oldItemId });
+                adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'location', value: group.locationId });
+                adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'adjustqtyby', value: -changeCount });
+                if (itemCost > 0) {
+                    adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'unitcost', value: itemCost });
+                }
+
+                const removeDetail = adjRecord.getCurrentSublistSubrecord({
+                    sublistId: 'inventory',
+                    fieldId: 'inventorydetail'
+                });
+
+                group.changes.forEach(change => {
+                    removeDetail.selectNewLine({ sublistId: 'inventoryassignment' });
+                    removeDetail.setCurrentSublistValue({
+                        sublistId: 'inventoryassignment',
+                        fieldId: 'issueinventorynumber',
+                        value: change.serialId
+                    });
+                    removeDetail.setCurrentSublistValue({
+                        sublistId: 'inventoryassignment',
+                        fieldId: 'quantity',
+                        value: -1
+                    });
+                    if (change.binId) {
+                        removeDetail.setCurrentSublistValue({
+                            sublistId: 'inventoryassignment',
+                            fieldId: 'binnumber',
+                            value: change.binId
+                        });
+                    }
+                    removeDetail.commitLine({ sublistId: 'inventoryassignment' });
+                });
+
+                adjRecord.commitLine({ sublistId: 'inventory' });
+
+                // --- ADDITION LINE: add serials to new (target) item (same cost as removal for zero variance) ---
+                adjRecord.selectNewLine({ sublistId: 'inventory' });
+                adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'item', value: group.newItemId });
+                adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'location', value: group.locationId });
+                adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'adjustqtyby', value: changeCount });
+                if (itemCost > 0) {
+                    adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'unitcost', value: itemCost });
+                }
+
+                const addDetail = adjRecord.getCurrentSublistSubrecord({
+                    sublistId: 'inventory',
+                    fieldId: 'inventorydetail'
+                });
+
+                group.changes.forEach(change => {
+                    addDetail.selectNewLine({ sublistId: 'inventoryassignment' });
+                    addDetail.setCurrentSublistValue({
+                        sublistId: 'inventoryassignment',
+                        fieldId: 'receiptinventorynumber',
+                        value: change.serialNumber
+                    });
+                    addDetail.setCurrentSublistValue({
+                        sublistId: 'inventoryassignment',
+                        fieldId: 'quantity',
+                        value: 1
+                    });
+
+                    if (change.action === 'part_number_change_stock') {
+                        // Part Number Change & Back to Stock: use bin 3555 and status 1
+                        addDetail.setCurrentSublistValue({
+                            sublistId: 'inventoryassignment',
+                            fieldId: 'binnumber',
+                            value: BACK_TO_STOCK_BIN_ID
+                        });
+                        addDetail.setCurrentSublistValue({
+                            sublistId: 'inventoryassignment',
+                            fieldId: 'inventorystatus',
+                            value: BACK_TO_STOCK_STATUS_ID
+                        });
+                    } else {
+                        // Part Number Change only: keep same bin and status
                         if (change.binId) {
                             addDetail.setCurrentSublistValue({
                                 sublistId: 'inventoryassignment',
@@ -1515,6 +1880,40 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                         form.submit();
                     }
 
+                    function showInventoryFoundModal() {
+                        var modal = document.getElementById('inventoryFoundModal');
+                        if (modal) modal.style.display = 'flex';
+                        var itemInput = document.getElementById('if_item_name');
+                        if (itemInput) itemInput.focus();
+                    }
+
+                    function hideInventoryFoundModal() {
+                        var modal = document.getElementById('inventoryFoundModal');
+                        if (modal) modal.style.display = 'none';
+                    }
+
+                    function submitInventoryFound() {
+                        var itemName = (document.getElementById('if_item_name').value || '').trim();
+                        var serialsRaw = (document.getElementById('if_serials').value || '').trim();
+
+                        if (!itemName) { alert('Please enter an item name / SKU.'); return; }
+                        if (!serialsRaw) { alert('Please enter at least one serial number.'); return; }
+
+                        window.onbeforeunload = null;
+                        var form = document.forms[0];
+
+                        var ifItemField = document.getElementById('custpage_if_item_name');
+                        if (ifItemField) ifItemField.value = itemName;
+
+                        var ifSerialsField = document.getElementById('custpage_if_serials');
+                        if (ifSerialsField) ifSerialsField.value = serialsRaw;
+
+                        var actionInput = document.createElement('input');
+                        actionInput.type = 'hidden'; actionInput.name = 'custpage_action'; actionInput.value = 'process_inventory_found';
+                        form.appendChild(actionInput);
+                        form.submit();
+                    }
+
                     function clearForm() {
                         if (currentMode === 'serialized') {
                             var field = document.getElementById('custpage_serial_numbers');
@@ -1556,6 +1955,40 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                             alert('Serial change actions must be set individually for each serial.');
                             return;
                         }
+
+                        // Show/hide bulk new item input for part number change
+                        var bulkNewItem = document.getElementById('bulk-new-item');
+                        if (bulkNewItem) {
+                            if (value === 'part_number_change' || value === 'part_number_change_stock') {
+                                bulkNewItem.style.display = 'block';
+                            } else {
+                                bulkNewItem.style.display = 'none';
+                                bulkNewItem.value = '';
+                            }
+                        }
+
+                        // For part number change, require item name before applying
+                        if (value === 'part_number_change' || value === 'part_number_change_stock') {
+                            var bulkItemName = bulkNewItem ? bulkNewItem.value.trim() : '';
+                            if (!bulkItemName) {
+                                // Just show the input, don't apply yet — user needs to type item name first
+                                // Set the dropdowns so user sees the selection, populate item names on submit
+                                var selects = document.querySelectorAll('select.action-select[data-index]');
+                                for (var i = 0; i < selects.length; i++) {
+                                    selects[i].value = value;
+                                    handleActionChange(selects[i]);
+                                }
+                                updateActionCount();
+                                bulkNewItem.focus();
+                                return;
+                            }
+                            // Populate all per-row new-item-input fields with the bulk value
+                            var itemInputs = document.querySelectorAll('.new-item-input[data-index]');
+                            for (var j = 0; j < itemInputs.length; j++) {
+                                itemInputs[j].value = bulkItemName;
+                            }
+                        }
+
                         // Select only row dropdowns (those with data-index attribute)
                         var selects = document.querySelectorAll('select.action-select[data-index]');
                         for (var i = 0; i < selects.length; i++) {
@@ -1578,6 +2011,17 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                                 newSerialInput.value = '';
                             }
                         }
+                        var newItemInput = document.querySelector('.new-item-input[data-index="' + idx + '"]');
+                        if (newItemInput) {
+                            if (selectEl.value === 'part_number_change' || selectEl.value === 'part_number_change_stock') {
+                                newItemInput.style.display = 'block';
+                                newItemInput.required = true;
+                            } else {
+                                newItemInput.style.display = 'none';
+                                newItemInput.required = false;
+                                newItemInput.value = '';
+                            }
+                        }
                         updateActionCount();
                     }
 
@@ -1598,11 +2042,17 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                         var actions = [];
                         var hasAction = false;
                         var missingNewSerial = false;
+                        var missingNewItem = false;
+
+                        // Get bulk item name if present (for part number change via Apply to All)
+                        var bulkNewItem = document.getElementById('bulk-new-item');
+                        var bulkItemName = bulkNewItem ? bulkNewItem.value.trim() : '';
 
                         for (var i = 0; i < selects.length; i++) {
                             var idx = selects[i].getAttribute('data-index');
                             var val = selects[i].value;
                             var newSerial = '';
+                            var newItemName = '';
 
                             if (val === 'serial_change' || val === 'serial_change_stock') {
                                 var newSerialInput = document.querySelector('.new-serial-input[data-index="' + idx + '"]');
@@ -1617,12 +2067,31 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                                 }
                             }
 
-                            actions.push({ index: parseInt(idx), action: val, newSerial: newSerial });
+                            if (val === 'part_number_change' || val === 'part_number_change_stock') {
+                                var newItemInput = document.querySelector('.new-item-input[data-index="' + idx + '"]');
+                                if (newItemInput) {
+                                    newItemName = newItemInput.value.trim();
+                                    // If per-row is empty but bulk has a value, use bulk
+                                    if (!newItemName && bulkItemName) {
+                                        newItemName = bulkItemName;
+                                        newItemInput.value = bulkItemName;
+                                    }
+                                    if (!newItemName) {
+                                        missingNewItem = true;
+                                        newItemInput.style.border = '2px solid #ef4444';
+                                    } else {
+                                        newItemInput.style.border = '1px solid #e2e8f0';
+                                    }
+                                }
+                            }
+
+                            actions.push({ index: parseInt(idx), action: val, newSerial: newSerial, newItemName: newItemName });
                             if (val !== '') hasAction = true;
                         }
 
                         if (!hasAction) { alert('Select an action for at least one serial number'); return; }
                         if (missingNewSerial) { alert('Please enter a new serial number for all Serial Number Change actions'); return; }
+                        if (missingNewItem) { alert('Please enter a new item name for all Part Number Change actions'); return; }
 
                         window.onbeforeunload = null;
                         var form = document.forms[0];
@@ -1734,13 +2203,35 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                         <div id="serialized-btn-area" class="btn-area">
                             <button type="button" class="custom-btn btn-success" onclick="submitSerials()">Submit</button>
                             <button type="button" class="custom-btn btn-outline" onclick="clearForm()">Clear</button>
+                            <button type="button" class="custom-btn btn-outline" style="padding:6px 14px; font-size:12px;" onclick="showInventoryFoundModal()">Inventory Found</button>
                         </div>
                         <div id="nonserialized-btn-area" class="btn-area" style="display:none;">
                             <button type="button" class="custom-btn btn-success" onclick="submitNonSerialized()">Submit</button>
                             <button type="button" class="custom-btn btn-outline" onclick="clearForm()">Clear</button>
+                            <button type="button" class="custom-btn btn-outline" style="padding:6px 14px; font-size:12px;" onclick="showInventoryFoundModal()">Inventory Found</button>
                         </div>
                     </div>
                 </div>
+
+                <!-- Inventory Found Modal -->
+                <div id="inventoryFoundModal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.5); z-index:9999; justify-content:center; align-items:center;">
+                    <div style="background:#fff; border-radius:12px; padding:32px; max-width:500px; width:90%; box-shadow:0 20px 60px rgba(0,0,0,0.3);">
+                        <h2 style="margin:0 0 8px; color:#1e3c72; font-size:20px;">Inventory Found</h2>
+                        <p style="margin:0 0 20px; color:#64748b; font-size:14px;">Enter the item name and serial number(s) to adjust in.</p>
+
+                        <label style="display:block; font-weight:600; margin-bottom:6px; color:#334155; font-size:14px;">Item Name / SKU</label>
+                        <input type="text" id="if_item_name" placeholder="Enter exact item name" style="width:100%; padding:10px 12px; border:1px solid #e2e8f0; border-radius:8px; font-size:14px; margin-bottom:16px; box-sizing:border-box;">
+
+                        <label style="display:block; font-weight:600; margin-bottom:6px; color:#334155; font-size:14px;">Serial Numbers (one per line)</label>
+                        <textarea id="if_serials" rows="6" placeholder="Scan or type serial numbers, one per line" style="width:100%; padding:10px 12px; border:1px solid #e2e8f0; border-radius:8px; font-size:14px; resize:vertical; margin-bottom:20px; box-sizing:border-box;"></textarea>
+
+                        <div style="display:flex; gap:12px; justify-content:flex-end;">
+                            <button type="button" class="custom-btn btn-outline" style="padding:10px 20px; margin:0;" onclick="hideInventoryFoundModal()">Cancel</button>
+                            <button type="button" class="custom-btn btn-success" style="padding:10px 20px; margin:0; background:linear-gradient(135deg,#059669,#047857);" onclick="submitInventoryFound()">Submit</button>
+                        </div>
+                    </div>
+                </div>
+
                 <div style="display:none;">
             `;
 
@@ -1767,6 +2258,16 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
             nsActionField.addSelectOption({ value: 'move_testing', text: 'Move to Testing' });
             nsActionField.addSelectOption({ value: 'return_to_vendor', text: 'Return to Vendor' });
             nsActionField.addSelectOption({ value: 'trash', text: 'Trash' });
+            nsActionField.addSelectOption({ value: 'inventory_found', text: 'Inventory Found' });
+
+            // Hidden fields for Inventory Found modal
+            const ifItemField = form.addField({ id: 'custpage_if_item_name', type: serverWidget.FieldType.TEXT, label: 'IF Item' });
+            ifItemField.updateDisplayType({ displayType: serverWidget.FieldDisplayType.HIDDEN });
+            ifItemField.defaultValue = '';
+
+            const ifSerialsField = form.addField({ id: 'custpage_if_serials', type: serverWidget.FieldType.LONGTEXT, label: 'IF Serials' });
+            ifSerialsField.updateDisplayType({ displayType: serverWidget.FieldDisplayType.HIDDEN });
+            ifSerialsField.defaultValue = '';
 
             const containerEnd = form.addField({ id: 'custpage_container_end', type: serverWidget.FieldType.INLINEHTML, label: ' ' });
             containerEnd.defaultValue = `</div>
@@ -1830,11 +2331,14 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                             <option value="defective">Defective</option>
                             <option value="move_refurbishing">Move to Refurbishing</option>
                             <option value="move_testing">Move to Testing</option>
+                            <option value="part_number_change">Part Number Change</option>
+                            <option value="part_number_change_stock">Part Number Change &amp; Back to Stock</option>
                             <option value="return_to_vendor">Return to Vendor</option>
                             <option value="serial_change">Serial Number Change</option>
                             <option value="trash">Trash</option>
                         </select>
                         <input type="text" class="new-serial-input" data-index="${idx}" placeholder="Enter new serial" style="display:none; margin-top:8px; width:100%; padding:8px; border:1px solid #e2e8f0; border-radius:6px; font-size:13px;">
+                        <input type="text" class="new-item-input" data-index="${idx}" placeholder="Enter new item name" style="display:none; margin-top:8px; width:100%; padding:8px; border:1px solid #e2e8f0; border-radius:6px; font-size:13px;">
                     </td>
                 </tr>`;
             });
@@ -1877,10 +2381,13 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                                     <option value="defective">Defective</option>
                                     <option value="move_refurbishing">Move to Refurbishing</option>
                                     <option value="move_testing">Move to Testing</option>
+                                    <option value="part_number_change">Part Number Change</option>
+                                    <option value="part_number_change_stock">Part Number Change &amp; Back to Stock</option>
                                     <option value="return_to_vendor">Return to Vendor</option>
                                     <option value="serial_change">Serial Number Change</option>
                                     <option value="trash">Trash</option>
                                 </select>
+                                <input type="text" id="bulk-new-item" placeholder="Enter new item name" style="display:none; flex:1; padding:8px; border:1px solid #e2e8f0; border-radius:6px; font-size:13px;">
                                 <div style="display:flex; align-items:center; gap:12px;">
                                     <span style="color:#64748b; font-weight:500;">With Action:</span>
                                     <span style="font-size:22px; font-weight:700; color:#1e3c72;" id="action_count">0</span>
@@ -1904,6 +2411,7 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                         </div>
                     </div>
                 </div>
+
             `;
 
             // Hidden fields for data persistence
@@ -1918,7 +2426,7 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
             context.response.writePage(form);
         }
 
-        function createSuccessPage(context, adjustmentTranId, binTransferTranId, labelGroups, serialChangeTranId) {
+        function createSuccessPage(context, adjustmentTranId, binTransferTranId, labelGroups, serialChangeTranId, inventoryFoundTranId, partNumberChangeTranId) {
             const form = serverWidget.createForm({ title: 'Transactions Created' });
 
             const suiteletUrl = url.resolveScript({
@@ -1950,7 +2458,7 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
             }));
 
             // Use whichever transaction ID is available for the print job
-            const recordIdForPrint = adjustmentTranId || binTransferTranId || serialChangeTranId || '';
+            const recordIdForPrint = adjustmentTranId || binTransferTranId || serialChangeTranId || partNumberChangeTranId || '';
 
             const styleField = form.addField({ id: 'custpage_styles', type: serverWidget.FieldType.INLINEHTML, label: ' ' });
             styleField.defaultValue = getStyles() + getSuccessPageScript(suiteletUrl);
@@ -1978,7 +2486,10 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                     'return_to_vendor': 'Return to Vendor',
                     'serial_change': 'Serial Number Change',
                     'serial_change_stock': 'Change Serial & Back to Stock',
-                    'trash': 'Trash'
+                    'part_number_change': 'Part Number Change',
+                    'part_number_change_stock': 'Part Number Change & Back to Stock',
+                    'trash': 'Trash',
+                    'inventory_found': 'Inventory Found'
                 }[group.action] || group.action;
 
                 groupsHtml += `
@@ -2005,6 +2516,12 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
             }
             if (serialChangeTranId) {
                 transactionInfoHtml += `<p style="font-size:16px; margin:8px 0; color:#1e3c72;"><strong>Serial Number Change:</strong> ${escapeXml(String(serialChangeTranId))}</p>`;
+            }
+            if (partNumberChangeTranId) {
+                transactionInfoHtml += `<p style="font-size:16px; margin:8px 0; color:#1e3c72;"><strong>Part Number Change:</strong> ${escapeXml(String(partNumberChangeTranId))}</p>`;
+            }
+            if (inventoryFoundTranId) {
+                transactionInfoHtml += `<p style="font-size:16px; margin:8px 0; color:#1e3c72;"><strong>Inventory Found:</strong> ${escapeXml(String(inventoryFoundTranId))}</p>`;
             }
 
             const contentField = form.addField({ id: 'custpage_content', type: serverWidget.FieldType.INLINEHTML, label: ' ' });
@@ -2073,11 +2590,11 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                 return;
             }
 
-            // Build map of index → action (including newSerial for serial_change)
+            // Build map of index → action (including newSerial for serial_change, newItemName for part_number_change)
             const actionMap = {};
             actions.forEach(a => {
                 if (a.action && a.action !== '') {
-                    actionMap[a.index] = { action: a.action, newSerial: a.newSerial || '' };
+                    actionMap[a.index] = { action: a.action, newSerial: a.newSerial || '', newItemName: a.newItemName || '' };
                 }
             });
 
@@ -2086,14 +2603,17 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                 return;
             }
 
-            // Separate actions into adjustment vs bin transfer vs serial change
+            // Separate actions into adjustment vs bin transfer vs serial change vs part number change vs inventory found
             const ADJUSTMENT_ACTIONS = ['likenew', 'likenew_stock'];
             const BIN_TRANSFER_ACTIONS = ['move_testing', 'move_refurbishing', 'back_to_stock', 'defective', 'trash', 'return_to_vendor'];
             const SERIAL_CHANGE_ACTIONS = ['serial_change', 'serial_change_stock'];
+            const PART_NUMBER_CHANGE_ACTIONS = ['part_number_change', 'part_number_change_stock'];
+            const INVENTORY_FOUND_ACTIONS = ['inventory_found'];
 
             const errors = [];
             const itemDetailsCache = {}; // itemId → { itemid, displayname, description }
             const targetItemCache = {}; // sourceItemId → { found, targetItem } (for adjustment actions)
+            const partNumberTargetCache = {}; // itemName → { found, targetItem } (for part number change actions)
 
             // Groups for inventory adjustment (condition change)
             const adjustmentGroupMap = {};
@@ -2101,6 +2621,10 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
             const binTransferGroupMap = {};
             // List for serial number changes (each is processed individually)
             const serialChangeList = [];
+            // List for part number changes
+            const partNumberChangeList = [];
+            // Groups for inventory found (adjust in at avg cost)
+            const inventoryFoundGroupMap = {};
 
             for (const [idxStr, actionData] of Object.entries(actionMap)) {
                 const idx = parseInt(idxStr, 10);
@@ -2108,6 +2632,7 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                 if (!serial) continue;
 
                 const action = actionData.action;
+                const newItemName = actionData.newItemName;
                 const newSerial = actionData.newSerial;
                 const itemId = serial.itemId;
 
@@ -2198,13 +2723,69 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                         statusId: serial.statusId,
                         action: action  // 'serial_change' or 'serial_change_stock'
                     });
+
+                } else if (PART_NUMBER_CHANGE_ACTIONS.includes(action)) {
+                    // --- PART NUMBER CHANGE: Move serial from old item to new (target) item ---
+                    if (!newItemName) {
+                        errors.push('New item name required for: ' + serial.serialNumber);
+                        continue;
+                    }
+
+                    // Look up target item by name (cache to avoid repeated lookups)
+                    if (!partNumberTargetCache[newItemName]) {
+                        const targetItem = findItemByName(newItemName);
+                        if (!targetItem) {
+                            errors.push('Item not found: ' + newItemName + ' (for serial ' + serial.serialNumber + ')');
+                            partNumberTargetCache[newItemName] = { found: false };
+                        } else {
+                            partNumberTargetCache[newItemName] = { found: true, targetItem: targetItem };
+                        }
+                    }
+
+                    const pnCache = partNumberTargetCache[newItemName];
+                    if (!pnCache.found) continue;
+
+                    partNumberChangeList.push({
+                        oldItemId: itemId,
+                        oldItemText: itemDetails.displayname || itemDetails.itemid,
+                        newItemId: pnCache.targetItem.id,
+                        newItemName: pnCache.targetItem.itemid,
+                        newItemText: pnCache.targetItem.displayname || pnCache.targetItem.itemid,
+                        newItemDescription: pnCache.targetItem.description,
+                        locationId: serial.locationId,
+                        serialNumber: serial.serialNumber,
+                        serialId: serial.serialId,
+                        binId: serial.binId,
+                        statusId: serial.statusId,
+                        action: action  // 'part_number_change' or 'part_number_change_stock'
+                    });
+
+                } else if (INVENTORY_FOUND_ACTIONS.includes(action)) {
+                    // --- INVENTORY FOUND: Adjust item in at avg cost, bin 3555, status 1 ---
+                    const key = itemId + '_' + serial.locationId + '_' + action;
+                    if (!inventoryFoundGroupMap[key]) {
+                        inventoryFoundGroupMap[key] = {
+                            itemId: itemId,
+                            itemText: itemDetails.displayname || itemDetails.itemid,
+                            itemDescription: itemDetails.description,
+                            locationId: serial.locationId,
+                            action: action,
+                            serials: []
+                        };
+                    }
+                    inventoryFoundGroupMap[key].serials.push({
+                        serialNumber: serial.serialNumber,
+                        serialId: serial.serialId,
+                        binId: serial.binId
+                    });
                 }
             }
 
             const adjustmentGroups = Object.values(adjustmentGroupMap);
             const binTransferGroups = Object.values(binTransferGroupMap);
+            const inventoryFoundGroups = Object.values(inventoryFoundGroupMap);
 
-            if (adjustmentGroups.length === 0 && binTransferGroups.length === 0 && serialChangeList.length === 0) {
+            if (adjustmentGroups.length === 0 && binTransferGroups.length === 0 && serialChangeList.length === 0 && partNumberChangeList.length === 0 && inventoryFoundGroups.length === 0) {
                 const errMsg = errors.length > 0
                     ? 'Could not process: ' + errors.join('; ')
                     : 'No valid serials to process.';
@@ -2220,6 +2801,8 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
             let adjustmentTranId = null;
             let binTransferTranId = null;
             let serialChangeTranId = null;
+            let partNumberChangeTranId = null;
+            let inventoryFoundTranId = null;
             const labelGroups = [];
 
             // --- Process Inventory Adjustments (condition change to -LN) ---
@@ -2310,7 +2893,142 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                 }
             }
 
-            createSuccessPage(context, adjustmentTranId, binTransferTranId, labelGroups, serialChangeTranId);
+            // --- Process Part Number Changes ---
+            if (partNumberChangeList.length > 0) {
+                try {
+                    const partNumberChangeResult = createPartNumberChangeAdjustment(partNumberChangeList, 'Part Number Change via Warehouse Assistant Dashboard');
+                    log.audit('Part Number Change Adjustment Created', 'TranID: ' + partNumberChangeResult.tranId);
+                    partNumberChangeTranId = partNumberChangeResult.tranId;
+
+                    // Build label groups for part number changes (use new item, same serial)
+                    partNumberChangeList.forEach(change => {
+                        let existing = labelGroups.find(lg => lg.itemId === change.newItemId && lg.action === change.action);
+                        if (!existing) {
+                            existing = {
+                                itemId: change.newItemId,
+                                itemText: change.newItemText,
+                                description: change.newItemDescription,
+                                action: change.action,
+                                serialNumbers: []
+                            };
+                            labelGroups.push(existing);
+                        }
+                        existing.serialNumbers.push(change.serialNumber);
+                    });
+                } catch (e) {
+                    log.error('Part Number Change Error', e.message + ' | ' + e.stack);
+                    createResultsPage(context, serialData, 'Part number change failed: ' + e.message, 'error');
+                    return;
+                }
+            }
+
+            // --- Process Inventory Found (adjust in at average cost) ---
+            if (inventoryFoundGroups.length > 0) {
+                try {
+                    const foundResult = createInventoryFoundAdjustment(inventoryFoundGroups, 'Inventory Found — via Warehouse Assistant Dashboard.');
+                    log.audit('Inventory Found Adjustment Created', 'TranID: ' + foundResult.tranId);
+                    inventoryFoundTranId = foundResult.tranId;
+
+                    // Build label groups for inventory found (same item)
+                    inventoryFoundGroups.forEach(group => {
+                        let existing = labelGroups.find(lg => lg.itemId === group.itemId && lg.action === group.action);
+                        if (!existing) {
+                            existing = {
+                                itemId: group.itemId,
+                                itemText: group.itemText,
+                                description: group.itemDescription,
+                                action: group.action,
+                                serialNumbers: []
+                            };
+                            labelGroups.push(existing);
+                        }
+                        group.serials.forEach(s => existing.serialNumbers.push(s.serialNumber));
+                    });
+                } catch (e) {
+                    log.error('Inventory Found Error', e.message + ' | ' + e.stack);
+                    createResultsPage(context, serialData, 'Inventory found adjustment failed: ' + e.message, 'error');
+                    return;
+                }
+            }
+
+            createSuccessPage(context, adjustmentTranId, binTransferTranId, labelGroups, serialChangeTranId, inventoryFoundTranId, partNumberChangeTranId);
+        }
+
+        /**
+         * Handle "Inventory Found" modal submission (serialized).
+         * Looks up item by name, creates adjust-in at avg cost into bin 3555 / status 1.
+         */
+        function handleProcessInventoryFound(context) {
+            const itemName = (context.request.parameters.custpage_if_item_name || '').trim();
+            const serialsRaw = (context.request.parameters.custpage_if_serials || '').trim();
+
+            if (!itemName) {
+                createEntryForm(context, 'Item name is required for Inventory Found.', 'error');
+                return;
+            }
+            if (!serialsRaw) {
+                createEntryForm(context, 'At least one serial number is required.', 'error');
+                return;
+            }
+
+            // Look up the item by name/SKU
+            const item = findItemByName(itemName);
+            if (!item) {
+                createEntryForm(context, 'Item not found: ' + itemName, 'error');
+                return;
+            }
+
+            // Parse serials (one per line, trim, deduplicate, skip blanks)
+            const serials = serialsRaw.split(/[\r\n]+/).map(function(s) { return s.trim(); }).filter(function(s) { return s.length > 0; });
+            const uniqueSerials = [];
+            const seen = {};
+            serials.forEach(function(s) {
+                if (!seen[s]) {
+                    seen[s] = true;
+                    uniqueSerials.push(s);
+                }
+            });
+
+            if (uniqueSerials.length === 0) {
+                createEntryForm(context, 'No valid serial numbers provided.', 'error');
+                return;
+            }
+
+            const locationId = '1';
+
+            // Build group for the adjustment
+            const groups = [{
+                itemId: item.id,
+                itemText: item.displayname || item.itemid,
+                itemDescription: item.description,
+                locationId: locationId,
+                action: 'inventory_found',
+                serials: uniqueSerials.map(function(s) {
+                    return { serialNumber: s, serialId: null, binId: null };
+                })
+            }];
+
+            let inventoryFoundTranId = null;
+            try {
+                const foundResult = createInventoryFoundAdjustment(groups, 'Inventory Found — via Warehouse Assistant Dashboard.');
+                log.audit('Inventory Found Adjustment Created', 'TranID: ' + foundResult.tranId);
+                inventoryFoundTranId = foundResult.tranId;
+            } catch (e) {
+                log.error('Inventory Found Error', e.message + ' | ' + e.stack);
+                createEntryForm(context, 'Inventory found adjustment failed: ' + e.message, 'error');
+                return;
+            }
+
+            // Build label groups for success page
+            const labelGroups = [{
+                itemId: item.id,
+                itemText: item.displayname || item.itemid,
+                description: item.description,
+                action: 'inventory_found',
+                serialNumbers: uniqueSerials
+            }];
+
+            createSuccessPage(context, null, null, labelGroups, null, inventoryFoundTranId, null);
         }
 
         /**
@@ -2349,9 +3067,11 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
 
             const ADJUSTMENT_ACTIONS = ['likenew', 'likenew_stock'];
             const BIN_TRANSFER_ACTIONS = ['move_testing', 'move_refurbishing', 'back_to_stock', 'defective', 'trash', 'return_to_vendor'];
+            const INVENTORY_FOUND_ACTIONS = ['inventory_found'];
 
             let adjustmentTranId = null;
             let binTransferTranId = null;
+            let inventoryFoundTranId = null;
 
             // Default location - using 1 as default, you may want to make this configurable
             const locationId = '1';
@@ -2434,16 +3154,31 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                     createEntryForm(context, 'Bin transfer failed: ' + e.message, 'error');
                     return;
                 }
+            } else if (INVENTORY_FOUND_ACTIONS.includes(action)) {
+                try {
+                    const foundResult = createNonSerializedInventoryFoundAdjustment({
+                        itemId: itemId,
+                        locationId: locationId,
+                        quantity: quantity
+                    }, 'Inventory Found — via Warehouse Assistant Dashboard.');
+
+                    inventoryFoundTranId = foundResult.tranId;
+                    log.audit('Non-Serialized Inventory Found Created', 'TranID: ' + foundResult.tranId);
+                } catch (e) {
+                    log.error('Non-Serialized Inventory Found Error', e.message + ' | ' + e.stack);
+                    createEntryForm(context, 'Inventory found adjustment failed: ' + e.message, 'error');
+                    return;
+                }
             }
 
             // Show success page for non-serialized
-            createNonSerializedSuccessPage(context, adjustmentTranId, binTransferTranId, itemDetails, quantity, action);
+            createNonSerializedSuccessPage(context, adjustmentTranId, binTransferTranId, itemDetails, quantity, action, inventoryFoundTranId);
         }
 
         /**
          * Success page for non-serialized items (no serial list to display).
          */
-        function createNonSerializedSuccessPage(context, adjustmentTranId, binTransferTranId, itemDetails, quantity, action) {
+        function createNonSerializedSuccessPage(context, adjustmentTranId, binTransferTranId, itemDetails, quantity, action, inventoryFoundTranId) {
             const form = serverWidget.createForm({ title: 'Transactions Created' });
 
             const suiteletUrl = url.resolveScript({
@@ -2460,7 +3195,7 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
             }];
 
             // Use whichever transaction ID is available for the print job
-            const recordIdForPrint = adjustmentTranId || binTransferTranId || '';
+            const recordIdForPrint = adjustmentTranId || binTransferTranId || inventoryFoundTranId || '';
 
             const styleField = form.addField({ id: 'custpage_styles', type: serverWidget.FieldType.INLINEHTML, label: ' ' });
             styleField.defaultValue = getStyles() + getSuccessPageScript(suiteletUrl);
@@ -2482,6 +3217,9 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
             if (binTransferTranId) {
                 transactionInfoHtml += `<p style="font-size:16px; margin:8px 0; color:#1e3c72;"><strong>Bin Transfer:</strong> ${escapeXml(String(binTransferTranId))}</p>`;
             }
+            if (inventoryFoundTranId) {
+                transactionInfoHtml += `<p style="font-size:16px; margin:8px 0; color:#1e3c72;"><strong>Inventory Found:</strong> ${escapeXml(String(inventoryFoundTranId))}</p>`;
+            }
 
             const actionLabel = {
                 'back_to_stock': 'Back to Stock',
@@ -2491,7 +3229,8 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                 'move_refurbishing': 'Move to Refurbishing',
                 'move_testing': 'Move to Testing',
                 'return_to_vendor': 'Return to Vendor',
-                'trash': 'Trash'
+                'trash': 'Trash',
+                'inventory_found': 'Inventory Found'
             }[action] || action;
 
             const contentField = form.addField({ id: 'custpage_content', type: serverWidget.FieldType.INLINEHTML, label: ' ' });
@@ -2644,6 +3383,11 @@ setTimeout(doPrint, 4000);
 
                     if (action === 'process_nonserialized') {
                         handleProcessNonSerialized(context);
+                        return;
+                    }
+
+                    if (action === 'process_inventory_found') {
+                        handleProcessInventoryFound(context);
                         return;
                     }
 

@@ -220,7 +220,7 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                         id: r.getValue('internalid'),
                         name: r.getValue('binnumber')
                     });
-                    return bins.length < 100;
+                    return bins.length < 1000;
                 });
             } catch (e) {
                 log.error('getBinsForLocation Error', e.message);
@@ -252,6 +252,34 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                 log.error('getLocations Error', e.message);
             }
             return locations;
+        }
+
+        /**
+         * Find a bin by its bin number for a given location.
+         * Returns { id, binnumber } or null.
+         */
+        function findBinByNumber(binNumber, locationId) {
+            let result = null;
+            try {
+                search.create({
+                    type: 'bin',
+                    filters: [
+                        ['binnumber', 'is', binNumber],
+                        'AND',
+                        ['location', 'anyof', locationId]
+                    ],
+                    columns: ['internalid', 'binnumber']
+                }).run().each(function(r) {
+                    result = {
+                        id: r.getValue('internalid'),
+                        binnumber: r.getValue('binnumber')
+                    };
+                    return false;
+                });
+            } catch (e) {
+                log.error('findBinByNumber Error', e.message);
+            }
+            return result;
         }
 
         /**
@@ -862,6 +890,98 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
         }
 
         /**
+         * Create a single inventory adjustment for multiple non-serialized condition-change rows.
+         * Each row produces a removal line (source item) and an addition line (target -LN item).
+         *
+         * @param {Array} rows - Array of { sourceItemId, sourceItemName, targetItemId, targetItemName, locationId, quantity, fromBinId, toBinId, toStatusId }
+         * @param {string} memo - Transaction memo
+         * @returns {Object} { adjId, tranId }
+         */
+        function createNonSerializedAdjustmentMulti(rows, memo) {
+            const adjRecord = record.create({
+                type: record.Type.INVENTORY_ADJUSTMENT,
+                isDynamic: true
+            });
+
+            adjRecord.setValue({ fieldId: 'subsidiary', value: '1' });
+            if (ADJUSTMENT_ACCOUNT_ID) {
+                adjRecord.setValue({ fieldId: 'account', value: ADJUSTMENT_ACCOUNT_ID });
+            }
+            adjRecord.setValue({ fieldId: 'memo', value: memo || 'Created through Warehouse Assistant Dashboard.' });
+
+            const costCache = {};
+
+            rows.forEach(function(data) {
+                if (!costCache[data.sourceItemId]) {
+                    try {
+                        const costLookup = search.lookupFields({
+                            type: search.Type.ITEM,
+                            id: data.sourceItemId,
+                            columns: ['averagecost']
+                        });
+                        costCache[data.sourceItemId] = parseFloat(costLookup.averagecost) || 0;
+                    } catch (e) {
+                        log.debug('Cost lookup failed for item ' + data.sourceItemId, e.message);
+                        costCache[data.sourceItemId] = 0;
+                    }
+                }
+
+                const itemCost = costCache[data.sourceItemId];
+
+                // --- REMOVAL LINE ---
+                adjRecord.selectNewLine({ sublistId: 'inventory' });
+                adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'item', value: data.sourceItemId });
+                adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'location', value: data.locationId });
+                adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'adjustqtyby', value: -data.quantity });
+                if (itemCost > 0) {
+                    adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'unitcost', value: itemCost });
+                }
+
+                if (data.fromBinId) {
+                    const removeDetail = adjRecord.getCurrentSublistSubrecord({ sublistId: 'inventory', fieldId: 'inventorydetail' });
+                    removeDetail.selectNewLine({ sublistId: 'inventoryassignment' });
+                    removeDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity', value: -data.quantity });
+                    removeDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', value: data.fromBinId });
+                    removeDetail.commitLine({ sublistId: 'inventoryassignment' });
+                }
+                adjRecord.commitLine({ sublistId: 'inventory' });
+
+                // --- ADDITION LINE ---
+                adjRecord.selectNewLine({ sublistId: 'inventory' });
+                adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'item', value: data.targetItemId });
+                adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'location', value: data.locationId });
+                adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'adjustqtyby', value: data.quantity });
+                if (itemCost > 0) {
+                    adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'unitcost', value: itemCost });
+                }
+
+                if (data.toBinId) {
+                    const addDetail = adjRecord.getCurrentSublistSubrecord({ sublistId: 'inventory', fieldId: 'inventorydetail' });
+                    addDetail.selectNewLine({ sublistId: 'inventoryassignment' });
+                    addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity', value: data.quantity });
+                    addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', value: data.toBinId });
+                    if (data.toStatusId) {
+                        addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'inventorystatus', value: data.toStatusId });
+                    }
+                    addDetail.commitLine({ sublistId: 'inventoryassignment' });
+                }
+                adjRecord.commitLine({ sublistId: 'inventory' });
+            });
+
+            const adjId = adjRecord.save({ enableSourcing: true, ignoreMandatoryFields: false });
+
+            let tranId = String(adjId);
+            try {
+                const adjLookup = search.lookupFields({ type: search.Type.INVENTORY_ADJUSTMENT, id: adjId, columns: ['tranid'] });
+                tranId = adjLookup.tranid || String(adjId);
+            } catch (e) {
+                log.debug('Could not look up adjustment tranid', e.message);
+            }
+
+            return { adjId: adjId, tranId: tranId };
+        }
+
+        /**
          * Create bin transfer for non-serialized items.
          *
          * @param {Object} data - { itemId, locationId, quantity, fromBinId, toBinId, toStatusId }
@@ -929,6 +1049,60 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                     id: transferId,
                     columns: ['tranid']
                 });
+                tranId = lookup.tranid || String(transferId);
+            } catch (e) {
+                log.debug('Could not look up bin transfer tranid', e.message);
+            }
+
+            return { transferId: transferId, tranId: tranId };
+        }
+
+        /**
+         * Create a single bin transfer for multiple non-serialized items.
+         * Each row adds a line to the same Bin Transfer record.
+         *
+         * @param {Array} rows - Array of { itemId, locationId, quantity, fromBinId, toBinId, toStatusId }
+         * @param {string} memo - Transaction memo
+         * @returns {Object} { transferId, tranId }
+         */
+        function createNonSerializedBinTransferMulti(rows, memo) {
+            const transferRecord = record.create({
+                type: record.Type.BIN_TRANSFER,
+                isDynamic: true
+            });
+
+            transferRecord.setValue({ fieldId: 'subsidiary', value: '1' });
+            transferRecord.setValue({ fieldId: 'memo', value: memo || 'Via Warehouse Assistant Dashboard' });
+
+            if (rows.length > 0) {
+                transferRecord.setValue({ fieldId: 'location', value: rows[0].locationId });
+            }
+
+            rows.forEach(function(data) {
+                transferRecord.selectNewLine({ sublistId: 'inventory' });
+                transferRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'item', value: data.itemId });
+                transferRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'quantity', value: data.quantity });
+
+                const invDetail = transferRecord.getCurrentSublistSubrecord({ sublistId: 'inventory', fieldId: 'inventorydetail' });
+                invDetail.selectNewLine({ sublistId: 'inventoryassignment' });
+                invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity', value: data.quantity });
+                if (data.fromBinId) {
+                    invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', value: data.fromBinId });
+                }
+                invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'tobinnumber', value: data.toBinId });
+                if (data.toStatusId) {
+                    invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'toinventorystatus', value: data.toStatusId });
+                }
+                invDetail.commitLine({ sublistId: 'inventoryassignment' });
+
+                transferRecord.commitLine({ sublistId: 'inventory' });
+            });
+
+            const transferId = transferRecord.save({ enableSourcing: true, ignoreMandatoryFields: false });
+
+            let tranId = String(transferId);
+            try {
+                const lookup = search.lookupFields({ type: record.Type.BIN_TRANSFER, id: transferId, columns: ['tranid'] });
                 tranId = lookup.tranid || String(transferId);
             } catch (e) {
                 log.debug('Could not look up bin transfer tranid', e.message);
@@ -1116,6 +1290,72 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                     id: adjId,
                     columns: ['tranid']
                 });
+                tranId = adjLookup.tranid || String(adjId);
+            } catch (e) {
+                log.debug('Could not look up adjustment tranid', e.message);
+            }
+
+            return { adjId: adjId, tranId: tranId };
+        }
+
+        /**
+         * Create a single inventory adjustment for multiple non-serialized "Inventory Found" rows.
+         * Each row adds a line (adjust-in) to the same record at bin 3555, status 1.
+         *
+         * @param {Array} rows - Array of { itemId, locationId, quantity }
+         * @param {string} memo - Transaction memo
+         * @returns {Object} { adjId, tranId }
+         */
+        function createNonSerializedInventoryFoundMulti(rows, memo) {
+            const adjRecord = record.create({
+                type: record.Type.INVENTORY_ADJUSTMENT,
+                isDynamic: true
+            });
+
+            adjRecord.setValue({ fieldId: 'subsidiary', value: '1' });
+            if (ADJUSTMENT_ACCOUNT_ID) {
+                adjRecord.setValue({ fieldId: 'account', value: ADJUSTMENT_ACCOUNT_ID });
+            }
+            adjRecord.setValue({ fieldId: 'memo', value: memo || 'Inventory Found — via Warehouse Assistant Dashboard.' });
+
+            const costCache = {};
+
+            rows.forEach(function(data) {
+                if (!costCache[data.itemId]) {
+                    try {
+                        const costLookup = search.lookupFields({ type: search.Type.ITEM, id: data.itemId, columns: ['averagecost'] });
+                        costCache[data.itemId] = parseFloat(costLookup.averagecost) || 0;
+                    } catch (e) {
+                        log.debug('Cost lookup failed for item ' + data.itemId, e.message);
+                        costCache[data.itemId] = 0;
+                    }
+                }
+
+                const itemCost = costCache[data.itemId];
+
+                adjRecord.selectNewLine({ sublistId: 'inventory' });
+                adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'item', value: data.itemId });
+                adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'location', value: data.locationId });
+                adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'adjustqtyby', value: data.quantity });
+                if (itemCost > 0) {
+                    adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'unitcost', value: itemCost });
+                }
+
+                const addDetail = adjRecord.getCurrentSublistSubrecord({ sublistId: 'inventory', fieldId: 'inventorydetail' });
+                addDetail.selectNewLine({ sublistId: 'inventoryassignment' });
+                addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity', value: data.quantity });
+                addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', value: BACK_TO_STOCK_BIN_ID });
+                addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'inventorystatus', value: BACK_TO_STOCK_STATUS_ID });
+                addDetail.commitLine({ sublistId: 'inventoryassignment' });
+
+                adjRecord.commitLine({ sublistId: 'inventory' });
+            });
+
+            const adjId = adjRecord.save({ enableSourcing: true, ignoreMandatoryFields: false });
+
+            let tranId = String(adjId);
+            try {
+                const adjLookup = search.lookupFields({ type: search.Type.INVENTORY_ADJUSTMENT, id: adjId, columns: ['tranid'] });
                 tranId = adjLookup.tranid || String(adjId);
             } catch (e) {
                 log.debug('Could not look up adjustment tranid', e.message);
@@ -1760,6 +2000,14 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                 .form-section.active {
                     display: block;
                 }
+
+                #ns-grid-body tr {
+                    animation: cartFadeIn 0.3s ease-in;
+                }
+                @keyframes cartFadeIn {
+                    from { background-color: #e0f2fe; }
+                    to { background-color: transparent; }
+                }
             </style>
             `;
         }
@@ -1768,13 +2016,153 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
         // CLIENT-SIDE SCRIPTS
         // ====================================================================
 
-        function getEntryFormScript() {
+        function getEntryFormScript(nsBinOptionsHtml) {
             return `
                 <script>
                     window.onbeforeunload = null;
                     if (typeof setWindowChanged === 'function') setWindowChanged(window, false);
 
                     var currentMode = 'serialized';
+
+                    // Non-serialized grid management
+                    var nsGridRowId = 0;
+
+                    var nsBinOptions = '${(nsBinOptionsHtml || '').replace(/'/g, "\\'")}';
+
+                    var nsActionOptions = '<option value="">-- Select Action --</option>'
+                        + '<option value="back_to_stock">Back to Stock</option>'
+                        + '<option value="likenew">Change to Like New</option>'
+                        + '<option value="likenew_stock">Change to Like New &amp; Back to Stock</option>'
+                        + '<option value="defective">Defective</option>'
+                        + '<option value="move_refurbishing">Move to Refurbishing</option>'
+                        + '<option value="move_testing">Move to Testing</option>'
+                        + '<option value="return_to_vendor">Return to Vendor</option>'
+                        + '<option value="trash">Trash</option>'
+                        + '<option value="inventory_found">Inventory Found</option>';
+
+                    function addNsGridRow() {
+                        var tbody = document.getElementById('ns-grid-body');
+                        if (!tbody) return;
+
+                        nsGridRowId++;
+                        var tr = document.createElement('tr');
+                        tr.setAttribute('data-row-id', nsGridRowId);
+                        tr.innerHTML = '<td><input type="text" class="ns-grid-input ns-item-input" data-row="' + nsGridRowId + '" placeholder="Enter SKU" style="width:100%; padding:8px 10px; border:1px solid #e2e8f0; border-radius:6px; font-size:13px;"></td>'
+                            + '<td><select class="action-select ns-bin-input" data-row="' + nsGridRowId + '" style="min-width:120px;">' + nsBinOptions + '</select></td>'
+                            + '<td><input type="number" class="ns-grid-input ns-qty-input" data-row="' + nsGridRowId + '" placeholder="Qty" min="1" style="width:80px; padding:8px 10px; border:1px solid #e2e8f0; border-radius:6px; font-size:13px;"></td>'
+                            + '<td><select class="action-select ns-action-input" data-row="' + nsGridRowId + '" style="min-width:180px;">' + nsActionOptions + '</select></td>'
+                            + '<td><button type="button" onclick="removeNsGridRow(' + nsGridRowId + ')" '
+                            + 'style="background:none; border:none; color:#ef4444; cursor:pointer; font-size:18px; padding:4px 8px;" '
+                            + 'title="Remove">&times;</button></td>';
+                        tbody.appendChild(tr);
+                        updateNsRowCount();
+
+                        // Focus the part number input of the new row
+                        var newInput = tr.querySelector('.ns-item-input');
+                        if (newInput) newInput.focus();
+                    }
+
+                    function removeNsGridRow(rowId) {
+                        var row = document.querySelector('#ns-grid-body tr[data-row-id="' + rowId + '"]');
+                        if (row) row.remove();
+                        updateNsRowCount();
+                        // Ensure at least one row remains
+                        var tbody = document.getElementById('ns-grid-body');
+                        if (tbody && tbody.children.length === 0) addNsGridRow();
+                    }
+
+                    function updateNsRowCount() {
+                        var tbody = document.getElementById('ns-grid-body');
+                        var countEl = document.getElementById('ns_row_count');
+                        if (tbody && countEl) countEl.textContent = tbody.children.length;
+                    }
+
+                    function clearNsGrid() {
+                        var tbody = document.getElementById('ns-grid-body');
+                        if (tbody) tbody.innerHTML = '';
+                        nsGridRowId = 0;
+                        addNsGridRow();
+                    }
+
+                    function submitNonSerializedMulti() {
+                        var rows = document.querySelectorAll('#ns-grid-body tr');
+                        var gridData = [];
+                        var hasError = false;
+
+                        for (var i = 0; i < rows.length; i++) {
+                            var row = rows[i];
+                            var itemInput = row.querySelector('.ns-item-input');
+                            var binInput = row.querySelector('.ns-bin-input');
+                            var qtyInput = row.querySelector('.ns-qty-input');
+                            var actionSelect = row.querySelector('.ns-action-input');
+
+                            var itemName = itemInput ? itemInput.value.trim() : '';
+                            var binNumber = binInput ? binInput.value.trim() : '';
+                            var qty = qtyInput ? parseInt(qtyInput.value) || 0 : 0;
+                            var action = actionSelect ? actionSelect.value : '';
+
+                            // Skip completely empty rows
+                            if (!itemName && !binNumber && qty === 0 && !action) continue;
+
+                            // Validate filled rows
+                            var rowNum = i + 1;
+                            if (!itemName) {
+                                if (itemInput) itemInput.style.border = '2px solid #ef4444';
+                                hasError = true;
+                            } else {
+                                if (itemInput) itemInput.style.border = '1px solid #e2e8f0';
+                            }
+                            if (!binNumber) {
+                                if (binInput) binInput.style.border = '2px solid #ef4444';
+                                hasError = true;
+                            } else {
+                                if (binInput) binInput.style.border = '1px solid #e2e8f0';
+                            }
+                            if (qty <= 0) {
+                                if (qtyInput) qtyInput.style.border = '2px solid #ef4444';
+                                hasError = true;
+                            } else {
+                                if (qtyInput) qtyInput.style.border = '1px solid #e2e8f0';
+                            }
+                            if (!action) {
+                                if (actionSelect) actionSelect.style.border = '2px solid #ef4444';
+                                hasError = true;
+                            } else {
+                                if (actionSelect) actionSelect.style.border = '1px solid #e2e8f0';
+                            }
+
+                            gridData.push({
+                                itemName: itemName,
+                                binNumber: binNumber,
+                                quantity: qty,
+                                action: action
+                            });
+                        }
+
+                        if (gridData.length === 0) {
+                            alert('Please fill in at least one row.');
+                            return;
+                        }
+                        if (hasError) {
+                            alert('Please fill in all fields for each row (highlighted in red).');
+                            return;
+                        }
+
+                        window.onbeforeunload = null;
+                        var form = document.forms[0];
+
+                        var cartField = document.getElementById('custpage_ns_cart_json');
+                        if (cartField) {
+                            cartField.value = JSON.stringify(gridData);
+                        }
+
+                        var actionInput = document.createElement('input');
+                        actionInput.type = 'hidden';
+                        actionInput.name = 'custpage_action';
+                        actionInput.value = 'process_nonserialized_multi';
+                        form.appendChild(actionInput);
+                        form.submit();
+                    }
 
                     function switchMode(mode) {
                         currentMode = mode;
@@ -1920,12 +2308,7 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                             if (field) field.value = '';
                             updateCount();
                         } else {
-                            var itemField = document.getElementById('custpage_ns_item');
-                            var qtyField = document.getElementById('custpage_ns_quantity');
-                            var actionField = document.getElementById('custpage_ns_action');
-                            if (itemField) itemField.value = '';
-                            if (qtyField) qtyField.value = '';
-                            if (actionField) actionField.value = '';
+                            clearNsGrid();
                         }
                     }
 
@@ -2147,8 +2530,15 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
         function createEntryForm(context, message, messageType) {
             const form = serverWidget.createForm({ title: 'Warehouse Assistant Dashboard' });
 
+            // Pre-load bins for the non-serialized grid dropdowns
+            const binList = getBinsForLocation('1');
+            let nsBinOptionsHtml = '<option value="">-- Select Bin --</option>';
+            binList.forEach(function(b) {
+                nsBinOptionsHtml += '<option value="' + escapeXml(b.name) + '">' + escapeXml(b.name) + '</option>';
+            });
+
             const styleField = form.addField({ id: 'custpage_styles', type: serverWidget.FieldType.INLINEHTML, label: ' ' });
-            styleField.defaultValue = getStyles() + getEntryFormScript();
+            styleField.defaultValue = getStyles() + getEntryFormScript(nsBinOptionsHtml);
 
             let msgHtml = '';
             if (message) {
@@ -2179,24 +2569,27 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                                 </div>
                             </div>
 
-                            <!-- Non-Serialized Items Section -->
+                            <!-- Non-Serialized Items Section — Grid View -->
                             <div id="non-serialized-section" class="form-section">
-                                <div class="input-group">
-                                    <label class="custom-label">Item</label>
-                                    <div id="ns-item-wrap"></div>
+                                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+                                    <label class="custom-label" style="margin-bottom:0;">
+                                        Items to Process
+                                        <span class="badge-count"><span id="ns_row_count">1</span> rows</span>
+                                    </label>
+                                    <button type="button" class="custom-btn btn-outline" style="padding:6px 14px; font-size:12px; margin:0;" onclick="addNsGridRow()">+ Add Row</button>
                                 </div>
-                                <div class="input-group">
-                                    <label class="custom-label">From Bin</label>
-                                    <div id="ns-bin-wrap"></div>
-                                </div>
-                                <div class="input-group">
-                                    <label class="custom-label">Quantity</label>
-                                    <div id="ns-qty-wrap"></div>
-                                </div>
-                                <div class="input-group">
-                                    <label class="custom-label">Action</label>
-                                    <div id="ns-action-wrap"></div>
-                                </div>
+                                <table class="results-table" id="ns-grid-table">
+                                    <thead>
+                                        <tr>
+                                            <th>Part Number / SKU</th>
+                                            <th>From Bin</th>
+                                            <th>Qty</th>
+                                            <th>Action</th>
+                                            <th style="width:40px;"></th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="ns-grid-body"></tbody>
+                                </table>
                             </div>
                         </div>
                         <!-- Buttons pinned outside scrollable area -->
@@ -2206,7 +2599,7 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                             <button type="button" class="custom-btn btn-outline" style="padding:6px 14px; font-size:12px;" onclick="showInventoryFoundModal()">Inventory Found</button>
                         </div>
                         <div id="nonserialized-btn-area" class="btn-area" style="display:none;">
-                            <button type="button" class="custom-btn btn-success" onclick="submitNonSerialized()">Submit</button>
+                            <button type="button" class="custom-btn btn-success" onclick="submitNonSerializedMulti()">Submit</button>
                             <button type="button" class="custom-btn btn-outline" onclick="clearForm()">Clear</button>
                             <button type="button" class="custom-btn btn-outline" style="padding:6px 14px; font-size:12px;" onclick="showInventoryFoundModal()">Inventory Found</button>
                         </div>
@@ -2239,16 +2632,18 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
             const serialField = form.addField({ id: 'custpage_serial_numbers', type: serverWidget.FieldType.TEXTAREA, label: 'Serials' });
             serialField.updateDisplaySize({ height: 10, width: 60 });
 
-            // Non-serialized fields
+            // Non-serialized fields (hidden — grid uses its own HTML inputs)
             const nsItemField = form.addField({ id: 'custpage_ns_item', type: serverWidget.FieldType.SELECT, label: 'Item', source: 'item' });
-            nsItemField.updateDisplaySize({ height: 1, width: 60 });
+            nsItemField.updateDisplayType({ displayType: serverWidget.FieldDisplayType.HIDDEN });
 
             const nsBinField = form.addField({ id: 'custpage_ns_bin', type: serverWidget.FieldType.SELECT, label: 'From Bin', source: 'bin' });
-            nsBinField.updateDisplaySize({ height: 1, width: 60 });
+            nsBinField.updateDisplayType({ displayType: serverWidget.FieldDisplayType.HIDDEN });
 
             const nsQtyField = form.addField({ id: 'custpage_ns_quantity', type: serverWidget.FieldType.INTEGER, label: 'Quantity' });
+            nsQtyField.updateDisplayType({ displayType: serverWidget.FieldDisplayType.HIDDEN });
 
             const nsActionField = form.addField({ id: 'custpage_ns_action', type: serverWidget.FieldType.SELECT, label: 'Action' });
+            nsActionField.updateDisplayType({ displayType: serverWidget.FieldDisplayType.HIDDEN });
             nsActionField.addSelectOption({ value: '', text: '-- Select Action --' });
             nsActionField.addSelectOption({ value: 'back_to_stock', text: 'Back to Stock' });
             nsActionField.addSelectOption({ value: 'likenew', text: 'Change to Like New' });
@@ -2269,6 +2664,11 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
             ifSerialsField.updateDisplayType({ displayType: serverWidget.FieldDisplayType.HIDDEN });
             ifSerialsField.defaultValue = '';
 
+            // Hidden field for Non-Serialized multi-row cart data
+            const nsCartDataField = form.addField({ id: 'custpage_ns_cart_json', type: serverWidget.FieldType.LONGTEXT, label: 'NS Cart Data' });
+            nsCartDataField.updateDisplayType({ displayType: serverWidget.FieldDisplayType.HIDDEN });
+            nsCartDataField.defaultValue = '';
+
             const containerEnd = form.addField({ id: 'custpage_container_end', type: serverWidget.FieldType.INLINEHTML, label: ' ' });
             containerEnd.defaultValue = `</div>
             <script>
@@ -2278,24 +2678,10 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                     var serialLabel = document.getElementById('custpage_serial_numbers_fs_lbl_uir_label');
                     if (serialWrap && serialLabel) serialWrap.appendChild(serialLabel.parentNode);
 
-                    // Move non-serialized fields to their wrappers
-                    var nsItemWrap = document.getElementById('ns-item-wrap');
-                    var nsItemLabel = document.getElementById('custpage_ns_item_fs_lbl_uir_label');
-                    if (nsItemWrap && nsItemLabel) nsItemWrap.appendChild(nsItemLabel.parentNode);
-
-                    var nsBinWrap = document.getElementById('ns-bin-wrap');
-                    var nsBinLabel = document.getElementById('custpage_ns_bin_fs_lbl_uir_label');
-                    if (nsBinWrap && nsBinLabel) nsBinWrap.appendChild(nsBinLabel.parentNode);
-
-                    var nsQtyWrap = document.getElementById('ns-qty-wrap');
-                    var nsQtyLabel = document.getElementById('custpage_ns_quantity_fs_lbl_uir_label');
-                    if (nsQtyWrap && nsQtyLabel) nsQtyWrap.appendChild(nsQtyLabel.parentNode);
-
-                    var nsActionWrap = document.getElementById('ns-action-wrap');
-                    var nsActionLabel = document.getElementById('custpage_ns_action_fs_lbl_uir_label');
-                    if (nsActionWrap && nsActionLabel) nsActionWrap.appendChild(nsActionLabel.parentNode);
-
                     updateCount();
+
+                    // Initialize the non-serialized grid with one empty row
+                    addNsGridRow();
                 });
             </script>`;
 
@@ -3073,6 +3459,9 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
             let binTransferTranId = null;
             let inventoryFoundTranId = null;
 
+            // Track the item details to use for label printing (may change for adjustments)
+            let labelItemDetails = itemDetails;
+
             // Default location - using 1 as default, you may want to make this configurable
             const locationId = '1';
 
@@ -3085,6 +3474,13 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                     createEntryForm(context, 'Like New item not found: ' + likeNewName, 'error');
                     return;
                 }
+
+                // Use the target item details for label printing (not the original item)
+                labelItemDetails = {
+                    itemid: targetItem.itemid,
+                    displayname: targetItem.displayname,
+                    description: targetItem.description
+                };
 
                 // Determine destination bin and status for 'likenew_stock' action
                 let toBinId = null;
@@ -3171,8 +3567,240 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                 }
             }
 
-            // Show success page for non-serialized
-            createNonSerializedSuccessPage(context, adjustmentTranId, binTransferTranId, itemDetails, quantity, action, inventoryFoundTranId);
+            // Show success page for non-serialized (use labelItemDetails so adjustment actions print the target item label)
+            createNonSerializedSuccessPage(context, adjustmentTranId, binTransferTranId, labelItemDetails, quantity, action, inventoryFoundTranId);
+        }
+
+        /**
+         * Handle multi-row non-serialized processing.
+         * Parses the JSON cart data and groups rows by action type,
+         * creating one transaction per type (Adjustment, Bin Transfer, Inventory Found).
+         */
+        function handleProcessNonSerializedMulti(context) {
+            const cartDataRaw = context.request.parameters.custpage_ns_cart_json;
+
+            if (!cartDataRaw) {
+                createEntryForm(context, 'Missing cart data. Please start over.', 'error');
+                return;
+            }
+
+            let cartRows;
+            try {
+                cartRows = JSON.parse(cartDataRaw);
+            } catch (e) {
+                createEntryForm(context, 'Invalid cart data. Please start over.', 'error');
+                return;
+            }
+
+            if (!cartRows || cartRows.length === 0) {
+                createEntryForm(context, 'No items in the grid. Please add items first.', 'warning');
+                return;
+            }
+
+            const ADJUSTMENT_ACTIONS = ['likenew', 'likenew_stock'];
+            const BIN_TRANSFER_ACTIONS = ['move_testing', 'move_refurbishing', 'back_to_stock', 'defective', 'trash', 'return_to_vendor'];
+            const INVENTORY_FOUND_ACTIONS = ['inventory_found'];
+
+            const locationId = '1';
+            const errors = [];
+
+            const adjustmentRows = [];
+            const binTransferRows = [];
+            const inventoryFoundRows = [];
+
+            const itemCache = {};       // keyed by itemName
+            const binCache = {};        // keyed by binNumber
+            const targetItemCache = {}; // keyed by sourceItemId
+
+            cartRows.forEach(function(row, idx) {
+                const itemName = (row.itemName || '').trim();
+                const binNumber = (row.binNumber || '').trim();
+                const action = row.action;
+                const quantity = parseInt(row.quantity) || 0;
+                const rowLabel = 'Row ' + (idx + 1) + ' (' + (itemName || 'empty') + ')';
+
+                if (!itemName || !action || quantity <= 0) {
+                    errors.push(rowLabel + ': missing required fields');
+                    return;
+                }
+
+                // Look up item by SKU/name
+                if (!itemCache[itemName]) {
+                    const item = findItemByName(itemName);
+                    if (item) {
+                        itemCache[itemName] = item;
+                    } else {
+                        errors.push(rowLabel + ': item not found "' + itemName + '"');
+                        return;
+                    }
+                }
+                const itemData = itemCache[itemName];
+                const itemId = itemData.id;
+
+                // Look up from-bin by bin number
+                let fromBinId = null;
+                if (binNumber) {
+                    if (!binCache[binNumber]) {
+                        const bin = findBinByNumber(binNumber, locationId);
+                        if (bin) {
+                            binCache[binNumber] = bin;
+                        } else {
+                            errors.push(rowLabel + ': bin not found "' + binNumber + '"');
+                            return;
+                        }
+                    }
+                    fromBinId = binCache[binNumber].id;
+                }
+
+                if (ADJUSTMENT_ACTIONS.indexOf(action) !== -1) {
+                    // Find -LN target item
+                    if (!targetItemCache[itemId]) {
+                        const likeNewName = getLikeNewItemName(itemData.itemid);
+                        const targetItem = findItemByName(likeNewName);
+                        if (!targetItem) {
+                            errors.push(rowLabel + ': Like New item not found "' + likeNewName + '"');
+                            targetItemCache[itemId] = { found: false };
+                        } else {
+                            targetItemCache[itemId] = { found: true, targetItem: targetItem };
+                        }
+                    }
+
+                    const cache = targetItemCache[itemId];
+                    if (!cache.found) return;
+
+                    let toBinId = null;
+                    let toStatusId = null;
+                    if (action === 'likenew_stock') {
+                        toBinId = BACK_TO_STOCK_BIN_ID;
+                        toStatusId = BACK_TO_STOCK_STATUS_ID;
+                    }
+
+                    adjustmentRows.push({
+                        sourceItemId: itemId,
+                        sourceItemName: itemData.itemid,
+                        targetItemId: cache.targetItem.id,
+                        targetItemName: cache.targetItem.itemid,
+                        targetDisplayName: cache.targetItem.displayname,
+                        targetDescription: cache.targetItem.description,
+                        locationId: locationId,
+                        quantity: quantity,
+                        fromBinId: fromBinId,
+                        toBinId: toBinId || fromBinId,
+                        toStatusId: toStatusId,
+                        action: action
+                    });
+
+                } else if (BIN_TRANSFER_ACTIONS.indexOf(action) !== -1) {
+                    let toBinId, toStatusId;
+                    if (action === 'move_testing') { toBinId = TESTING_BIN_ID; toStatusId = TESTING_STATUS_ID; }
+                    else if (action === 'move_refurbishing') { toBinId = REFURBISHING_BIN_ID; toStatusId = REFURBISHING_STATUS_ID; }
+                    else if (action === 'back_to_stock') { toBinId = BACK_TO_STOCK_BIN_ID; toStatusId = BACK_TO_STOCK_STATUS_ID; }
+                    else if (action === 'defective') { toBinId = DEFECTIVE_BIN_ID; toStatusId = DEFECTIVE_STATUS_ID; }
+                    else if (action === 'trash') { toBinId = TRASH_BIN_ID; toStatusId = TRASH_STATUS_ID; }
+                    else if (action === 'return_to_vendor') { toBinId = RETURN_TO_VENDOR_BIN_ID; toStatusId = RETURN_TO_VENDOR_STATUS_ID; }
+
+                    binTransferRows.push({
+                        itemId: itemId,
+                        itemText: itemData.displayname || itemData.itemid,
+                        description: itemData.description || '',
+                        locationId: locationId,
+                        quantity: quantity,
+                        fromBinId: fromBinId,
+                        toBinId: toBinId,
+                        toStatusId: toStatusId,
+                        action: action
+                    });
+
+                } else if (INVENTORY_FOUND_ACTIONS.indexOf(action) !== -1) {
+                    inventoryFoundRows.push({
+                        itemId: itemId,
+                        itemText: itemData.displayname || itemData.itemid,
+                        description: itemData.description || '',
+                        locationId: locationId,
+                        quantity: quantity,
+                        action: action
+                    });
+                }
+            });
+
+            if (adjustmentRows.length === 0 && binTransferRows.length === 0 && inventoryFoundRows.length === 0) {
+                const errMsg = errors.length > 0 ? 'Errors: ' + errors.join('; ') : 'No valid items to process.';
+                createEntryForm(context, errMsg, 'error');
+                return;
+            }
+
+            let adjustmentTranId = null;
+            let binTransferTranId = null;
+            let inventoryFoundTranId = null;
+            const processedItems = [];
+
+            // -- Process all adjustment rows in ONE Inventory Adjustment record --
+            if (adjustmentRows.length > 0) {
+                try {
+                    const adjResult = createNonSerializedAdjustmentMulti(adjustmentRows, 'Created through Warehouse Assistant Dashboard.');
+                    adjustmentTranId = adjResult.tranId;
+                    log.audit('Non-Serialized Multi Adjustment Created', 'TranID: ' + adjResult.tranId);
+
+                    adjustmentRows.forEach(function(row) {
+                        processedItems.push({
+                            itemText: row.targetDisplayName || row.targetItemName,
+                            description: row.targetDescription || '',
+                            quantity: row.quantity,
+                            action: row.action
+                        });
+                    });
+                } catch (e) {
+                    log.error('Non-Serialized Multi Adjustment Error', e.message + ' | ' + e.stack);
+                    createEntryForm(context, 'Inventory adjustment failed: ' + e.message, 'error');
+                    return;
+                }
+            }
+
+            // -- Process all bin transfer rows in ONE Bin Transfer record --
+            if (binTransferRows.length > 0) {
+                try {
+                    const transferResult = createNonSerializedBinTransferMulti(binTransferRows, 'Via Warehouse Assistant Dashboard');
+                    binTransferTranId = transferResult.tranId;
+                    log.audit('Non-Serialized Multi Bin Transfer Created', 'TranID: ' + transferResult.tranId);
+
+                    binTransferRows.forEach(function(row) {
+                        processedItems.push({
+                            itemText: row.itemText,
+                            description: row.description || '',
+                            quantity: row.quantity,
+                            action: row.action
+                        });
+                    });
+                } catch (e) {
+                    log.error('Non-Serialized Multi Bin Transfer Error', e.message + ' | ' + e.stack);
+                    createEntryForm(context, 'Bin transfer failed: ' + e.message, 'error');
+                    return;
+                }
+            }
+
+            // -- Process all inventory found rows in ONE adjustment --
+            if (inventoryFoundRows.length > 0) {
+                try {
+                    const foundResult = createNonSerializedInventoryFoundMulti(inventoryFoundRows, 'Inventory Found — via Warehouse Assistant Dashboard.');
+                    inventoryFoundTranId = foundResult.tranId;
+                    log.audit('Non-Serialized Multi Inventory Found Created', 'TranID: ' + foundResult.tranId);
+
+                    inventoryFoundRows.forEach(function(row) {
+                        processedItems.push({
+                            itemText: row.itemText,
+                            description: row.description || '',
+                            quantity: row.quantity,
+                            action: row.action
+                        });
+                    });
+                } catch (e) {
+                    log.error('Non-Serialized Multi Inventory Found Error', e.message + ' | ' + e.stack);
+                    createEntryForm(context, 'Inventory found adjustment failed: ' + e.message, 'error');
+                    return;
+                }
+            }
+
+            createNonSerializedMultiSuccessPage(context, adjustmentTranId, binTransferTranId, inventoryFoundTranId, processedItems, errors);
         }
 
         /**
@@ -3253,6 +3881,116 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                         </div>
                         <div class="btn-area" style="flex-direction:column;">
                             <button type="button" class="custom-btn btn-success" style="width:100%;" onclick="printLabels()">Print Labels (${quantity})</button>
+                            <button type="button" class="custom-btn btn-outline" style="width:100%;" onclick="createAnother()">Process More</button>
+                        </div>
+                    </div>
+                </div>
+            `;
+
+            context.response.writePage(form);
+        }
+
+        /**
+         * Success page for multi-row non-serialized processing.
+         * Displays all transaction IDs and a summary table of processed items.
+         */
+        function createNonSerializedMultiSuccessPage(context, adjustmentTranId, binTransferTranId, inventoryFoundTranId, processedItems, errors) {
+            const form = serverWidget.createForm({ title: 'Transactions Created' });
+
+            const suiteletUrl = url.resolveScript({
+                scriptId: runtime.getCurrentScript().id,
+                deploymentId: runtime.getCurrentScript().deploymentId,
+                returnExternalUrl: true
+            });
+
+            // Build label data for printing
+            const printData = processedItems.map(function(item) {
+                return {
+                    itemText: item.itemText || '',
+                    description: item.description || '',
+                    quantity: item.quantity
+                };
+            });
+
+            const recordIdForPrint = adjustmentTranId || binTransferTranId || inventoryFoundTranId || '';
+
+            const styleField = form.addField({ id: 'custpage_styles', type: serverWidget.FieldType.INLINEHTML, label: ' ' });
+            styleField.defaultValue = getStyles() + getSuccessPageScript(suiteletUrl);
+
+            const printDataField = form.addField({ id: 'custpage_print_data', type: serverWidget.FieldType.LONGTEXT, label: 'Print Data' });
+            printDataField.updateDisplayType({ displayType: serverWidget.FieldDisplayType.HIDDEN });
+            printDataField.defaultValue = JSON.stringify(printData);
+
+            const printRecordIdField = form.addField({ id: 'custpage_print_record_id', type: serverWidget.FieldType.TEXT, label: 'Print Record ID' });
+            printRecordIdField.updateDisplayType({ displayType: serverWidget.FieldDisplayType.HIDDEN });
+            printRecordIdField.defaultValue = String(recordIdForPrint);
+
+            // Build transaction info
+            let transactionInfoHtml = '';
+            if (adjustmentTranId) {
+                transactionInfoHtml += '<p style="font-size:16px; margin:8px 0; color:#1e3c72;"><strong>Inventory Adjustment:</strong> ' + escapeXml(String(adjustmentTranId)) + '</p>';
+            }
+            if (binTransferTranId) {
+                transactionInfoHtml += '<p style="font-size:16px; margin:8px 0; color:#1e3c72;"><strong>Bin Transfer:</strong> ' + escapeXml(String(binTransferTranId)) + '</p>';
+            }
+            if (inventoryFoundTranId) {
+                transactionInfoHtml += '<p style="font-size:16px; margin:8px 0; color:#1e3c72;"><strong>Inventory Found:</strong> ' + escapeXml(String(inventoryFoundTranId)) + '</p>';
+            }
+
+            const ACTION_LABELS = {
+                'back_to_stock': 'Back to Stock',
+                'defective': 'Defective',
+                'likenew': 'Change to Like New',
+                'likenew_stock': 'Change to Like New & Back to Stock',
+                'move_refurbishing': 'Move to Refurbishing',
+                'move_testing': 'Move to Testing',
+                'return_to_vendor': 'Return to Vendor',
+                'trash': 'Trash',
+                'inventory_found': 'Inventory Found'
+            };
+
+            let itemRows = '';
+            let totalQty = 0;
+            processedItems.forEach(function(item) {
+                totalQty += item.quantity;
+                itemRows += '<tr>';
+                itemRows += '<td><strong>' + escapeXml(item.itemText) + '</strong></td>';
+                itemRows += '<td>' + item.quantity + '</td>';
+                itemRows += '<td>' + escapeXml(ACTION_LABELS[item.action] || item.action) + '</td>';
+                itemRows += '</tr>';
+            });
+
+            let errorsHtml = '';
+            if (errors && errors.length > 0) {
+                errorsHtml = '<div class="alert alert-warning"><strong>Warnings:</strong> ' + escapeXml(errors.join('; ')) + '</div>';
+            }
+
+            const contentField = form.addField({ id: 'custpage_content', type: serverWidget.FieldType.INLINEHTML, label: ' ' });
+            contentField.defaultValue = `
+                <div class="app-container">
+                    ${errorsHtml}
+                    <div class="main-card">
+                        <div class="form-body">
+                            <div class="success-card">
+                                <div class="success-icon">&#10003;</div>
+                                <h2>Transactions Created!</h2>
+                                ${transactionInfoHtml}
+                                <p style="color:#64748b; margin-top:16px;">${processedItems.length} item${processedItems.length !== 1 ? 's' : ''} processed (${totalQty} total qty)</p>
+
+                                <table class="results-table" style="margin-top:24px; text-align:left;">
+                                    <thead>
+                                        <tr>
+                                            <th>Item</th>
+                                            <th>Qty</th>
+                                            <th>Action</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>${itemRows}</tbody>
+                                </table>
+                            </div>
+                        </div>
+                        <div class="btn-area" style="flex-direction:column;">
+                            <button type="button" class="custom-btn btn-success" style="width:100%;" onclick="printLabels()">Print Labels (${totalQty})</button>
                             <button type="button" class="custom-btn btn-outline" style="width:100%;" onclick="createAnother()">Process More</button>
                         </div>
                     </div>
@@ -3383,6 +4121,11 @@ setTimeout(doPrint, 4000);
 
                     if (action === 'process_nonserialized') {
                         handleProcessNonSerialized(context);
+                        return;
+                    }
+
+                    if (action === 'process_nonserialized_multi') {
+                        handleProcessNonSerializedMulti(context);
                         return;
                     }
 

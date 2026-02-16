@@ -347,37 +347,53 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                 log.error('lookupSerialDetails Phase1 Error', e.message);
             }
 
-            // --- Phase 2: Enrich with bin/status info using inventoryNumberBinOnHand join ---
+            // --- Phase 2: Enrich with bin/status info via inventorybalance search ---
+            // The inventoryNumberBinOnHand join does not expose binnumber or location columns,
+            // so we query the inventorybalance record type instead, which reliably provides
+            // bin, status, and location for serialized inventory.
             if (Object.keys(foundSerials).length > 0) {
                 try {
-                    search.create({
-                        type: 'inventorynumber',
-                        filters: serialFilterExpression,
-                        columns: [
-                            search.createColumn({ name: 'inventorynumber' }),
-                            search.createColumn({ name: 'location', join: 'inventoryNumberBinOnHand' }),
-                            search.createColumn({ name: 'binnumber', join: 'inventoryNumberBinOnHand' }),
-                            search.createColumn({ name: 'quantityonhand', join: 'inventoryNumberBinOnHand' }),
-                            search.createColumn({ name: 'status', join: 'inventoryNumberBinOnHand' })
-                        ]
-                    }).run().each(result => {
-                        const serial = result.getValue('inventorynumber');
-                        const binQty = parseFloat(result.getValue({ name: 'quantityonhand', join: 'inventoryNumberBinOnHand' })) || 0;
-                        const locId = String(result.getValue({ name: 'location', join: 'inventoryNumberBinOnHand' }) || '');
-
-                        // Only enrich if this serial was found in Phase 1 and bin is in location 1 with qty
-                        if (binQty > 0 && locId === SERIAL_LOOKUP_LOCATION_ID && foundSerials[serial]) {
-                            foundSerials[serial].locationId = locId;
-                            foundSerials[serial].locationText = result.getText({ name: 'location', join: 'inventoryNumberBinOnHand' }) || foundSerials[serial].locationText;
-                            foundSerials[serial].binId = result.getValue({ name: 'binnumber', join: 'inventoryNumberBinOnHand' }) || '';
-                            foundSerials[serial].binText = result.getText({ name: 'binnumber', join: 'inventoryNumberBinOnHand' }) || '';
-                            foundSerials[serial].statusId = result.getValue({ name: 'status', join: 'inventoryNumberBinOnHand' }) || '';
-                            foundSerials[serial].statusText = result.getText({ name: 'status', join: 'inventoryNumberBinOnHand' }) || '';
+                    // Build a map from serial internal ID back to serial text
+                    const serialIdToText = {};
+                    const serialIds = [];
+                    Object.keys(foundSerials).forEach(serial => {
+                        const sid = foundSerials[serial].serialId;
+                        if (sid) {
+                            serialIdToText[sid] = serial;
+                            serialIds.push(sid);
                         }
-                        return true;
                     });
+
+                    if (serialIds.length > 0) {
+                        search.create({
+                            type: 'inventorybalance',
+                            filters: [
+                                ['inventorynumber', 'anyof', serialIds],
+                                'AND',
+                                ['location', 'anyof', SERIAL_LOOKUP_LOCATION_ID]
+                            ],
+                            columns: [
+                                search.createColumn({ name: 'inventorynumber' }),
+                                search.createColumn({ name: 'binnumber' }),
+                                search.createColumn({ name: 'status' })
+                            ]
+                        }).run().each(result => {
+                            const serialId = result.getValue('inventorynumber') || '';
+                            const serial = serialIdToText[serialId];
+                            const binVal = result.getValue('binnumber') || '';
+                            const binTxt = result.getText('binnumber') || '';
+
+                            if (serial && foundSerials[serial] && binVal && !foundSerials[serial].binId) {
+                                foundSerials[serial].binId = binVal;
+                                foundSerials[serial].binText = binTxt;
+                                foundSerials[serial].statusId = result.getValue('status') || '';
+                                foundSerials[serial].statusText = result.getText('status') || '';
+                            }
+                            return true;
+                        });
+                    }
                 } catch (e) {
-                    // Bin join not available – Phase 1 data is still usable
+                    // inventorybalance search not available – Phase 1 data is still usable
                     log.debug('lookupSerialDetails Phase2 (bin enrichment) skipped', e.message);
                 }
             }
@@ -1725,6 +1741,16 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
 
         function getStyles() {
             return `
+            <script>
+                (function() {
+                    if (!document.querySelector('meta[name="viewport"]')) {
+                        var m = document.createElement('meta');
+                        m.name = 'viewport';
+                        m.content = 'width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no';
+                        document.head.appendChild(m);
+                    }
+                })();
+            </script>
             <style>
                 #main_form { background-color: #f4f7f9 !important; }
                 .uir-page-title, .uir-page-title-firstline, .uir-page-title-secondline,
@@ -1994,6 +2020,10 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                     color: #475569;
                 }
 
+                .app-container-wide {
+                    max-width: 1100px;
+                }
+
                 .form-section {
                     display: none;
                 }
@@ -2007,6 +2037,361 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                 @keyframes cartFadeIn {
                     from { background-color: #e0f2fe; }
                     to { background-color: transparent; }
+                }
+
+                /* ========= MOBILE RESPONSIVE ========= */
+                @media screen and (max-width: 768px) {
+                    /* Strip NetSuite chrome that eats space */
+                    #main_form {
+                        padding: 0 !important;
+                        margin: 0 !important;
+                    }
+                    body, #div__body, #outerdiv, .uir-record-type {
+                        padding: 0 !important;
+                        margin: 0 !important;
+                    }
+                    .uir-page-title, .uir-page-title-firstline, .uir-page-title-secondline,
+                    .uir-header-buttons, .uir-button-bar,
+                    #tbl_submitter, #submitter_row, .uir_form_tab_bg {
+                        display: none !important;
+                    }
+
+                    /* Container — edge to edge, no wasted margins */
+                    .app-container {
+                        padding: 0 !important;
+                        margin: 0 auto !important;
+                        height: 100vh;
+                        max-width: 100% !important;
+                    }
+
+                    .main-card {
+                        border-radius: 0;
+                        box-shadow: none;
+                        border: none;
+                    }
+
+                    /* Compact header */
+                    .card-header {
+                        padding: 10px 14px;
+                    }
+                    .card-header h1 { font-size: 15px; }
+                    .card-header p { font-size: 11px; margin-top: 2px; }
+
+                    /* Tighter form body */
+                    .form-body {
+                        padding: 10px 8px;
+                    }
+
+                    .input-group { margin-bottom: 10px; }
+
+                    .custom-label {
+                        font-size: 11px;
+                        margin-bottom: 5px;
+                    }
+
+                    /* Smaller inputs */
+                    .input-group input[type="text"],
+                    .input-group select,
+                    .input-group textarea {
+                        padding: 9px 10px !important;
+                        font-size: 14px !important;
+                        border-radius: 8px !important;
+                        border-width: 1px !important;
+                    }
+                    .input-group textarea {
+                        min-height: 100px !important;
+                        line-height: 1.4 !important;
+                    }
+
+                    /* Mode toggle — compact pill buttons */
+                    .mode-toggle {
+                        margin-bottom: 10px;
+                        padding: 3px;
+                        border-radius: 8px;
+                    }
+                    .mode-btn {
+                        padding: 8px 4px;
+                        font-size: 11px;
+                        font-weight: 600;
+                        border-radius: 6px;
+                    }
+
+                    /* Button area — stacked, compact */
+                    .btn-area {
+                        padding: 8px;
+                        gap: 6px;
+                        flex-direction: column;
+                    }
+                    .custom-btn {
+                        padding: 10px 14px;
+                        font-size: 13px;
+                        border-radius: 8px;
+                        width: 100%;
+                        text-align: center;
+                    }
+
+                    /* ---- Results table → card layout on mobile ---- */
+                    .results-table,
+                    .results-table thead,
+                    .results-table tbody,
+                    .results-table tr,
+                    .results-table th,
+                    .results-table td {
+                        display: block !important;
+                        width: 100% !important;
+                        white-space: normal !important;
+                    }
+                    .results-table thead {
+                        display: none !important;
+                    }
+                    .results-table tr {
+                        background: #f8fafc;
+                        border: 1px solid #e2e8f0;
+                        border-radius: 8px;
+                        padding: 10px;
+                        margin-bottom: 8px;
+                    }
+                    .results-table td {
+                        padding: 3px 0 !important;
+                        border-bottom: none !important;
+                        font-size: 13px !important;
+                        text-align: left !important;
+                        position: relative;
+                    }
+                    /* Show column names as inline labels via data-label */
+                    .results-table td[data-label]::before {
+                        content: attr(data-label) ": ";
+                        font-weight: 700;
+                        font-size: 10px;
+                        text-transform: uppercase;
+                        color: #64748b;
+                        letter-spacing: 0.3px;
+                        display: block;
+                        margin-bottom: 2px;
+                    }
+                    .results-table td:last-child {
+                        padding-top: 6px !important;
+                    }
+                    .results-table tr:hover td { background: transparent !important; }
+
+                    .results-table input[type="text"],
+                    .results-table input[type="number"] {
+                        font-size: 14px !important;
+                        padding: 8px 10px !important;
+                        border-radius: 6px !important;
+                        width: 100% !important;
+                        box-sizing: border-box !important;
+                    }
+                    .results-table select,
+                    .results-table .action-select {
+                        font-size: 14px !important;
+                        padding: 8px 10px !important;
+                        min-width: unset !important;
+                        width: 100% !important;
+                        border-radius: 6px !important;
+                        box-sizing: border-box !important;
+                    }
+
+                    /* Action selects (standalone) */
+                    .action-select {
+                        min-width: unset;
+                        width: 100%;
+                        font-size: 14px;
+                        padding: 8px 10px;
+                        border-radius: 6px;
+                    }
+
+                    /* Alerts — compact */
+                    .alert {
+                        padding: 8px 10px;
+                        font-size: 12px;
+                        margin-bottom: 8px;
+                        border-radius: 8px;
+                    }
+
+                    /* Bulk action bar — fully stacked */
+                    .bulk-action-bar {
+                        flex-direction: column !important;
+                        flex-wrap: nowrap !important;
+                        align-items: stretch !important;
+                        gap: 8px !important;
+                        padding: 10px !important;
+                        border-radius: 8px;
+                        margin-bottom: 10px;
+                    }
+                    .bulk-action-bar label {
+                        font-size: 11px;
+                    }
+                    .bulk-action-bar select {
+                        width: 100% !important;
+                        font-size: 14px !important;
+                        flex: unset !important;
+                    }
+                    .bulk-action-bar input[type="text"] {
+                        width: 100% !important;
+                        flex: unset !important;
+                        font-size: 14px !important;
+                        padding: 8px 10px !important;
+                        box-sizing: border-box !important;
+                    }
+                    /* The "With Action: N / Submit / Back" row — wrap & full-width buttons */
+                    .bulk-action-bar > div {
+                        display: flex !important;
+                        flex-wrap: wrap !important;
+                        gap: 6px !important;
+                        width: 100% !important;
+                    }
+                    .bulk-action-bar > div span {
+                        font-size: 12px !important;
+                    }
+                    .bulk-action-bar > div .custom-btn {
+                        flex: 1 !important;
+                        min-width: 0 !important;
+                        padding: 10px 12px !important;
+                        font-size: 13px !important;
+                    }
+
+                    /* Success page — compact */
+                    .success-icon { font-size: 32px; margin-bottom: 6px; }
+                    .success-card { padding: 8px 0 0; }
+                    .success-card h2 { font-size: 16px; margin-bottom: 4px; }
+                    .success-card p { font-size: 12px !important; margin-bottom: 12px; }
+                    /* Override inline font-size on transaction info paragraphs */
+                    .success-card p[style] { font-size: 13px !important; }
+
+                    .label-group {
+                        padding: 10px;
+                        margin: 6px 0;
+                        border-radius: 8px;
+                    }
+                    .label-group h3 { font-size: 13px; margin-bottom: 6px; }
+                    .label-group p { font-size: 12px !important; }
+
+                    .serial-list {
+                        grid-template-columns: repeat(auto-fill, minmax(90px, 1fr));
+                        gap: 4px;
+                        margin: 8px 0;
+                    }
+                    .serial-list li {
+                        font-size: 10px;
+                        padding: 5px 6px;
+                        border-radius: 6px;
+                        word-break: break-all;
+                    }
+
+                    /* Badges */
+                    .badge-count {
+                        padding: 2px 7px;
+                        font-size: 10px;
+                        margin-left: 5px;
+                    }
+                    .badge {
+                        padding: 2px 6px;
+                        font-size: 10px;
+                    }
+
+                    /* Inventory Found modal — full-width on mobile */
+                    #inventoryFoundModal > div {
+                        padding: 14px !important;
+                        width: 96% !important;
+                        max-width: 96% !important;
+                        border-radius: 10px !important;
+                    }
+                    #inventoryFoundModal h2 { font-size: 15px !important; }
+                    #inventoryFoundModal p { font-size: 12px !important; }
+                    #inventoryFoundModal label { font-size: 12px !important; }
+                    #inventoryFoundModal input,
+                    #inventoryFoundModal textarea {
+                        font-size: 14px !important;
+                        padding: 8px 10px !important;
+                    }
+                    /* Stack modal buttons vertically */
+                    #inventoryFoundModal > div > div:last-child {
+                        flex-direction: column !important;
+                        gap: 6px !important;
+                    }
+                    #inventoryFoundModal > div > div:last-child .custom-btn {
+                        width: 100% !important;
+                        text-align: center !important;
+                    }
+
+                    /* Bin putaway destination bin input */
+                    #bp_to_bin {
+                        padding: 9px 10px !important;
+                        font-size: 14px !important;
+                        border-radius: 8px !important;
+                    }
+
+                    /* New serial / new item inline inputs on results page */
+                    .new-serial-input, .new-item-input {
+                        font-size: 14px !important;
+                        padding: 8px 10px !important;
+                        min-width: unset !important;
+                        width: 100% !important;
+                        box-sizing: border-box !important;
+                    }
+
+                    /* Non-serialized grid — card layout */
+                    #ns-grid-table tr,
+                    #bp-ns-grid-table tr {
+                        position: relative;
+                    }
+                    /* Remove button — position top-right on card */
+                    #ns-grid-table td:last-child,
+                    #bp-ns-grid-table td:last-child {
+                        position: absolute;
+                        top: 6px;
+                        right: 6px;
+                        width: auto !important;
+                        padding: 0 !important;
+                    }
+                    #ns-grid-table td:last-child button,
+                    #bp-ns-grid-table td:last-child button {
+                        font-size: 16px !important;
+                        padding: 2px 6px !important;
+                    }
+
+                    /* Non-serialized header row flex layout */
+                    .form-section > div[style*="display:flex"] {
+                        flex-wrap: wrap;
+                        gap: 6px;
+                    }
+                }
+
+                /* ========= EXTRA-SMALL SCREENS (phones) ========= */
+                @media screen and (max-width: 400px) {
+                    .card-header {
+                        padding: 8px 10px;
+                    }
+                    .card-header h1 { font-size: 14px; }
+                    .card-header p { display: none; }
+
+                    .form-body {
+                        padding: 8px 6px;
+                    }
+
+                    .mode-btn {
+                        padding: 7px 2px;
+                        font-size: 10px;
+                    }
+
+                    .btn-area {
+                        padding: 6px;
+                    }
+
+                    .custom-btn {
+                        padding: 9px 10px;
+                        font-size: 12px;
+                    }
+
+                    .results-table tr {
+                        padding: 8px;
+                        margin-bottom: 6px;
+                    }
+
+                    .serial-list {
+                        grid-template-columns: repeat(auto-fill, minmax(75px, 1fr));
+                    }
                 }
             </style>
             `;
@@ -2047,10 +2432,10 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                         nsGridRowId++;
                         var tr = document.createElement('tr');
                         tr.setAttribute('data-row-id', nsGridRowId);
-                        tr.innerHTML = '<td><input type="text" class="ns-grid-input ns-item-input" data-row="' + nsGridRowId + '" placeholder="Enter SKU" style="width:100%; padding:8px 10px; border:1px solid #e2e8f0; border-radius:6px; font-size:13px;"></td>'
-                            + '<td><select class="action-select ns-bin-input" data-row="' + nsGridRowId + '" style="min-width:120px;">' + nsBinOptions + '</select></td>'
-                            + '<td><input type="number" class="ns-grid-input ns-qty-input" data-row="' + nsGridRowId + '" placeholder="Qty" min="1" style="width:80px; padding:8px 10px; border:1px solid #e2e8f0; border-radius:6px; font-size:13px;"></td>'
-                            + '<td><select class="action-select ns-action-input" data-row="' + nsGridRowId + '" style="min-width:180px;">' + nsActionOptions + '</select></td>'
+                        tr.innerHTML = '<td data-label="SKU"><input type="text" class="ns-grid-input ns-item-input" data-row="' + nsGridRowId + '" placeholder="Enter SKU" style="width:100%; padding:8px 10px; border:1px solid #e2e8f0; border-radius:6px; font-size:13px; box-sizing:border-box;"></td>'
+                            + '<td data-label="From Bin"><select class="action-select ns-bin-input" data-row="' + nsGridRowId + '" style="min-width:120px;">' + nsBinOptions + '</select></td>'
+                            + '<td data-label="Qty"><input type="number" class="ns-grid-input ns-qty-input" data-row="' + nsGridRowId + '" placeholder="Qty" min="1" style="width:80px; padding:8px 10px; border:1px solid #e2e8f0; border-radius:6px; font-size:13px;"></td>'
+                            + '<td data-label="Action"><select class="action-select ns-action-input" data-row="' + nsGridRowId + '" style="min-width:180px;">' + nsActionOptions + '</select></td>'
                             + '<td><button type="button" onclick="removeNsGridRow(' + nsGridRowId + ')" '
                             + 'style="background:none; border:none; color:#ef4444; cursor:pointer; font-size:18px; padding:4px 8px;" '
                             + 'title="Remove">&times;</button></td>';
@@ -2168,27 +2553,39 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                         currentMode = mode;
                         var serialSection = document.getElementById('serialized-section');
                         var nonSerialSection = document.getElementById('non-serialized-section');
+                        var binputawaySection = document.getElementById('binputaway-section');
                         var serialBtn = document.getElementById('mode-serialized');
                         var nonSerialBtn = document.getElementById('mode-nonserialized');
+                        var binputawayBtn = document.getElementById('mode-binputaway');
                         var serialBtnArea = document.getElementById('serialized-btn-area');
                         var nonSerialBtnArea = document.getElementById('nonserialized-btn-area');
+                        var binputawayBtnArea = document.getElementById('binputaway-btn-area');
+
+                        // Hide all sections
+                        serialSection.classList.remove('active');
+                        nonSerialSection.classList.remove('active');
+                        binputawaySection.classList.remove('active');
+                        serialBtn.classList.remove('active');
+                        nonSerialBtn.classList.remove('active');
+                        binputawayBtn.classList.remove('active');
+                        if (serialBtnArea) serialBtnArea.style.display = 'none';
+                        if (nonSerialBtnArea) nonSerialBtnArea.style.display = 'none';
+                        if (binputawayBtnArea) binputawayBtnArea.style.display = 'none';
 
                         if (mode === 'serialized') {
                             serialSection.classList.add('active');
-                            nonSerialSection.classList.remove('active');
                             serialBtn.classList.add('active');
-                            nonSerialBtn.classList.remove('active');
                             if (serialBtnArea) serialBtnArea.style.display = 'flex';
-                            if (nonSerialBtnArea) nonSerialBtnArea.style.display = 'none';
                             var field = document.getElementById('custpage_serial_numbers');
                             if (field) field.focus();
-                        } else {
-                            serialSection.classList.remove('active');
+                        } else if (mode === 'nonserialized') {
                             nonSerialSection.classList.add('active');
-                            serialBtn.classList.remove('active');
                             nonSerialBtn.classList.add('active');
-                            if (serialBtnArea) serialBtnArea.style.display = 'none';
                             if (nonSerialBtnArea) nonSerialBtnArea.style.display = 'flex';
+                        } else if (mode === 'binputaway') {
+                            binputawaySection.classList.add('active');
+                            binputawayBtn.classList.add('active');
+                            if (binputawayBtnArea) binputawayBtnArea.style.display = 'flex';
                         }
                     }
 
@@ -2302,13 +2699,176 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                         form.submit();
                     }
 
+                    // ---- Bin Putaway functions ----
+                    var bpCurrentMode = 'serialized';
+                    var bpNsGridRowId = 0;
+
+                    function switchBpMode(mode) {
+                        bpCurrentMode = mode;
+                        var serSection = document.getElementById('bp-serialized-section');
+                        var nsSection = document.getElementById('bp-nonserialized-section');
+                        var serBtn = document.getElementById('bp-mode-serialized');
+                        var nsBtn = document.getElementById('bp-mode-nonserialized');
+
+                        serSection.classList.remove('active');
+                        nsSection.classList.remove('active');
+                        serBtn.classList.remove('active');
+                        nsBtn.classList.remove('active');
+
+                        if (mode === 'serialized') {
+                            serSection.classList.add('active');
+                            serBtn.classList.add('active');
+                            var f = document.getElementById('custpage_bp_serials');
+                            if (f) f.focus();
+                        } else {
+                            nsSection.classList.add('active');
+                            nsBtn.classList.add('active');
+                        }
+                    }
+
+                    function updateBpCount() {
+                        var field = document.getElementById('custpage_bp_serials');
+                        var display = document.getElementById('bp_serial_count');
+                        if (!field || !display) return;
+                        var lines = field.value.split(/[\\r\\n]+/).filter(function(s) { return s.trim() !== ''; });
+                        display.textContent = lines.length;
+                    }
+
+                    function addBpNsGridRow() {
+                        var tbody = document.getElementById('bp-ns-grid-body');
+                        if (!tbody) return;
+                        bpNsGridRowId++;
+                        var tr = document.createElement('tr');
+                        tr.setAttribute('data-row-id', bpNsGridRowId);
+                        tr.innerHTML = '<td data-label="SKU"><input type="text" class="bp-ns-item-input" data-row="' + bpNsGridRowId + '" placeholder="Enter SKU" style="width:100%; padding:8px 10px; border:1px solid #e2e8f0; border-radius:6px; font-size:13px; box-sizing:border-box;"></td>'
+                            + '<td data-label="From Bin"><input type="text" class="bp-ns-frombin-input" data-row="' + bpNsGridRowId + '" list="bp-bin-datalist" autocomplete="off" placeholder="From Bin" style="min-width:120px; padding:8px 10px; border:1px solid #e2e8f0; border-radius:6px; font-size:13px; box-sizing:border-box;"></td>'
+                            + '<td data-label="To Bin"><input type="text" class="bp-ns-tobin-input" data-row="' + bpNsGridRowId + '" list="bp-bin-datalist" autocomplete="off" placeholder="To Bin" style="min-width:120px; padding:8px 10px; border:1px solid #e2e8f0; border-radius:6px; font-size:13px; box-sizing:border-box;"></td>'
+                            + '<td data-label="Qty"><input type="number" class="bp-ns-qty-input" data-row="' + bpNsGridRowId + '" placeholder="Qty" min="1" style="width:80px; padding:8px 10px; border:1px solid #e2e8f0; border-radius:6px; font-size:13px;"></td>'
+                            + '<td><button type="button" onclick="removeBpNsGridRow(' + bpNsGridRowId + ')" '
+                            + 'style="background:none; border:none; color:#ef4444; cursor:pointer; font-size:18px; padding:4px 8px;" '
+                            + 'title="Remove">&times;</button></td>';
+                        tbody.appendChild(tr);
+                        updateBpNsRowCount();
+                        var newInput = tr.querySelector('.bp-ns-item-input');
+                        if (newInput) newInput.focus();
+                    }
+
+                    function removeBpNsGridRow(rowId) {
+                        var row = document.querySelector('#bp-ns-grid-body tr[data-row-id="' + rowId + '"]');
+                        if (row) row.remove();
+                        updateBpNsRowCount();
+                        var tbody = document.getElementById('bp-ns-grid-body');
+                        if (tbody && tbody.children.length === 0) addBpNsGridRow();
+                    }
+
+                    function updateBpNsRowCount() {
+                        var tbody = document.getElementById('bp-ns-grid-body');
+                        var countEl = document.getElementById('bp_ns_row_count');
+                        if (tbody && countEl) countEl.textContent = tbody.children.length;
+                    }
+
+                    function clearBpNsGrid() {
+                        var tbody = document.getElementById('bp-ns-grid-body');
+                        if (tbody) tbody.innerHTML = '';
+                        bpNsGridRowId = 0;
+                        addBpNsGridRow();
+                    }
+
+                    function submitBinPutaway() {
+                        if (bpCurrentMode === 'serialized') {
+                            // Serialized bin putaway
+                            var toBinSelect = document.getElementById('bp_to_bin');
+                            var toBinValue = toBinSelect ? toBinSelect.value : '';
+                            if (!toBinValue) { alert('Please select a destination bin.'); return; }
+
+                            var serialField = document.getElementById('custpage_bp_serials');
+                            if (!serialField || !serialField.value.trim()) { alert('Scan or enter at least one serial number.'); return; }
+
+                            window.onbeforeunload = null;
+                            var form = document.forms[0];
+
+                            var bpToBinHidden = document.getElementById('custpage_bp_to_bin');
+                            if (bpToBinHidden) bpToBinHidden.value = toBinValue;
+
+                            var bpModeHidden = document.getElementById('custpage_bp_mode');
+                            if (bpModeHidden) bpModeHidden.value = 'serialized';
+
+                            var actionInput = document.createElement('input');
+                            actionInput.type = 'hidden';
+                            actionInput.name = 'custpage_action';
+                            actionInput.value = 'process_bin_putaway';
+                            form.appendChild(actionInput);
+                            form.submit();
+                        } else {
+                            // Non-serialized bin putaway
+                            var rows = document.querySelectorAll('#bp-ns-grid-body tr');
+                            var gridData = [];
+                            var hasError = false;
+
+                            for (var i = 0; i < rows.length; i++) {
+                                var row = rows[i];
+                                var itemInput = row.querySelector('.bp-ns-item-input');
+                                var fromBinInput = row.querySelector('.bp-ns-frombin-input');
+                                var toBinInput = row.querySelector('.bp-ns-tobin-input');
+                                var qtyInput = row.querySelector('.bp-ns-qty-input');
+
+                                var itemName = itemInput ? itemInput.value.trim() : '';
+                                var fromBin = fromBinInput ? fromBinInput.value.trim() : '';
+                                var toBin = toBinInput ? toBinInput.value.trim() : '';
+                                var qty = qtyInput ? parseInt(qtyInput.value) || 0 : 0;
+
+                                if (!itemName && !fromBin && !toBin && qty === 0) continue;
+
+                                if (!itemName) { if (itemInput) itemInput.style.border = '2px solid #ef4444'; hasError = true; }
+                                else { if (itemInput) itemInput.style.border = '1px solid #e2e8f0'; }
+                                if (!fromBin) { if (fromBinInput) fromBinInput.style.border = '2px solid #ef4444'; hasError = true; }
+                                else { if (fromBinInput) fromBinInput.style.border = '1px solid #e2e8f0'; }
+                                if (!toBin) { if (toBinInput) toBinInput.style.border = '2px solid #ef4444'; hasError = true; }
+                                else { if (toBinInput) toBinInput.style.border = '1px solid #e2e8f0'; }
+                                if (qty <= 0) { if (qtyInput) qtyInput.style.border = '2px solid #ef4444'; hasError = true; }
+                                else { if (qtyInput) qtyInput.style.border = '1px solid #e2e8f0'; }
+
+                                gridData.push({ itemName: itemName, fromBinNumber: fromBin, toBinNumber: toBin, quantity: qty });
+                            }
+
+                            if (gridData.length === 0) { alert('Please fill in at least one row.'); return; }
+                            if (hasError) { alert('Please fill in all fields for each row (highlighted in red).'); return; }
+
+                            window.onbeforeunload = null;
+                            var form = document.forms[0];
+
+                            var cartField = document.getElementById('custpage_bp_cart_json');
+                            if (cartField) cartField.value = JSON.stringify(gridData);
+
+                            var bpModeHidden = document.getElementById('custpage_bp_mode');
+                            if (bpModeHidden) bpModeHidden.value = 'nonserialized';
+
+                            var actionInput = document.createElement('input');
+                            actionInput.type = 'hidden';
+                            actionInput.name = 'custpage_action';
+                            actionInput.value = 'process_bin_putaway';
+                            form.appendChild(actionInput);
+                            form.submit();
+                        }
+                    }
+
                     function clearForm() {
                         if (currentMode === 'serialized') {
                             var field = document.getElementById('custpage_serial_numbers');
                             if (field) field.value = '';
                             updateCount();
-                        } else {
+                        } else if (currentMode === 'nonserialized') {
                             clearNsGrid();
+                        } else if (currentMode === 'binputaway') {
+                            if (bpCurrentMode === 'serialized') {
+                                var bpField = document.getElementById('custpage_bp_serials');
+                                if (bpField) bpField.value = '';
+                                updateBpCount();
+                                var toBinSelect = document.getElementById('bp_to_bin');
+                                if (toBinSelect) toBinSelect.selectedIndex = 0;
+                            } else {
+                                clearBpNsGrid();
+                            }
                         }
                     }
 
@@ -2527,14 +3087,16 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
         // PAGE BUILDERS
         // ====================================================================
 
-        function createEntryForm(context, message, messageType) {
+        function createEntryForm(context, message, messageType, prefill) {
             const form = serverWidget.createForm({ title: 'Warehouse Assistant Dashboard' });
 
             // Pre-load bins for the non-serialized grid dropdowns
             const binList = getBinsForLocation('1');
             let nsBinOptionsHtml = '<option value="">-- Select Bin --</option>';
+            let bpBinDatalistHtml = '';
             binList.forEach(function(b) {
                 nsBinOptionsHtml += '<option value="' + escapeXml(b.name) + '">' + escapeXml(b.name) + '</option>';
+                bpBinDatalistHtml += '<option value="' + escapeXml(b.name) + '">';
             });
 
             const styleField = form.addField({ id: 'custpage_styles', type: serverWidget.FieldType.INLINEHTML, label: ' ' });
@@ -2559,6 +3121,7 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                             <div class="mode-toggle">
                                 <button type="button" id="mode-serialized" class="mode-btn active" onclick="switchMode('serialized')">Serialized Items</button>
                                 <button type="button" id="mode-nonserialized" class="mode-btn" onclick="switchMode('nonserialized')">Non-Serialized Items</button>
+                                <button type="button" id="mode-binputaway" class="mode-btn" onclick="switchMode('binputaway')">Bin Putaway</button>
                             </div>
 
                             <!-- Serialized Items Section -->
@@ -2581,7 +3144,7 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                                 <table class="results-table" id="ns-grid-table">
                                     <thead>
                                         <tr>
-                                            <th>Part Number / SKU</th>
+                                            <th style="width:35%;">Part Number / SKU</th>
                                             <th>From Bin</th>
                                             <th>Qty</th>
                                             <th>Action</th>
@@ -2590,6 +3153,50 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                                     </thead>
                                     <tbody id="ns-grid-body"></tbody>
                                 </table>
+                            </div>
+
+                            <!-- Bin Putaway Section -->
+                            <div id="binputaway-section" class="form-section">
+                                <div class="mode-toggle" style="margin-bottom:20px;">
+                                    <button type="button" id="bp-mode-serialized" class="mode-btn active" onclick="switchBpMode('serialized')">Serialized</button>
+                                    <button type="button" id="bp-mode-nonserialized" class="mode-btn" onclick="switchBpMode('nonserialized')">Non-Serialized</button>
+                                </div>
+
+                                <!-- Bin Putaway - Serialized Sub-section -->
+                                <datalist id="bp-bin-datalist">${bpBinDatalistHtml}</datalist>
+                                <div id="bp-serialized-section" class="form-section active">
+                                    <div class="input-group">
+                                        <label class="custom-label">Destination Bin</label>
+                                        <input type="text" id="bp_to_bin" list="bp-bin-datalist" autocomplete="off" placeholder="Type or select a bin" style="width:100%; padding:14px 16px; border:2px solid #e2e8f0; border-radius:12px; font-size:14px; background:#f8fafc; box-sizing:border-box;">
+                                    </div>
+                                    <div class="input-group">
+                                        <label class="custom-label">Serial Numbers <span class="badge-count"><span id="bp_serial_count">0</span> scanned</span></label>
+                                        <div id="bp-serial-field-wrap"></div>
+                                    </div>
+                                </div>
+
+                                <!-- Bin Putaway - Non-Serialized Sub-section -->
+                                <div id="bp-nonserialized-section" class="form-section">
+                                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+                                        <label class="custom-label" style="margin-bottom:0;">
+                                            Items to Put Away
+                                            <span class="badge-count"><span id="bp_ns_row_count">1</span> rows</span>
+                                        </label>
+                                        <button type="button" class="custom-btn btn-outline" style="padding:6px 14px; font-size:12px; margin:0;" onclick="addBpNsGridRow()">+ Add Row</button>
+                                    </div>
+                                    <table class="results-table" id="bp-ns-grid-table">
+                                        <thead>
+                                            <tr>
+                                                <th>Part Number / SKU</th>
+                                                <th>From Bin</th>
+                                                <th>To Bin</th>
+                                                <th>Qty</th>
+                                                <th style="width:40px;"></th>
+                                            </tr>
+                                        </thead>
+                                        <tbody id="bp-ns-grid-body"></tbody>
+                                    </table>
+                                </div>
                             </div>
                         </div>
                         <!-- Buttons pinned outside scrollable area -->
@@ -2602,6 +3209,10 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                             <button type="button" class="custom-btn btn-success" onclick="submitNonSerializedMulti()">Submit</button>
                             <button type="button" class="custom-btn btn-outline" onclick="clearForm()">Clear</button>
                             <button type="button" class="custom-btn btn-outline" style="padding:6px 14px; font-size:12px;" onclick="showInventoryFoundModal()">Inventory Found</button>
+                        </div>
+                        <div id="binputaway-btn-area" class="btn-area" style="display:none;">
+                            <button type="button" class="custom-btn btn-success" onclick="submitBinPutaway()">Put Away</button>
+                            <button type="button" class="custom-btn btn-outline" onclick="clearForm()">Clear</button>
                         </div>
                     </div>
                 </div>
@@ -2669,6 +3280,37 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
             nsCartDataField.updateDisplayType({ displayType: serverWidget.FieldDisplayType.HIDDEN });
             nsCartDataField.defaultValue = '';
 
+            // Bin Putaway fields
+            const bpSerialsField = form.addField({ id: 'custpage_bp_serials', type: serverWidget.FieldType.TEXTAREA, label: 'BP Serials' });
+            bpSerialsField.updateDisplaySize({ height: 10, width: 60 });
+            if (prefill && prefill.bpSerials) bpSerialsField.defaultValue = prefill.bpSerials;
+
+            const bpToBinField = form.addField({ id: 'custpage_bp_to_bin', type: serverWidget.FieldType.TEXT, label: 'BP To Bin' });
+            bpToBinField.updateDisplayType({ displayType: serverWidget.FieldDisplayType.HIDDEN });
+            bpToBinField.defaultValue = (prefill && prefill.bpToBin) || '';
+
+            const bpCartDataField = form.addField({ id: 'custpage_bp_cart_json', type: serverWidget.FieldType.LONGTEXT, label: 'BP Cart Data' });
+            bpCartDataField.updateDisplayType({ displayType: serverWidget.FieldDisplayType.HIDDEN });
+            bpCartDataField.defaultValue = '';
+
+            const bpModeField = form.addField({ id: 'custpage_bp_mode', type: serverWidget.FieldType.TEXT, label: 'BP Mode' });
+            bpModeField.updateDisplayType({ displayType: serverWidget.FieldDisplayType.HIDDEN });
+            bpModeField.defaultValue = '';
+
+            // Build prefill script to restore state on error
+            let prefillScript = '';
+            if (prefill && prefill.mode === 'binputaway') {
+                const escapedToBin = (prefill.bpToBin || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+                prefillScript = `
+                    // Auto-switch to Bin Putaway tab and restore state
+                    switchMode('binputaway');
+                    ${prefill.bpMode === 'nonserialized' ? "switchBpMode('nonserialized');" : ''}
+                    var bpToBinInput = document.getElementById('bp_to_bin');
+                    if (bpToBinInput) bpToBinInput.value = '${escapedToBin}';
+                    updateBpCount();
+                `;
+            }
+
             const containerEnd = form.addField({ id: 'custpage_container_end', type: serverWidget.FieldType.INLINEHTML, label: ' ' });
             containerEnd.defaultValue = `</div>
             <script>
@@ -2678,10 +3320,27 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                     var serialLabel = document.getElementById('custpage_serial_numbers_fs_lbl_uir_label');
                     if (serialWrap && serialLabel) serialWrap.appendChild(serialLabel.parentNode);
 
+                    // Move bin putaway serials field to its wrapper
+                    var bpSerialWrap = document.getElementById('bp-serial-field-wrap');
+                    var bpSerialLabel = document.getElementById('custpage_bp_serials_fs_lbl_uir_label');
+                    if (bpSerialWrap && bpSerialLabel) bpSerialWrap.appendChild(bpSerialLabel.parentNode);
+
                     updateCount();
 
                     // Initialize the non-serialized grid with one empty row
                     addNsGridRow();
+
+                    // Initialize the bin putaway non-serialized grid with one empty row
+                    addBpNsGridRow();
+
+                    // Bind bp serial count
+                    var bpField = document.getElementById('custpage_bp_serials');
+                    if (bpField) {
+                        bpField.addEventListener('input', updateBpCount);
+                        bpField.addEventListener('paste', function() { setTimeout(updateBpCount, 50); });
+                    }
+
+                    ${prefillScript}
                 });
             </script>`;
 
@@ -2703,11 +3362,11 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
             let rows = '';
             serialData.valid.forEach((s, idx) => {
                 rows += `<tr>
-                    <td style="font-family: 'SF Mono', Monaco, monospace; font-size: 14px;">${escapeXml(s.serialNumber)}</td>
-                    <td><strong>${escapeXml(s.itemText)}</strong></td>
-                    <td>${escapeXml(s.binText) || '<span style="color:#94a3b8;">N/A</span>'}</td>
-                    <td>${escapeXml(s.locationText) || '<span style="color:#94a3b8;">N/A</span>'}</td>
-                    <td>
+                    <td data-label="Serial" style="font-family: 'SF Mono', Monaco, monospace; font-size: 14px;">${escapeXml(s.serialNumber)}</td>
+                    <td data-label="Item"><strong>${escapeXml(s.itemText)}</strong></td>
+                    <td data-label="Bin">${escapeXml(s.binText) || '<span style="color:#94a3b8;">N/A</span>'}</td>
+                    <td data-label="Location">${escapeXml(s.locationText) || '<span style="color:#94a3b8;">N/A</span>'}</td>
+                    <td data-label="Action">
                         <select class="action-select" data-index="${idx}" onchange="handleActionChange(this)">
                             <option value="">-- No Action --</option>
                             <option value="back_to_stock">Back to Stock</option>
@@ -2747,7 +3406,7 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
 
             const contentField = form.addField({ id: 'custpage_content', type: serverWidget.FieldType.INLINEHTML, label: ' ' });
             contentField.defaultValue = `
-                <div class="app-container" style="max-width:1100px;">
+                <div class="app-container app-container-wide">
                     ${msgHtml}
                     ${invalidHtml}
                     <div class="main-card">
@@ -2875,7 +3534,8 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                     'part_number_change': 'Part Number Change',
                     'part_number_change_stock': 'Part Number Change & Back to Stock',
                     'trash': 'Trash',
-                    'inventory_found': 'Inventory Found'
+                    'inventory_found': 'Inventory Found',
+                    'bin_putaway': 'Bin Putaway'
                 }[group.action] || group.action;
 
                 groupsHtml += `
@@ -3858,7 +4518,8 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                 'move_testing': 'Move to Testing',
                 'return_to_vendor': 'Return to Vendor',
                 'trash': 'Trash',
-                'inventory_found': 'Inventory Found'
+                'inventory_found': 'Inventory Found',
+                'bin_putaway': 'Bin Putaway'
             }[action] || action;
 
             const contentField = form.addField({ id: 'custpage_content', type: serverWidget.FieldType.INLINEHTML, label: ' ' });
@@ -3946,7 +4607,8 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                 'move_testing': 'Move to Testing',
                 'return_to_vendor': 'Return to Vendor',
                 'trash': 'Trash',
-                'inventory_found': 'Inventory Found'
+                'inventory_found': 'Inventory Found',
+                'bin_putaway': 'Bin Putaway'
             };
 
             let itemRows = '';
@@ -3954,9 +4616,9 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
             processedItems.forEach(function(item) {
                 totalQty += item.quantity;
                 itemRows += '<tr>';
-                itemRows += '<td><strong>' + escapeXml(item.itemText) + '</strong></td>';
-                itemRows += '<td>' + item.quantity + '</td>';
-                itemRows += '<td>' + escapeXml(ACTION_LABELS[item.action] || item.action) + '</td>';
+                itemRows += '<td data-label="Item"><strong>' + escapeXml(item.itemText) + '</strong></td>';
+                itemRows += '<td data-label="Qty">' + item.quantity + '</td>';
+                itemRows += '<td data-label="Action">' + escapeXml(ACTION_LABELS[item.action] || item.action) + '</td>';
                 itemRows += '</tr>';
             });
 
@@ -3998,6 +4660,467 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
             `;
 
             context.response.writePage(form);
+        }
+
+        // ====================================================================
+        // BIN PUTAWAY HANDLER
+        // ====================================================================
+
+        /**
+         * Handle Bin Putaway submissions (both serialized and non-serialized).
+         * All items are transferred to the user-selected bin with status = 1 (Good).
+         */
+        function handleProcessBinPutaway(context) {
+            const bpMode = (context.request.parameters.custpage_bp_mode || '').trim();
+
+            if (bpMode === 'serialized') {
+                // --- Serialized Bin Putaway ---
+                const serialInput = context.request.parameters.custpage_bp_serials || '';
+                const toBinNumber = (context.request.parameters.custpage_bp_to_bin || '').trim();
+
+                // Build prefill object so the form restores state on error
+                const bpPrefill = {
+                    mode: 'binputaway',
+                    bpMode: 'serialized',
+                    bpSerials: serialInput,
+                    bpToBin: toBinNumber
+                };
+
+                const serialTexts = cleanSerialInput(serialInput);
+                if (serialTexts.length === 0) {
+                    createEntryForm(context, 'Enter or scan at least one serial number.', 'warning', bpPrefill);
+                    return;
+                }
+                if (!toBinNumber) {
+                    createEntryForm(context, 'Please select a destination bin.', 'warning', bpPrefill);
+                    return;
+                }
+
+                // Look up destination bin
+                const locationId = '1';
+                const toBin = findBinByNumber(toBinNumber, locationId);
+                if (!toBin) {
+                    createEntryForm(context, 'Destination bin not found: ' + toBinNumber, 'error', bpPrefill);
+                    return;
+                }
+
+                // Look up serial details
+                const serialData = lookupSerialDetails(serialTexts);
+
+                // --- Block if any serials were not found / invalid ---
+                if (serialData.invalid.length > 0) {
+                    createEntryForm(context,
+                        'The following serial numbers were not found in stock. '
+                        + 'Please remove them and resubmit: '
+                        + serialData.invalid.join(', '),
+                        'error', bpPrefill);
+                    return;
+                }
+
+                if (serialData.valid.length === 0) {
+                    createEntryForm(context, 'No serial numbers to process.', 'warning', bpPrefill);
+                    return;
+                }
+
+                // --- Silently skip serials already in the destination bin ---
+                const skippedSameBin = [];
+                const readySerials = [];
+
+                serialData.valid.forEach(function(serial) {
+                    if (String(serial.binId) === String(toBin.id)) {
+                        skippedSameBin.push(serial.serialNumber);
+                    } else {
+                        readySerials.push(serial);
+                    }
+                });
+
+                if (skippedSameBin.length > 0) {
+                    log.audit('Bin Putaway — Skipped (already in bin)',
+                        skippedSameBin.length + ' serial(s) already in ' + toBinNumber + ': ' + skippedSameBin.join(', '));
+                }
+
+                // If every serial was already in the destination bin, show success
+                if (readySerials.length === 0) {
+                    createEntryForm(context,
+                        'All ' + skippedSameBin.length + ' serial(s) are already in bin ' + toBinNumber + '. Nothing to transfer.',
+                        'success', bpPrefill);
+                    return;
+                }
+
+                // --- Group remaining serials by item + location ---
+                const groupMap = {};
+                readySerials.forEach(function(serial) {
+                    const key = serial.itemId + '_' + serial.locationId;
+                    if (!groupMap[key]) {
+                        const details = getItemDetails(serial.itemId);
+                        groupMap[key] = {
+                            itemId: serial.itemId,
+                            itemText: details ? (details.displayname || details.itemid) : serial.itemText,
+                            itemDescription: details ? details.description : '',
+                            locationId: serial.locationId,
+                            action: 'bin_putaway',
+                            serials: []
+                        };
+                    }
+                    groupMap[key].serials.push({
+                        serialNumber: serial.serialNumber,
+                        serialId: serial.serialId,
+                        binId: serial.binId
+                    });
+                });
+
+                const groups = Object.values(groupMap);
+
+                // --- Helper: build and save a bin transfer for given groups ---
+                function attemptBinTransfer(transferGroups) {
+                    const transferRecord = record.create({
+                        type: record.Type.BIN_TRANSFER,
+                        isDynamic: true
+                    });
+
+                    transferRecord.setValue({ fieldId: 'subsidiary', value: '1' });
+                    transferRecord.setValue({ fieldId: 'memo', value: 'Bin Putaway via WH Assistant' });
+                    transferRecord.setValue({ fieldId: 'location', value: locationId });
+
+                    transferGroups.forEach(function(group) {
+                        transferRecord.selectNewLine({ sublistId: 'inventory' });
+                        transferRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'item', value: group.itemId });
+                        transferRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'quantity', value: group.serials.length });
+
+                        const invDetail = transferRecord.getCurrentSublistSubrecord({
+                            sublistId: 'inventory',
+                            fieldId: 'inventorydetail'
+                        });
+
+                        group.serials.forEach(function(serial) {
+                            invDetail.selectNewLine({ sublistId: 'inventoryassignment' });
+                            invDetail.setCurrentSublistText({
+                                sublistId: 'inventoryassignment',
+                                fieldId: 'issueinventorynumber',
+                                text: serial.serialNumber
+                            });
+                            invDetail.setCurrentSublistValue({
+                                sublistId: 'inventoryassignment',
+                                fieldId: 'quantity',
+                                value: 1
+                            });
+                            if (serial.binId) {
+                                invDetail.setCurrentSublistValue({
+                                    sublistId: 'inventoryassignment',
+                                    fieldId: 'binnumber',
+                                    value: serial.binId
+                                });
+                            }
+                            invDetail.setCurrentSublistValue({
+                                sublistId: 'inventoryassignment',
+                                fieldId: 'tobinnumber',
+                                value: toBin.id
+                            });
+                            invDetail.setCurrentSublistValue({
+                                sublistId: 'inventoryassignment',
+                                fieldId: 'toinventorystatus',
+                                value: 1
+                            });
+                            invDetail.commitLine({ sublistId: 'inventoryassignment' });
+                        });
+
+                        transferRecord.commitLine({ sublistId: 'inventory' });
+                    });
+
+                    return transferRecord.save({ enableSourcing: true, ignoreMandatoryFields: false });
+                }
+
+                // --- Helper: check if an error message indicates "already in bin" ---
+                function isAlreadyInBinError(errorMsg) {
+                    const msg = (errorMsg || '').toLowerCase();
+                    return msg.indexOf('already in') > -1
+                        || msg.indexOf('same bin') > -1
+                        || msg.indexOf('already exists in bin') > -1
+                        || msg.indexOf('to bin is the same') > -1
+                        || msg.indexOf('transfer from and to the same bin') > -1;
+                }
+
+                // --- Helper: re-lookup bin details for serials to find any now in dest bin ---
+                function findSerialsAlreadyInBin(serialItems, destBinId) {
+                    const alreadyIn = [];
+                    const remaining = [];
+
+                    // Re-check each serial's current bin via a fresh search
+                    const serialNames = serialItems.map(function(s) { return s.serialNumber; });
+                    const freshData = lookupSerialDetails(serialNames);
+                    const freshMap = {};
+                    freshData.valid.forEach(function(s) { freshMap[s.serialNumber] = s; });
+
+                    serialItems.forEach(function(serial) {
+                        const fresh = freshMap[serial.serialNumber];
+                        if (fresh && String(fresh.binId) === String(destBinId)) {
+                            alreadyIn.push(serial.serialNumber);
+                        } else {
+                            remaining.push(serial);
+                        }
+                    });
+
+                    return { alreadyIn: alreadyIn, remaining: remaining };
+                }
+
+                // --- Create bin transfer (status = 1 Good) ---
+                try {
+                    const transferId = attemptBinTransfer(groups);
+
+                    let tranId = String(transferId);
+                    try {
+                        const lookup = search.lookupFields({
+                            type: record.Type.BIN_TRANSFER,
+                            id: transferId,
+                            columns: ['tranid']
+                        });
+                        tranId = lookup.tranid || String(transferId);
+                    } catch (e) {
+                        log.debug('Could not look up bin putaway transfer tranid', e.message);
+                    }
+
+                    log.audit('Bin Putaway Transfer Created',
+                        'TranID: ' + tranId + ', Transferred: ' + readySerials.length
+                        + ', Skipped (same bin): ' + skippedSameBin.length + ', To Bin: ' + toBinNumber);
+
+                    // Build label groups for success page
+                    const labelGroups = [];
+                    groups.forEach(function(group) {
+                        labelGroups.push({
+                            itemId: group.itemId,
+                            itemText: group.itemText,
+                            description: group.itemDescription,
+                            action: 'bin_putaway',
+                            serialNumbers: group.serials.map(function(s) { return s.serialNumber; })
+                        });
+                    });
+
+                    createSuccessPage(context, null, tranId, labelGroups, null, null, null);
+
+                } catch (e) {
+                    // --- If the error is "already in bin", filter those serials out and retry ---
+                    if (isAlreadyInBinError(e.message)) {
+                        log.audit('Bin Putaway — already-in-bin error detected, attempting retry',
+                            e.message);
+
+                        // Flatten all serials from all groups
+                        const allSerials = [];
+                        groups.forEach(function(g) {
+                            g.serials.forEach(function(s) { allSerials.push(s); });
+                        });
+
+                        // Re-lookup to separate truly-already-in-bin from transferable
+                        const split = findSerialsAlreadyInBin(allSerials, toBin.id);
+
+                        if (split.alreadyIn.length > 0) {
+                            log.audit('Bin Putaway — serials already in destination bin',
+                                split.alreadyIn.length + ' serial(s): ' + split.alreadyIn.join(', '));
+                        }
+
+                        // If nothing left to transfer, show success with a note
+                        if (split.remaining.length === 0) {
+                            const allSkipped = skippedSameBin.concat(split.alreadyIn);
+                            createEntryForm(context,
+                                'All ' + allSkipped.length + ' serial(s) are already in bin '
+                                + toBinNumber + '. Nothing to transfer.',
+                                'success', bpPrefill);
+                            return;
+                        }
+
+                        // Re-group the remaining serials by item + location
+                        const retryGroupMap = {};
+                        split.remaining.forEach(function(serial) {
+                            const key = serial.itemId + '_' + (serial.locationId || locationId);
+                            if (!retryGroupMap[key]) {
+                                // Find original group to reuse item details
+                                var origGroup = null;
+                                for (var gi = 0; gi < groups.length; gi++) {
+                                    if (String(groups[gi].itemId) === String(serial.itemId)) {
+                                        origGroup = groups[gi]; break;
+                                    }
+                                }
+                                retryGroupMap[key] = {
+                                    itemId: serial.itemId,
+                                    itemText: origGroup ? origGroup.itemText : '',
+                                    itemDescription: origGroup ? origGroup.itemDescription : '',
+                                    locationId: serial.locationId || locationId,
+                                    action: 'bin_putaway',
+                                    serials: []
+                                };
+                            }
+                            retryGroupMap[key].serials.push(serial);
+                        });
+
+                        const retryGroups = Object.values(retryGroupMap);
+
+                        try {
+                            const retryTransferId = attemptBinTransfer(retryGroups);
+
+                            let retryTranId = String(retryTransferId);
+                            try {
+                                const lookup2 = search.lookupFields({
+                                    type: record.Type.BIN_TRANSFER,
+                                    id: retryTransferId,
+                                    columns: ['tranid']
+                                });
+                                retryTranId = lookup2.tranid || String(retryTransferId);
+                            } catch (e2) {
+                                log.debug('Could not look up retry bin putaway transfer tranid', e2.message);
+                            }
+
+                            log.audit('Bin Putaway Transfer Created (retry)',
+                                'TranID: ' + retryTranId + ', Transferred: ' + split.remaining.length
+                                + ', Already in bin: ' + split.alreadyIn.length + ', To Bin: ' + toBinNumber);
+
+                            // Build label groups for success page (only the transferred serials)
+                            const retryLabelGroups = [];
+                            retryGroups.forEach(function(group) {
+                                retryLabelGroups.push({
+                                    itemId: group.itemId,
+                                    itemText: group.itemText,
+                                    description: group.itemDescription,
+                                    action: 'bin_putaway',
+                                    serialNumbers: group.serials.map(function(s) { return s.serialNumber; })
+                                });
+                            });
+
+                            createSuccessPage(context, null, retryTranId, retryLabelGroups, null, null, null);
+
+                        } catch (retryErr) {
+                            log.error('Bin Putaway Retry Transfer Error', retryErr.message + ' | ' + retryErr.stack);
+                            const failedSerialList = split.remaining.map(function(s) { return s.serialNumber; }).join(', ');
+                            createEntryForm(context,
+                                'Bin putaway failed on retry: ' + retryErr.message
+                                + ' — Serials with issues: ' + failedSerialList,
+                                'error', bpPrefill);
+                            return;
+                        }
+
+                    } else {
+                        // Non "already in bin" error — fail as before
+                        log.error('Bin Putaway Transfer Error', e.message + ' | ' + e.stack);
+
+                        const failedSerialList = readySerials.map(function(s) { return s.serialNumber; }).join(', ');
+                        createEntryForm(context,
+                            'Bin putaway failed: ' + e.message
+                            + ' — Serials with issues: ' + failedSerialList,
+                            'error', bpPrefill);
+                        return;
+                    }
+                }
+
+            } else {
+                // --- Non-Serialized Bin Putaway ---
+                const cartDataRaw = context.request.parameters.custpage_bp_cart_json;
+                if (!cartDataRaw) {
+                    createEntryForm(context, 'Missing cart data. Please start over.', 'error');
+                    return;
+                }
+
+                let cartRows;
+                try {
+                    cartRows = JSON.parse(cartDataRaw);
+                } catch (e) {
+                    createEntryForm(context, 'Invalid cart data. Please start over.', 'error');
+                    return;
+                }
+
+                if (!cartRows || cartRows.length === 0) {
+                    createEntryForm(context, 'No items in the grid. Please add items first.', 'warning');
+                    return;
+                }
+
+                const locationId = '1';
+                const errors = [];
+                const binTransferRows = [];
+                const itemCache = {};
+                const binCache = {};
+
+                cartRows.forEach(function(row, idx) {
+                    const itemName = (row.itemName || '').trim();
+                    const fromBinNumber = (row.fromBinNumber || '').trim();
+                    const toBinNumber = (row.toBinNumber || '').trim();
+                    const quantity = parseInt(row.quantity) || 0;
+                    const rowLabel = 'Row ' + (idx + 1) + ' (' + (itemName || 'empty') + ')';
+
+                    if (!itemName || !fromBinNumber || !toBinNumber || quantity <= 0) {
+                        errors.push(rowLabel + ': missing required fields');
+                        return;
+                    }
+
+                    // Look up item
+                    if (!itemCache[itemName]) {
+                        const item = findItemByName(itemName);
+                        if (item) {
+                            itemCache[itemName] = item;
+                        } else {
+                            errors.push(rowLabel + ': item not found "' + itemName + '"');
+                            return;
+                        }
+                    }
+                    const itemData = itemCache[itemName];
+
+                    // Look up from bin
+                    if (!binCache[fromBinNumber]) {
+                        const bin = findBinByNumber(fromBinNumber, locationId);
+                        if (bin) {
+                            binCache[fromBinNumber] = bin;
+                        } else {
+                            errors.push(rowLabel + ': from bin not found "' + fromBinNumber + '"');
+                            return;
+                        }
+                    }
+
+                    // Look up to bin
+                    if (!binCache[toBinNumber]) {
+                        const bin = findBinByNumber(toBinNumber, locationId);
+                        if (bin) {
+                            binCache[toBinNumber] = bin;
+                        } else {
+                            errors.push(rowLabel + ': to bin not found "' + toBinNumber + '"');
+                            return;
+                        }
+                    }
+
+                    binTransferRows.push({
+                        itemId: itemData.id,
+                        itemText: itemData.displayname || itemData.itemid,
+                        description: itemData.description || '',
+                        locationId: locationId,
+                        quantity: quantity,
+                        fromBinId: binCache[fromBinNumber].id,
+                        toBinId: binCache[toBinNumber].id,
+                        toStatusId: 1  // Good status
+                    });
+                });
+
+                if (binTransferRows.length === 0) {
+                    const errMsg = errors.length > 0 ? 'Errors: ' + errors.join('; ') : 'No valid items to process.';
+                    createEntryForm(context, errMsg, 'error');
+                    return;
+                }
+
+                try {
+                    const transferResult = createNonSerializedBinTransferMulti(binTransferRows, 'Bin Putaway via WH Assistant');
+                    log.audit('Non-Serialized Bin Putaway Transfer Created', 'TranID: ' + transferResult.tranId);
+
+                    const processedItems = binTransferRows.map(function(row) {
+                        return {
+                            itemText: row.itemText,
+                            description: row.description,
+                            quantity: row.quantity,
+                            action: 'bin_putaway'
+                        };
+                    });
+
+                    createNonSerializedMultiSuccessPage(context, null, transferResult.tranId, null, processedItems, errors);
+
+                } catch (e) {
+                    log.error('Non-Serialized Bin Putaway Error', e.message + ' | ' + e.stack);
+                    createEntryForm(context, 'Bin putaway failed: ' + e.message, 'error');
+                    return;
+                }
+            }
         }
 
         // ====================================================================
@@ -4131,6 +5254,11 @@ setTimeout(doPrint, 4000);
 
                     if (action === 'process_inventory_found') {
                         handleProcessInventoryFound(context);
+                        return;
+                    }
+
+                    if (action === 'process_bin_putaway') {
+                        handleProcessBinPutaway(context);
                         return;
                     }
 

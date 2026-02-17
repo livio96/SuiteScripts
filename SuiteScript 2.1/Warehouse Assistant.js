@@ -289,8 +289,14 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
          *   Phase 2 – enrich with bin/location via inventoryNumberBinOnHand join (best-effort)
          * Returns { valid: [...], invalid: [...] }
          */
-        // Location ID to restrict serial number searches
+        // Location IDs to restrict serial number searches
         const SERIAL_LOOKUP_LOCATION_ID = '1';
+        const TRANSFER_SOURCE_LOCATION_ID = '26';
+        const SERIAL_LOOKUP_LOCATION_IDS = [SERIAL_LOOKUP_LOCATION_ID, TRANSFER_SOURCE_LOCATION_ID];
+
+        // Transfer Order configuration
+        const TRANSFER_DESTINATION_LOCATION_ID = '1'; // Location A
+        const LANDED_COST_CATEGORY_ID = 21697;
 
         function lookupSerialDetails(serialTexts) {
             if (!serialTexts || serialTexts.length === 0) {
@@ -323,8 +329,8 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                     const locId = String(result.getValue('location') || '');
                     const qtyOnHand = parseFloat(result.getValue('quantityonhand')) || 0;
 
-                    // Only accept if in target location with quantity on hand
-                    if (locId === SERIAL_LOOKUP_LOCATION_ID && qtyOnHand > 0) {
+                    // Only accept if in target location(s) with quantity on hand
+                    if (SERIAL_LOOKUP_LOCATION_IDS.indexOf(locId) !== -1 && qtyOnHand > 0) {
                         if (!foundSerials[serial]) {
                             foundSerials[serial] = {
                                 serialNumber: serial,
@@ -370,7 +376,7 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                             filters: [
                                 ['inventorynumber', 'anyof', serialIds],
                                 'AND',
-                                ['location', 'anyof', SERIAL_LOOKUP_LOCATION_ID]
+                                ['location', 'anyof', SERIAL_LOOKUP_LOCATION_IDS]
                             ],
                             columns: [
                                 search.createColumn({ name: 'inventorynumber' }),
@@ -1378,6 +1384,228 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
             }
 
             return { adjId: adjId, tranId: tranId };
+        }
+
+        // ====================================================================
+        // TRANSFER ORDER + UPCHARGE (LANDED COST) FUNCTIONS
+        // ====================================================================
+
+        /**
+         * Create a Transfer Order from TRANSFER_SOURCE_LOCATION_ID (26) to
+         * TRANSFER_DESTINATION_LOCATION_ID (1), then fulfill and receive it,
+         * and add a landed cost (upcharge) to the Item Receipt.
+         *
+         * For SERIALIZED items:
+         * @param {Object} params
+         * @param {string} params.itemId - The item internal ID
+         * @param {string} params.itemText - Display name for the item
+         * @param {Array}  params.serials - Array of { serialNumber, serialId, binId }
+         * @param {number} params.upchargePerUnit - Dollar amount per unit for landed cost
+         * @param {string} params.memo - Transaction memo
+         * @returns {Object} { transferOrderId, transferOrderTranId, itemFulfillmentId, itemReceiptId }
+         */
+        function createTransferOrderWithUpcharge(params) {
+            const itemId = params.itemId;
+            const serials = params.serials || [];
+            const quantity = params.quantity || serials.length;
+            const upchargePerUnit = params.upchargePerUnit || 0;
+            const memo = params.memo || 'Transfer to A & Upcharge via Warehouse Assistant Dashboard.';
+            const isSerialized = serials.length > 0;
+
+            // ---- Step 1: Create Transfer Order ----
+            const toRecord = record.create({
+                type: record.Type.TRANSFER_ORDER,
+                isDynamic: true
+            });
+
+            toRecord.setValue({ fieldId: 'subsidiary', value: '1' });
+            toRecord.setValue({ fieldId: 'location', value: TRANSFER_SOURCE_LOCATION_ID });
+            toRecord.setValue({ fieldId: 'transferlocation', value: TRANSFER_DESTINATION_LOCATION_ID });
+            toRecord.setValue({ fieldId: 'memo', value: memo });
+            toRecord.setValue({ fieldId: 'orderstatus', value: 'B' }); // Pending Fulfillment
+
+            toRecord.selectNewLine({ sublistId: 'item' });
+            toRecord.setCurrentSublistValue({ sublistId: 'item', fieldId: 'item', value: itemId });
+            toRecord.setCurrentSublistValue({ sublistId: 'item', fieldId: 'quantity', value: quantity });
+            toRecord.commitLine({ sublistId: 'item' });
+
+            const toId = toRecord.save({ enableSourcing: true, ignoreMandatoryFields: true });
+            log.audit('Transfer Order Created', 'ID: ' + toId);
+
+            let toTranId = String(toId);
+            try {
+                const toLookup = search.lookupFields({ type: record.Type.TRANSFER_ORDER, id: toId, columns: ['tranid'] });
+                toTranId = toLookup.tranid || String(toId);
+            } catch (e) {
+                log.debug('Could not look up TO tranid', e.message);
+            }
+
+            // ---- Step 2: Fulfill (Item Fulfillment) from Location 26 ----
+            const ifRecord = record.transform({
+                fromType: record.Type.TRANSFER_ORDER,
+                fromId: toId,
+                toType: record.Type.ITEM_FULFILLMENT,
+                isDynamic: true
+            });
+
+            // Mark as Shipped so the TO can be received
+            ifRecord.setValue({ fieldId: 'shipstatus', value: 'C' });
+
+            // Set serial numbers on the fulfillment if serialized
+            const lineCount = ifRecord.getLineCount({ sublistId: 'item' });
+            for (let i = 0; i < lineCount; i++) {
+                ifRecord.selectLine({ sublistId: 'item', line: i });
+                const lineItemId = ifRecord.getCurrentSublistValue({ sublistId: 'item', fieldId: 'item' });
+
+                if (String(lineItemId) === String(itemId)) {
+                    ifRecord.setCurrentSublistValue({ sublistId: 'item', fieldId: 'itemreceive', value: true });
+
+                    if (isSerialized) {
+                        const invDetail = ifRecord.getCurrentSublistSubrecord({ sublistId: 'item', fieldId: 'inventorydetail' });
+                        serials.forEach((s, sIdx) => {
+                            if (sIdx > 0) {
+                                invDetail.selectNewLine({ sublistId: 'inventoryassignment' });
+                            } else {
+                                // First line may already exist — select it
+                                try {
+                                    invDetail.selectLine({ sublistId: 'inventoryassignment', line: 0 });
+                                } catch (e) {
+                                    invDetail.selectNewLine({ sublistId: 'inventoryassignment' });
+                                }
+                            }
+                            invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'issueinventorynumber', value: s.serialId || s.serialNumber });
+                            invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity', value: 1 });
+                            if (s.binId) {
+                                invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', value: s.binId });
+                            }
+                            invDetail.commitLine({ sublistId: 'inventoryassignment' });
+                        });
+                    }
+
+                    ifRecord.commitLine({ sublistId: 'item' });
+                }
+            }
+
+            const ifId = ifRecord.save({ enableSourcing: true, ignoreMandatoryFields: true });
+            log.audit('Item Fulfillment Created', 'ID: ' + ifId + ' for TO: ' + toId);
+
+            // ---- Step 3: Receive (Item Receipt) in Location 1 ----
+            const irRecord = record.transform({
+                fromType: record.Type.TRANSFER_ORDER,
+                fromId: toId,
+                toType: record.Type.ITEM_RECEIPT,
+                isDynamic: true
+            });
+
+            // Enable per-line landed cost on the new transaction (must be set before first save)
+            if (upchargePerUnit > 0) {
+                try {
+                    irRecord.setValue({ fieldId: 'landedcostperline', value: true });
+                } catch (plErr) {
+                    log.debug('landedcostperline', 'Could not set on new IR: ' + plErr.message);
+                }
+            }
+
+            // Mark item line as received
+            const irLineCount = irRecord.getLineCount({ sublistId: 'item' });
+            for (let i = 0; i < irLineCount; i++) {
+                irRecord.selectLine({ sublistId: 'item', line: i });
+                const lineItemId = irRecord.getCurrentSublistValue({ sublistId: 'item', fieldId: 'item' });
+
+                if (String(lineItemId) === String(itemId)) {
+                    irRecord.setCurrentSublistValue({ sublistId: 'item', fieldId: 'itemreceive', value: true });
+
+                    // Set landed cost category on the item line so NS creates the subrecord row
+                    if (upchargePerUnit > 0) {
+                        irRecord.setCurrentSublistValue({ sublistId: 'item', fieldId: 'landedcost', value: LANDED_COST_CATEGORY_ID });
+                    }
+
+                    if (isSerialized) {
+                        const invDetail = irRecord.getCurrentSublistSubrecord({ sublistId: 'item', fieldId: 'inventorydetail' });
+                        const existingLines = invDetail.getLineCount({ sublistId: 'inventoryassignment' });
+                        log.debug('IR Inventory Detail', 'Pre-populated lines: ' + existingLines + ', serials to receive: ' + serials.length);
+
+                        // NetSuite pre-populates inventory assignment lines from the fulfillment.
+                        // Update existing lines with our serials instead of adding new (duplicate) lines.
+                        serials.forEach((s, sIdx) => {
+                            if (sIdx < existingLines) {
+                                // Update the pre-populated line
+                                invDetail.selectLine({ sublistId: 'inventoryassignment', line: sIdx });
+                            } else {
+                                // Only add a new line if we have more serials than pre-populated lines
+                                invDetail.selectNewLine({ sublistId: 'inventoryassignment' });
+                            }
+                            invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'receiptinventorynumber', value: s.serialNumber });
+                            invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity', value: 1 });
+                            invDetail.commitLine({ sublistId: 'inventoryassignment' });
+                        });
+                    }
+
+                    irRecord.commitLine({ sublistId: 'item' });
+                }
+            }
+
+            const irId = irRecord.save({ enableSourcing: true, ignoreMandatoryFields: true });
+            log.audit('Item Receipt Created', 'ID: ' + irId + ' for TO: ' + toId);
+
+            // ---- Step 4: Apply landed cost amount via the landedcost subrecord (standard mode) ----
+            if (upchargePerUnit > 0) {
+                try {
+                    const totalLandedCost = upchargePerUnit * quantity;
+
+                    const irEdit = record.load({
+                        type: record.Type.ITEM_RECEIPT,
+                        id: irId,
+                        isDynamic: false
+                    });
+
+                    // Find our item line and set the landed cost subrecord
+                    const irEditLineCount = irEdit.getLineCount({ sublistId: 'item' });
+                    for (let li = 0; li < irEditLineCount; li++) {
+                        const liItemId = irEdit.getSublistValue({ sublistId: 'item', fieldId: 'item', line: li });
+                        if (String(liItemId) === String(itemId)) {
+                            // Access the landedcost subrecord on this item line
+                            const lcSubrec = irEdit.getSublistSubrecord({
+                                sublistId: 'item',
+                                fieldId: 'landedcost',
+                                line: li
+                            });
+
+                            // The category was set on the item line in Step 3, so NS should
+                            // have created a subrecord row with the default amount ($70).
+                            // We just need to overwrite the amount on that existing row.
+                            const lcLineCount = lcSubrec.getLineCount({ sublistId: 'landedcostdata' });
+                            log.debug('Landed Cost Subrecord', 'Found ' + lcLineCount + ' existing row(s) in landedcostdata');
+
+                            if (lcLineCount > 0) {
+                                // Update the amount on the first row (the one NS created from the category)
+                                const existingCat = lcSubrec.getSublistValue({ sublistId: 'landedcostdata', fieldId: 'costcategory', line: 0 });
+                                const existingAmt = lcSubrec.getSublistValue({ sublistId: 'landedcostdata', fieldId: 'amount', line: 0 });
+                                log.debug('Landed Cost Subrecord', 'Before — costcategory: ' + existingCat + ', amount: ' + existingAmt);
+
+                                lcSubrec.setSublistValue({ sublistId: 'landedcostdata', fieldId: 'amount', line: 0, value: totalLandedCost });
+                                log.debug('Landed Cost Subrecord', 'After — set amount to: ' + totalLandedCost);
+                            } else {
+                                log.debug('Landed Cost Subrecord', 'No existing rows — cannot set amount');
+                            }
+
+                            break;
+                        }
+                    }
+
+                    irEdit.save({ enableSourcing: true, ignoreMandatoryFields: true });
+                    log.audit('Landed Cost Applied', 'IR ID: ' + irId + ', amount: ' + totalLandedCost + ' (upcharge ' + upchargePerUnit + ' x ' + quantity + ')');
+                } catch (lcErr) {
+                    log.error('Landed Cost Error', lcErr.message + ' | ' + lcErr.stack);
+                }
+            }
+
+            return {
+                transferOrderId: toId,
+                transferOrderTranId: toTranId,
+                itemFulfillmentId: ifId,
+                itemReceiptId: irId
+            };
         }
 
         /**
@@ -2423,7 +2651,8 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                         + '<option value="move_testing">Move to Testing</option>'
                         + '<option value="return_to_vendor">Return to Vendor</option>'
                         + '<option value="trash">Trash</option>'
-                        + '<option value="inventory_found">Inventory Found</option>';
+                        + '<option value="inventory_found">Inventory Found</option>'
+                        + '<option value="transfer_upcharge">Transfer to A &amp; Upcharge</option>';
 
                     function addNsGridRow() {
                         var tbody = document.getElementById('ns-grid-body');
@@ -2435,7 +2664,8 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                         tr.innerHTML = '<td data-label="SKU"><input type="text" class="ns-grid-input ns-item-input" data-row="' + nsGridRowId + '" placeholder="Enter SKU" style="width:100%; padding:8px 10px; border:1px solid #e2e8f0; border-radius:6px; font-size:13px; box-sizing:border-box;"></td>'
                             + '<td data-label="From Bin"><select class="action-select ns-bin-input" data-row="' + nsGridRowId + '" style="min-width:120px;">' + nsBinOptions + '</select></td>'
                             + '<td data-label="Qty"><input type="number" class="ns-grid-input ns-qty-input" data-row="' + nsGridRowId + '" placeholder="Qty" min="1" style="width:80px; padding:8px 10px; border:1px solid #e2e8f0; border-radius:6px; font-size:13px;"></td>'
-                            + '<td data-label="Action"><select class="action-select ns-action-input" data-row="' + nsGridRowId + '" style="min-width:180px;">' + nsActionOptions + '</select></td>'
+                            + '<td data-label="Action"><select class="action-select ns-action-input" data-row="' + nsGridRowId + '" style="min-width:180px;" onchange="handleNsActionChange(this)">' + nsActionOptions + '</select>'
+                            + '<input type="number" class="ns-grid-input ns-upcharge-input" data-row="' + nsGridRowId + '" placeholder="Upcharge $ per unit" min="0" step="0.01" style="display:none; margin-top:6px; width:100%; padding:8px 10px; border:1px solid #e2e8f0; border-radius:6px; font-size:13px;"></td>'
                             + '<td><button type="button" onclick="removeNsGridRow(' + nsGridRowId + ')" '
                             + 'style="background:none; border:none; color:#ef4444; cursor:pointer; font-size:18px; padding:4px 8px;" '
                             + 'title="Remove">&times;</button></td>';
@@ -2469,6 +2699,20 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                         addNsGridRow();
                     }
 
+                    function handleNsActionChange(selectEl) {
+                        var row = selectEl.closest('tr');
+                        if (!row) return;
+                        var upchargeInput = row.querySelector('.ns-upcharge-input');
+                        if (upchargeInput) {
+                            if (selectEl.value === 'transfer_upcharge') {
+                                upchargeInput.style.display = 'block';
+                            } else {
+                                upchargeInput.style.display = 'none';
+                                upchargeInput.value = '';
+                            }
+                        }
+                    }
+
                     function submitNonSerializedMulti() {
                         var rows = document.querySelectorAll('#ns-grid-body tr');
                         var gridData = [];
@@ -2480,11 +2724,13 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                             var binInput = row.querySelector('.ns-bin-input');
                             var qtyInput = row.querySelector('.ns-qty-input');
                             var actionSelect = row.querySelector('.ns-action-input');
+                            var upchargeInput = row.querySelector('.ns-upcharge-input');
 
                             var itemName = itemInput ? itemInput.value.trim() : '';
                             var binNumber = binInput ? binInput.value.trim() : '';
                             var qty = qtyInput ? parseInt(qtyInput.value) || 0 : 0;
                             var action = actionSelect ? actionSelect.value : '';
+                            var upcharge = upchargeInput ? parseFloat(upchargeInput.value) || 0 : 0;
 
                             // Skip completely empty rows
                             if (!itemName && !binNumber && qty === 0 && !action) continue;
@@ -2515,12 +2761,19 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                             } else {
                                 if (actionSelect) actionSelect.style.border = '1px solid #e2e8f0';
                             }
+                            if (action === 'transfer_upcharge' && upcharge <= 0) {
+                                if (upchargeInput) upchargeInput.style.border = '2px solid #ef4444';
+                                hasError = true;
+                            } else {
+                                if (upchargeInput) upchargeInput.style.border = '1px solid #e2e8f0';
+                            }
 
                             gridData.push({
                                 itemName: itemName,
                                 binNumber: binNumber,
                                 quantity: qty,
-                                action: action
+                                action: action,
+                                upcharge: action === 'transfer_upcharge' ? upcharge : 0
                             });
                         }
 
@@ -2910,6 +3163,17 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                             }
                         }
 
+                        // Show/hide bulk upcharge input for transfer_upcharge
+                        var bulkUpcharge = document.getElementById('bulk-upcharge');
+                        if (bulkUpcharge) {
+                            if (value === 'transfer_upcharge') {
+                                bulkUpcharge.style.display = 'block';
+                            } else {
+                                bulkUpcharge.style.display = 'none';
+                                bulkUpcharge.value = '';
+                            }
+                        }
+
                         // For part number change, require item name before applying
                         if (value === 'part_number_change' || value === 'part_number_change_stock') {
                             var bulkItemName = bulkNewItem ? bulkNewItem.value.trim() : '';
@@ -2930,6 +3194,39 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                             for (var j = 0; j < itemInputs.length; j++) {
                                 itemInputs[j].value = bulkItemName;
                             }
+                        }
+
+                        // For transfer_upcharge via bulk, require upcharge value and only apply to location 26 rows
+                        if (value === 'transfer_upcharge') {
+                            var bulkUpchargeVal = bulkUpcharge ? bulkUpcharge.value.trim() : '';
+                            if (!bulkUpchargeVal || parseFloat(bulkUpchargeVal) <= 0) {
+                                // Set dropdowns for loc 26 rows, prompt for upcharge value
+                                var selects = document.querySelectorAll('select.action-select[data-index]');
+                                for (var i = 0; i < selects.length; i++) {
+                                    var loc = selects[i].getAttribute('data-location');
+                                    if (loc === '${TRANSFER_SOURCE_LOCATION_ID}') {
+                                        selects[i].value = value;
+                                        handleActionChange(selects[i]);
+                                    }
+                                }
+                                updateActionCount();
+                                bulkUpcharge.focus();
+                                return;
+                            }
+                            // Populate all per-row upcharge-input fields with the bulk value (loc 26 rows only)
+                            var selects = document.querySelectorAll('select.action-select[data-index]');
+                            for (var i = 0; i < selects.length; i++) {
+                                var loc = selects[i].getAttribute('data-location');
+                                var idx = selects[i].getAttribute('data-index');
+                                if (loc === '${TRANSFER_SOURCE_LOCATION_ID}') {
+                                    selects[i].value = value;
+                                    handleActionChange(selects[i]);
+                                    var upInput = document.querySelector('.upcharge-input[data-index="' + idx + '"]');
+                                    if (upInput) upInput.value = bulkUpchargeVal;
+                                }
+                            }
+                            updateActionCount();
+                            return;
                         }
 
                         // Select only row dropdowns (those with data-index attribute)
@@ -2965,6 +3262,17 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                                 newItemInput.value = '';
                             }
                         }
+                        var upchargeInput = document.querySelector('.upcharge-input[data-index="' + idx + '"]');
+                        if (upchargeInput) {
+                            if (selectEl.value === 'transfer_upcharge') {
+                                upchargeInput.style.display = 'block';
+                                upchargeInput.required = true;
+                            } else {
+                                upchargeInput.style.display = 'none';
+                                upchargeInput.required = false;
+                                upchargeInput.value = '';
+                            }
+                        }
                         updateActionCount();
                     }
 
@@ -2986,16 +3294,22 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                         var hasAction = false;
                         var missingNewSerial = false;
                         var missingNewItem = false;
+                        var missingUpcharge = false;
 
                         // Get bulk item name if present (for part number change via Apply to All)
                         var bulkNewItem = document.getElementById('bulk-new-item');
                         var bulkItemName = bulkNewItem ? bulkNewItem.value.trim() : '';
+
+                        // Get bulk upcharge if present (for transfer_upcharge via Apply to All)
+                        var bulkUpcharge = document.getElementById('bulk-upcharge');
+                        var bulkUpchargeVal = bulkUpcharge ? bulkUpcharge.value.trim() : '';
 
                         for (var i = 0; i < selects.length; i++) {
                             var idx = selects[i].getAttribute('data-index');
                             var val = selects[i].value;
                             var newSerial = '';
                             var newItemName = '';
+                            var upcharge = 0;
 
                             if (val === 'serial_change' || val === 'serial_change_stock') {
                                 var newSerialInput = document.querySelector('.new-serial-input[data-index="' + idx + '"]');
@@ -3028,13 +3342,33 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                                 }
                             }
 
-                            actions.push({ index: parseInt(idx), action: val, newSerial: newSerial, newItemName: newItemName });
+                            if (val === 'transfer_upcharge') {
+                                var upchargeInput = document.querySelector('.upcharge-input[data-index="' + idx + '"]');
+                                if (upchargeInput) {
+                                    var upVal = upchargeInput.value.trim();
+                                    // If per-row is empty but bulk has a value, use bulk
+                                    if (!upVal && bulkUpchargeVal) {
+                                        upVal = bulkUpchargeVal;
+                                        upchargeInput.value = bulkUpchargeVal;
+                                    }
+                                    upcharge = parseFloat(upVal) || 0;
+                                    if (upcharge <= 0) {
+                                        missingUpcharge = true;
+                                        upchargeInput.style.border = '2px solid #ef4444';
+                                    } else {
+                                        upchargeInput.style.border = '1px solid #e2e8f0';
+                                    }
+                                }
+                            }
+
+                            actions.push({ index: parseInt(idx), action: val, newSerial: newSerial, newItemName: newItemName, upcharge: upcharge });
                             if (val !== '') hasAction = true;
                         }
 
                         if (!hasAction) { alert('Select an action for at least one serial number'); return; }
                         if (missingNewSerial) { alert('Please enter a new serial number for all Serial Number Change actions'); return; }
                         if (missingNewItem) { alert('Please enter a new item name for all Part Number Change actions'); return; }
+                        if (missingUpcharge) { alert('Please enter an upcharge amount for all Transfer to A & Upcharge actions'); return; }
 
                         window.onbeforeunload = null;
                         var form = document.forms[0];
@@ -3360,14 +3694,17 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
 
             // Build table rows for valid serials
             let rows = '';
+            const hasLocation26Serials = serialData.valid.some(s => String(s.locationId) === TRANSFER_SOURCE_LOCATION_ID);
             serialData.valid.forEach((s, idx) => {
+                const isLoc26 = String(s.locationId) === TRANSFER_SOURCE_LOCATION_ID;
+                const transferOption = isLoc26 ? '<option value="transfer_upcharge">Transfer to A &amp; Upcharge</option>' : '';
                 rows += `<tr>
                     <td data-label="Serial" style="font-family: 'SF Mono', Monaco, monospace; font-size: 14px;">${escapeXml(s.serialNumber)}</td>
                     <td data-label="Item"><strong>${escapeXml(s.itemText)}</strong></td>
                     <td data-label="Bin">${escapeXml(s.binText) || '<span style="color:#94a3b8;">N/A</span>'}</td>
                     <td data-label="Location">${escapeXml(s.locationText) || '<span style="color:#94a3b8;">N/A</span>'}</td>
                     <td data-label="Action">
-                        <select class="action-select" data-index="${idx}" onchange="handleActionChange(this)">
+                        <select class="action-select" data-index="${idx}" data-location="${escapeXml(String(s.locationId))}" onchange="handleActionChange(this)">
                             <option value="">-- No Action --</option>
                             <option value="back_to_stock">Back to Stock</option>
                             <option value="likenew">Change to Like New</option>
@@ -3381,9 +3718,11 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                             <option value="return_to_vendor">Return to Vendor</option>
                             <option value="serial_change">Serial Number Change</option>
                             <option value="trash">Trash</option>
+                            ${transferOption}
                         </select>
                         <input type="text" class="new-serial-input" data-index="${idx}" placeholder="Enter new serial" style="display:none; margin-top:8px; width:100%; padding:8px; border:1px solid #e2e8f0; border-radius:6px; font-size:13px;">
                         <input type="text" class="new-item-input" data-index="${idx}" placeholder="Enter new item name" style="display:none; margin-top:8px; width:100%; padding:8px; border:1px solid #e2e8f0; border-radius:6px; font-size:13px;">
+                        <input type="number" class="upcharge-input" data-index="${idx}" placeholder="Upcharge $ per unit" min="0" step="0.01" style="display:none; margin-top:8px; width:100%; padding:8px; border:1px solid #e2e8f0; border-radius:6px; font-size:13px;">
                     </td>
                 </tr>`;
             });
@@ -3431,8 +3770,10 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                                     <option value="return_to_vendor">Return to Vendor</option>
                                     <option value="serial_change">Serial Number Change</option>
                                     <option value="trash">Trash</option>
+                                    ${hasLocation26Serials ? '<option value="transfer_upcharge">Transfer to A &amp; Upcharge</option>' : ''}
                                 </select>
                                 <input type="text" id="bulk-new-item" placeholder="Enter new item name" style="display:none; flex:1; padding:8px; border:1px solid #e2e8f0; border-radius:6px; font-size:13px;">
+                                <input type="number" id="bulk-upcharge" placeholder="Upcharge $ per unit" min="0" step="0.01" style="display:none; flex:1; padding:8px; border:1px solid #e2e8f0; border-radius:6px; font-size:13px;">
                                 <div style="display:flex; align-items:center; gap:12px;">
                                     <span style="color:#64748b; font-weight:500;">With Action:</span>
                                     <span style="font-size:22px; font-weight:700; color:#1e3c72;" id="action_count">0</span>
@@ -3471,7 +3812,7 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
             context.response.writePage(form);
         }
 
-        function createSuccessPage(context, adjustmentTranId, binTransferTranId, labelGroups, serialChangeTranId, inventoryFoundTranId, partNumberChangeTranId) {
+        function createSuccessPage(context, adjustmentTranId, binTransferTranId, labelGroups, serialChangeTranId, inventoryFoundTranId, partNumberChangeTranId, transferOrderTranId) {
             const form = serverWidget.createForm({ title: 'Transactions Created' });
 
             const suiteletUrl = url.resolveScript({
@@ -3503,7 +3844,7 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
             }));
 
             // Use whichever transaction ID is available for the print job
-            const recordIdForPrint = adjustmentTranId || binTransferTranId || serialChangeTranId || partNumberChangeTranId || '';
+            const recordIdForPrint = adjustmentTranId || binTransferTranId || serialChangeTranId || partNumberChangeTranId || transferOrderTranId || '';
 
             const styleField = form.addField({ id: 'custpage_styles', type: serverWidget.FieldType.INLINEHTML, label: ' ' });
             styleField.defaultValue = getStyles() + getSuccessPageScript(suiteletUrl);
@@ -3535,7 +3876,8 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                     'part_number_change_stock': 'Part Number Change & Back to Stock',
                     'trash': 'Trash',
                     'inventory_found': 'Inventory Found',
-                    'bin_putaway': 'Bin Putaway'
+                    'bin_putaway': 'Bin Putaway',
+                    'transfer_upcharge': 'Transfer to A & Upcharge'
                 }[group.action] || group.action;
 
                 groupsHtml += `
@@ -3568,6 +3910,9 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
             }
             if (inventoryFoundTranId) {
                 transactionInfoHtml += `<p style="font-size:16px; margin:8px 0; color:#1e3c72;"><strong>Inventory Found:</strong> ${escapeXml(String(inventoryFoundTranId))}</p>`;
+            }
+            if (transferOrderTranId) {
+                transactionInfoHtml += `<p style="font-size:16px; margin:8px 0; color:#1e3c72;"><strong>Transfer Order:</strong> ${escapeXml(String(transferOrderTranId))}</p>`;
             }
 
             const contentField = form.addField({ id: 'custpage_content', type: serverWidget.FieldType.INLINEHTML, label: ' ' });
@@ -3636,11 +3981,11 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                 return;
             }
 
-            // Build map of index → action (including newSerial for serial_change, newItemName for part_number_change)
+            // Build map of index → action (including newSerial for serial_change, newItemName for part_number_change, upcharge for transfer_upcharge)
             const actionMap = {};
             actions.forEach(a => {
                 if (a.action && a.action !== '') {
-                    actionMap[a.index] = { action: a.action, newSerial: a.newSerial || '', newItemName: a.newItemName || '' };
+                    actionMap[a.index] = { action: a.action, newSerial: a.newSerial || '', newItemName: a.newItemName || '', upcharge: parseFloat(a.upcharge) || 0 };
                 }
             });
 
@@ -3649,12 +3994,13 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                 return;
             }
 
-            // Separate actions into adjustment vs bin transfer vs serial change vs part number change vs inventory found
+            // Separate actions into adjustment vs bin transfer vs serial change vs part number change vs inventory found vs transfer
             const ADJUSTMENT_ACTIONS = ['likenew', 'likenew_stock'];
             const BIN_TRANSFER_ACTIONS = ['move_testing', 'move_refurbishing', 'back_to_stock', 'defective', 'trash', 'return_to_vendor'];
             const SERIAL_CHANGE_ACTIONS = ['serial_change', 'serial_change_stock'];
             const PART_NUMBER_CHANGE_ACTIONS = ['part_number_change', 'part_number_change_stock'];
             const INVENTORY_FOUND_ACTIONS = ['inventory_found'];
+            const TRANSFER_UPCHARGE_ACTIONS = ['transfer_upcharge'];
 
             const errors = [];
             const itemDetailsCache = {}; // itemId → { itemid, displayname, description }
@@ -3671,6 +4017,8 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
             const partNumberChangeList = [];
             // Groups for inventory found (adjust in at avg cost)
             const inventoryFoundGroupMap = {};
+            // Groups for transfer order + upcharge (keyed by itemId + upcharge)
+            const transferUpchargeGroupMap = {};
 
             for (const [idxStr, actionData] of Object.entries(actionMap)) {
                 const idx = parseInt(idxStr, 10);
@@ -3824,14 +4172,40 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                         serialId: serial.serialId,
                         binId: serial.binId
                     });
+
+                } else if (TRANSFER_UPCHARGE_ACTIONS.includes(action)) {
+                    // --- TRANSFER TO A & UPCHARGE: Create TO from loc 26 → loc 1 with landed cost ---
+                    const upchargeAmount = actionData.upcharge || 0;
+                    if (upchargeAmount <= 0) {
+                        errors.push('Upcharge amount required for: ' + serial.serialNumber);
+                        continue;
+                    }
+                    // Group by item + upcharge (so all serials of same item with same upcharge go to one TO)
+                    const key = itemId + '_' + upchargeAmount;
+                    if (!transferUpchargeGroupMap[key]) {
+                        transferUpchargeGroupMap[key] = {
+                            itemId: itemId,
+                            itemText: itemDetails.displayname || itemDetails.itemid,
+                            itemDescription: itemDetails.description,
+                            upchargePerUnit: upchargeAmount,
+                            action: action,
+                            serials: []
+                        };
+                    }
+                    transferUpchargeGroupMap[key].serials.push({
+                        serialNumber: serial.serialNumber,
+                        serialId: serial.serialId,
+                        binId: serial.binId
+                    });
                 }
             }
 
             const adjustmentGroups = Object.values(adjustmentGroupMap);
             const binTransferGroups = Object.values(binTransferGroupMap);
             const inventoryFoundGroups = Object.values(inventoryFoundGroupMap);
+            const transferUpchargeGroups = Object.values(transferUpchargeGroupMap);
 
-            if (adjustmentGroups.length === 0 && binTransferGroups.length === 0 && serialChangeList.length === 0 && partNumberChangeList.length === 0 && inventoryFoundGroups.length === 0) {
+            if (adjustmentGroups.length === 0 && binTransferGroups.length === 0 && serialChangeList.length === 0 && partNumberChangeList.length === 0 && inventoryFoundGroups.length === 0 && transferUpchargeGroups.length === 0) {
                 const errMsg = errors.length > 0
                     ? 'Could not process: ' + errors.join('; ')
                     : 'No valid serials to process.';
@@ -3849,6 +4223,7 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
             let serialChangeTranId = null;
             let partNumberChangeTranId = null;
             let inventoryFoundTranId = null;
+            let transferOrderTranId = null;
             const labelGroups = [];
 
             // --- Process Inventory Adjustments (condition change to -LN) ---
@@ -3997,7 +4372,44 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                 }
             }
 
-            createSuccessPage(context, adjustmentTranId, binTransferTranId, labelGroups, serialChangeTranId, inventoryFoundTranId, partNumberChangeTranId);
+            // --- Process Transfer Orders with Upcharge ---
+            if (transferUpchargeGroups.length > 0) {
+                try {
+                    const toTranIds = [];
+                    transferUpchargeGroups.forEach(group => {
+                        const toResult = createTransferOrderWithUpcharge({
+                            itemId: group.itemId,
+                            itemText: group.itemText,
+                            serials: group.serials,
+                            upchargePerUnit: group.upchargePerUnit,
+                            memo: 'Transfer to A & Upcharge via Warehouse Assistant Dashboard.'
+                        });
+                        toTranIds.push(toResult.transferOrderTranId);
+                        log.audit('Transfer Order with Upcharge Created', 'TO TranID: ' + toResult.transferOrderTranId + ', IF ID: ' + toResult.itemFulfillmentId + ', IR ID: ' + toResult.itemReceiptId);
+
+                        // Build label groups for transfer (same item)
+                        let existing = labelGroups.find(lg => lg.itemId === group.itemId && lg.action === group.action);
+                        if (!existing) {
+                            existing = {
+                                itemId: group.itemId,
+                                itemText: group.itemText,
+                                description: group.itemDescription,
+                                action: group.action,
+                                serialNumbers: []
+                            };
+                            labelGroups.push(existing);
+                        }
+                        group.serials.forEach(s => existing.serialNumbers.push(s.serialNumber));
+                    });
+                    transferOrderTranId = toTranIds.join(', ');
+                } catch (e) {
+                    log.error('Transfer Order Error', e.message + ' | ' + e.stack);
+                    createResultsPage(context, serialData, 'Transfer order failed: ' + e.message, 'error');
+                    return;
+                }
+            }
+
+            createSuccessPage(context, adjustmentTranId, binTransferTranId, labelGroups, serialChangeTranId, inventoryFoundTranId, partNumberChangeTranId, transferOrderTranId);
         }
 
         /**
@@ -4260,6 +4672,7 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
             const ADJUSTMENT_ACTIONS = ['likenew', 'likenew_stock'];
             const BIN_TRANSFER_ACTIONS = ['move_testing', 'move_refurbishing', 'back_to_stock', 'defective', 'trash', 'return_to_vendor'];
             const INVENTORY_FOUND_ACTIONS = ['inventory_found'];
+            const TRANSFER_UPCHARGE_ACTIONS = ['transfer_upcharge'];
 
             const locationId = '1';
             const errors = [];
@@ -4267,6 +4680,7 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
             const adjustmentRows = [];
             const binTransferRows = [];
             const inventoryFoundRows = [];
+            const transferUpchargeRows = [];
 
             const itemCache = {};       // keyed by itemName
             const binCache = {};        // keyed by binNumber
@@ -4277,6 +4691,7 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                 const binNumber = (row.binNumber || '').trim();
                 const action = row.action;
                 const quantity = parseInt(row.quantity) || 0;
+                const upcharge = parseFloat(row.upcharge) || 0;
                 const rowLabel = 'Row ' + (idx + 1) + ' (' + (itemName || 'empty') + ')';
 
                 if (!itemName || !action || quantity <= 0) {
@@ -4380,10 +4795,24 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                         quantity: quantity,
                         action: action
                     });
+
+                } else if (TRANSFER_UPCHARGE_ACTIONS.indexOf(action) !== -1) {
+                    if (upcharge <= 0) {
+                        errors.push(rowLabel + ': upcharge amount required for Transfer to A & Upcharge');
+                        return;
+                    }
+                    transferUpchargeRows.push({
+                        itemId: itemId,
+                        itemText: itemData.displayname || itemData.itemid,
+                        description: itemData.description || '',
+                        quantity: quantity,
+                        upchargePerUnit: upcharge,
+                        action: action
+                    });
                 }
             });
 
-            if (adjustmentRows.length === 0 && binTransferRows.length === 0 && inventoryFoundRows.length === 0) {
+            if (adjustmentRows.length === 0 && binTransferRows.length === 0 && inventoryFoundRows.length === 0 && transferUpchargeRows.length === 0) {
                 const errMsg = errors.length > 0 ? 'Errors: ' + errors.join('; ') : 'No valid items to process.';
                 createEntryForm(context, errMsg, 'error');
                 return;
@@ -4392,6 +4821,7 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
             let adjustmentTranId = null;
             let binTransferTranId = null;
             let inventoryFoundTranId = null;
+            let transferOrderTranId = null;
             const processedItems = [];
 
             // -- Process all adjustment rows in ONE Inventory Adjustment record --
@@ -4460,7 +4890,38 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                 }
             }
 
-            createNonSerializedMultiSuccessPage(context, adjustmentTranId, binTransferTranId, inventoryFoundTranId, processedItems, errors);
+            // -- Process all transfer upcharge rows (each creates a Transfer Order + Fulfill + Receive) --
+            if (transferUpchargeRows.length > 0) {
+                try {
+                    const toTranIds = [];
+                    transferUpchargeRows.forEach(function(row) {
+                        const toResult = createTransferOrderWithUpcharge({
+                            itemId: row.itemId,
+                            itemText: row.itemText,
+                            serials: [],
+                            quantity: row.quantity,
+                            upchargePerUnit: row.upchargePerUnit,
+                            memo: 'Transfer to A & Upcharge via Warehouse Assistant Dashboard.'
+                        });
+                        toTranIds.push(toResult.transferOrderTranId);
+                        log.audit('Non-Serialized Transfer Order with Upcharge Created', 'TO TranID: ' + toResult.transferOrderTranId);
+
+                        processedItems.push({
+                            itemText: row.itemText,
+                            description: row.description || '',
+                            quantity: row.quantity,
+                            action: row.action
+                        });
+                    });
+                    transferOrderTranId = toTranIds.join(', ');
+                } catch (e) {
+                    log.error('Non-Serialized Transfer Order Error', e.message + ' | ' + e.stack);
+                    createEntryForm(context, 'Transfer order failed: ' + e.message, 'error');
+                    return;
+                }
+            }
+
+            createNonSerializedMultiSuccessPage(context, adjustmentTranId, binTransferTranId, inventoryFoundTranId, processedItems, errors, transferOrderTranId);
         }
 
         /**
@@ -4555,7 +5016,7 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
          * Success page for multi-row non-serialized processing.
          * Displays all transaction IDs and a summary table of processed items.
          */
-        function createNonSerializedMultiSuccessPage(context, adjustmentTranId, binTransferTranId, inventoryFoundTranId, processedItems, errors) {
+        function createNonSerializedMultiSuccessPage(context, adjustmentTranId, binTransferTranId, inventoryFoundTranId, processedItems, errors, transferOrderTranId) {
             const form = serverWidget.createForm({ title: 'Transactions Created' });
 
             const suiteletUrl = url.resolveScript({
@@ -4573,7 +5034,7 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                 };
             });
 
-            const recordIdForPrint = adjustmentTranId || binTransferTranId || inventoryFoundTranId || '';
+            const recordIdForPrint = adjustmentTranId || binTransferTranId || inventoryFoundTranId || transferOrderTranId || '';
 
             const styleField = form.addField({ id: 'custpage_styles', type: serverWidget.FieldType.INLINEHTML, label: ' ' });
             styleField.defaultValue = getStyles() + getSuccessPageScript(suiteletUrl);
@@ -4597,6 +5058,9 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
             if (inventoryFoundTranId) {
                 transactionInfoHtml += '<p style="font-size:16px; margin:8px 0; color:#1e3c72;"><strong>Inventory Found:</strong> ' + escapeXml(String(inventoryFoundTranId)) + '</p>';
             }
+            if (transferOrderTranId) {
+                transactionInfoHtml += '<p style="font-size:16px; margin:8px 0; color:#1e3c72;"><strong>Transfer Order:</strong> ' + escapeXml(String(transferOrderTranId)) + '</p>';
+            }
 
             const ACTION_LABELS = {
                 'back_to_stock': 'Back to Stock',
@@ -4608,7 +5072,8 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                 'return_to_vendor': 'Return to Vendor',
                 'trash': 'Trash',
                 'inventory_found': 'Inventory Found',
-                'bin_putaway': 'Bin Putaway'
+                'bin_putaway': 'Bin Putaway',
+                'transfer_upcharge': 'Transfer to A & Upcharge'
             };
 
             let itemRows = '';

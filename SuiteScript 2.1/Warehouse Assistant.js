@@ -347,6 +347,44 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
         }
 
         // ====================================================================
+        // BATCH-THEN-INDIVIDUAL RETRY HELPER
+        // ====================================================================
+        // Tries batch first (all items in one transaction). If batch fails,
+        // retries each item individually so good items go through and bad
+        // items are tracked as failures.
+
+        function tryBatchThenIndividual(items, createFn, memo) {
+            if (items.length === 0) return { tranIds: [], succeeded: [], failed: [] };
+            // Try batch first (happy path - 1 transaction)
+            try {
+                const r = createFn(items, memo);
+                var tid = r.tranId || r.transferId || r.adjId || '';
+                return { tranIds: [String(tid)], succeeded: items, failed: [] };
+            } catch (batchErr) {
+                log.debug('Batch failed, retrying individually', batchErr.message);
+                // If only 1 item, no point retrying
+                if (items.length === 1) {
+                    items[0]._error = batchErr.message;
+                    return { tranIds: [], succeeded: [], failed: items };
+                }
+                // Retry each item individually
+                var succeeded = [], failed = [], tranIds = [];
+                items.forEach(function(item) {
+                    try {
+                        var r = createFn([item], memo);
+                        var tid = r.tranId || r.transferId || r.adjId || '';
+                        tranIds.push(String(tid));
+                        succeeded.push(item);
+                    } catch (e) {
+                        item._error = e.message;
+                        failed.push(item);
+                    }
+                });
+                return { tranIds: tranIds, succeeded: succeeded, failed: failed };
+            }
+        }
+
+        // ====================================================================
         // INVENTORY ADJUSTMENT
         // ====================================================================
 
@@ -2006,9 +2044,11 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
             context.response.writePage(form);
         }
 
-        function createSuccessPage(context, adjustmentTranId, binTransferTranId, labelGroups, serialChangeTranId, inventoryFoundTranId, partNumberChangeTranId, transferOrderTranId) {
+        function createSuccessPage(context, adjustmentTranId, binTransferTranId, labelGroups, serialChangeTranId, inventoryFoundTranId, partNumberChangeTranId, transferOrderTranId, errors, failedGroups) {
             const form = serverWidget.createForm({ title: 'Transactions Created' });
             const suiteletUrl = url.resolveScript({ scriptId: runtime.getCurrentScript().id, deploymentId: runtime.getCurrentScript().deploymentId, returnExternalUrl: true });
+            errors = errors || [];
+            failedGroups = failedGroups || [];
 
             labelGroups.forEach((group, idx) => {
                 try {
@@ -2042,6 +2082,22 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                 'transfer_upcharge':'Transfer to A & Upcharge'
             };
 
+            // Build failed items HTML (red highlighted)
+            let failedHtml = '';
+            if (failedGroups.length > 0) {
+                let failedRowsHtml = '';
+                failedGroups.forEach(f => {
+                    failedRowsHtml += '<tr style="background:#fef2f2;"><td data-label="Serial" style="color:#991b1b;font-weight:700;">' + escapeXml(f.serialNumber) + '</td>'
+                        + '<td data-label="Item" style="color:#991b1b;">' + escapeXml(f.itemText) + '</td>'
+                        + '<td data-label="Action" style="color:#991b1b;">' + escapeXml(ACTION_LABELS[f.action] || f.action) + '</td>'
+                        + '<td data-label="Error" style="color:#dc2626;font-weight:700;">' + escapeXml(f.error) + '</td></tr>';
+                });
+                failedHtml = '<div style="background:#fef2f2;border:2px solid #dc2626;border-radius:10px;padding:16px;margin-bottom:20px;">'
+                    + '<h3 style="color:#dc2626;margin:0 0 10px;font-size:16px;">&#9888; ' + failedGroups.length + ' Serial' + (failedGroups.length !== 1 ? 's' : '') + ' FAILED</h3>'
+                    + '<table class="results-table" style="margin:0;"><thead><tr><th>Serial</th><th>Item</th><th>Action</th><th>Error</th></tr></thead>'
+                    + '<tbody>' + failedRowsHtml + '</tbody></table></div>';
+            }
+
             let groupsHtml = '';
             labelGroups.forEach(group => {
                 const serialListHtml = group.serialNumbers.map(s => '<li>' + escapeXml(s) + '</li>').join('');
@@ -2051,6 +2107,9 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
             });
 
             const totalSerials = labelGroups.reduce((sum, g) => sum + g.serialNumbers.length, 0);
+            const hasErrors = failedGroups.length > 0;
+            const iconHtml = hasErrors ? '<div style="font-size:56px;color:#f59e0b;margin-bottom:12px;">&#9888;</div>' : '<div class="success-icon">&#10003;</div>';
+            const headingHtml = hasErrors ? '<h2 style="color:#92400e;">Partially Complete</h2>' : '<h2>Done!</h2>';
 
             let transactionInfoHtml = '';
             if (adjustmentTranId) transactionInfoHtml += '<p style="font-size:15px;margin:6px 0;color:#1a4971;"><strong>Inv. Adjustment:</strong> ' + escapeXml(String(adjustmentTranId)) + '</p>';
@@ -2066,15 +2125,16 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
                     <div class="main-card">
                         <div class="form-body">
                             <div class="success-card">
-                                <div class="success-icon">&#10003;</div>
-                                <h2>Done!</h2>
+                                ${iconHtml}
+                                ${headingHtml}
                                 ${transactionInfoHtml}
-                                <p style="color:#6b7280;margin-top:12px;">${totalSerials} serial${totalSerials !== 1 ? 's' : ''} processed</p>
+                                <p style="color:#6b7280;margin-top:12px;">${totalSerials} serial${totalSerials !== 1 ? 's' : ''} processed successfully</p>
+                                ${failedHtml}
                                 ${groupsHtml}
                             </div>
                         </div>
                         <div class="btn-area" style="flex-direction:column;">
-                            <button type="button" class="custom-btn btn-success" style="width:100%;" onclick="printLabels()">Print Labels (${totalSerials})</button>
+                            ${totalSerials > 0 ? '<button type="button" class="custom-btn btn-success" style="width:100%;" onclick="printLabels()">Print Labels (' + totalSerials + ')</button>' : ''}
                             <button type="button" class="custom-btn btn-outline" style="width:100%;" onclick="createAnother()">Process More</button>
                         </div>
                     </div>
@@ -2121,11 +2181,12 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
             context.response.writePage(form);
         }
 
-        function createNonSerializedMultiSuccessPage(context, adjustmentTranId, binTransferTranId, inventoryFoundTranId, processedItems, errors, transferOrderTranId) {
+        function createNonSerializedMultiSuccessPage(context, adjustmentTranId, binTransferTranId, inventoryFoundTranId, processedItems, errors, transferOrderTranId, failedItems) {
             const form = serverWidget.createForm({ title: 'Transactions Created' });
             const suiteletUrl = url.resolveScript({ scriptId: runtime.getCurrentScript().id, deploymentId: runtime.getCurrentScript().deploymentId, returnExternalUrl: true });
             const printData = processedItems.map(function(item) { return { itemText: item.itemText || '', description: item.description || '', quantity: item.quantity }; });
             const recordIdForPrint = adjustmentTranId || binTransferTranId || inventoryFoundTranId || transferOrderTranId || '';
+            failedItems = failedItems || [];
 
             const styleField = form.addField({ id: 'custpage_styles', type: serverWidget.FieldType.INLINEHTML, label: ' ' });
             styleField.defaultValue = getStyles() + getSuccessPageScript(suiteletUrl);
@@ -2145,24 +2206,44 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
             let itemRows = '', totalQty = 0;
             processedItems.forEach(function(item) {
                 totalQty += item.quantity;
-                itemRows += '<tr><td data-label="Item"><strong>' + escapeXml(item.itemText) + '</strong></td><td data-label="Qty">' + item.quantity + '</td><td data-label="Action">' + escapeXml(ACTION_LABELS[item.action] || item.action) + '</td></tr>';
+                itemRows += '<tr style="background:#f0fdf4;"><td data-label="Item"><strong style="color:#166534;">' + escapeXml(item.itemText) + '</strong></td><td data-label="Qty">' + item.quantity + '</td><td data-label="Action">' + escapeXml(ACTION_LABELS[item.action] || item.action) + '</td><td data-label="Status" style="color:#059669;font-weight:700;">&#10003; OK</td></tr>';
             });
 
-            let errorsHtml = '';
-            if (errors && errors.length > 0) errorsHtml = '<div class="alert alert-warning"><strong>Warnings:</strong> ' + escapeXml(errors.join('; ')) + '</div>';
+            // Failed items in red
+            let failedHtml = '';
+            if (failedItems.length > 0) {
+                let failedRowsHtml = '';
+                failedItems.forEach(function(item) {
+                    failedRowsHtml += '<tr style="background:#fef2f2;"><td data-label="Item" style="color:#991b1b;font-weight:700;">' + escapeXml(item.itemText) + '</td>'
+                        + '<td data-label="Qty" style="color:#991b1b;">' + item.quantity + '</td>'
+                        + '<td data-label="Action" style="color:#991b1b;">' + escapeXml(ACTION_LABELS[item.action] || item.action) + '</td>'
+                        + '<td data-label="Error" style="color:#dc2626;font-weight:700;">' + escapeXml(item.error) + '</td></tr>';
+                });
+                failedHtml = '<div style="background:#fef2f2;border:2px solid #dc2626;border-radius:10px;padding:16px;margin:20px 0;text-align:left;">'
+                    + '<h3 style="color:#dc2626;margin:0 0 10px;font-size:16px;">&#9888; ' + failedItems.length + ' Row' + (failedItems.length !== 1 ? 's' : '') + ' FAILED — Needs Attention</h3>'
+                    + '<table class="results-table" style="margin:0;"><thead><tr><th>Item</th><th>Qty</th><th>Action</th><th>Error</th></tr></thead>'
+                    + '<tbody>' + failedRowsHtml + '</tbody></table></div>';
+            }
+
+            const hasErrors = failedItems.length > 0;
+            const iconHtml = hasErrors ? '<div style="font-size:56px;color:#f59e0b;margin-bottom:12px;">&#9888;</div>' : '<div class="success-icon">&#10003;</div>';
+            const headingHtml = hasErrors ? '<h2 style="color:#92400e;">Partially Complete</h2>' : '<h2>Done!</h2>';
 
             const contentField = form.addField({ id: 'custpage_content', type: serverWidget.FieldType.INLINEHTML, label: ' ' });
             contentField.defaultValue = `
-                <div class="app-container">${errorsHtml}<div class="main-card"><div class="form-body"><div class="success-card">
-                    <div class="success-icon">&#10003;</div><h2>Done!</h2>${transactionInfoHtml}
-                    <p style="color:#6b7280;margin-top:12px;">${processedItems.length} item${processedItems.length !== 1 ? 's' : ''} (${totalQty} total qty)</p>
+                <div class="app-container"><div class="main-card"><div class="form-body"><div class="success-card">
+                    ${iconHtml}
+                    ${headingHtml}
+                    ${transactionInfoHtml}
+                    <p style="color:#6b7280;margin-top:12px;">${processedItems.length} item${processedItems.length !== 1 ? 's' : ''} (${totalQty} total qty) processed successfully</p>
+                    ${failedHtml}
                     <table class="results-table" style="margin-top:20px;text-align:left;">
-                        <thead><tr><th>Item</th><th>Qty</th><th>Action</th></tr></thead>
+                        <thead><tr><th>Item</th><th>Qty</th><th>Action</th><th>Status</th></tr></thead>
                         <tbody>${itemRows}</tbody>
                     </table>
                 </div></div>
                 <div class="btn-area" style="flex-direction:column;">
-                    <button type="button" class="custom-btn btn-success" style="width:100%;" onclick="printLabels()">Print Labels (${totalQty})</button>
+                    ${totalQty > 0 ? '<button type="button" class="custom-btn btn-success" style="width:100%;" onclick="printLabels()">Print Labels (' + totalQty + ')</button>' : ''}
                     <button type="button" class="custom-btn btn-outline" style="width:100%;" onclick="createAnother()">Process More</button>
                 </div></div></div>
             `;
@@ -2282,76 +2363,96 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
             let adjustmentTranId = null, binTransferTranId = null, serialChangeTranId = null, partNumberChangeTranId = null, inventoryFoundTranId = null, transferOrderTranId = null;
             const labelGroups = [];
 
+            const failedGroups = [];
+
             if (adjustmentGroups.length > 0) {
-                try {
-                    const r = createConditionChangeAdjustment(adjustmentGroups, 'Created via WH Assistant');
-                    adjustmentTranId = r.tranId;
-                    adjustmentGroups.forEach(g => {
-                        let ex = labelGroups.find(lg => lg.itemId === g.targetItemId && lg.action === g.action);
-                        if (!ex) { ex = { itemId: g.targetItemId, itemText: g.targetDisplayName || g.targetItemName, description: g.targetDescription, action: g.action, serialNumbers: [] }; labelGroups.push(ex); }
-                        g.serials.forEach(s => ex.serialNumbers.push(s.serialNumber));
-                    });
-                } catch (e) { log.error('Adjustment Error', e.message); createResultsPage(context, serialData, 'Adjustment failed: ' + e.message, 'error'); return; }
+                const result = tryBatchThenIndividual(adjustmentGroups, createConditionChangeAdjustment, 'Created via WH Assistant');
+                if (result.tranIds.length > 0) adjustmentTranId = result.tranIds.join(', ');
+                result.succeeded.forEach(g => {
+                    let ex = labelGroups.find(lg => lg.itemId === g.targetItemId && lg.action === g.action);
+                    if (!ex) { ex = { itemId: g.targetItemId, itemText: g.targetDisplayName || g.targetItemName, description: g.targetDescription, action: g.action, serialNumbers: [] }; labelGroups.push(ex); }
+                    g.serials.forEach(s => ex.serialNumbers.push(s.serialNumber));
+                });
+                result.failed.forEach(g => {
+                    g.serials.forEach(s => { failedGroups.push({ serialNumber: s.serialNumber, itemText: g.targetDisplayName || g.targetItemName, action: g.action, error: g._error || 'Adjustment failed' }); });
+                });
+                if (result.failed.length > 0) errors.push(result.failed.length + ' adjustment group(s) failed');
             }
             if (binTransferGroups.length > 0) {
-                try {
-                    const r = createBinTransfer(binTransferGroups, 'Via WH Assistant');
-                    binTransferTranId = r.tranId;
-                    binTransferGroups.forEach(g => {
-                        let ex = labelGroups.find(lg => lg.itemId === g.itemId && lg.action === g.action);
-                        if (!ex) { ex = { itemId: g.itemId, itemText: g.itemText, description: g.itemDescription, action: g.action, serialNumbers: [] }; labelGroups.push(ex); }
-                        g.serials.forEach(s => ex.serialNumbers.push(s.serialNumber));
-                    });
-                } catch (e) { log.error('Bin Transfer Error', e.message); createResultsPage(context, serialData, 'Bin transfer failed: ' + e.message, 'error'); return; }
+                const result = tryBatchThenIndividual(binTransferGroups, createBinTransfer, 'Via WH Assistant');
+                if (result.tranIds.length > 0) binTransferTranId = result.tranIds.join(', ');
+                result.succeeded.forEach(g => {
+                    let ex = labelGroups.find(lg => lg.itemId === g.itemId && lg.action === g.action);
+                    if (!ex) { ex = { itemId: g.itemId, itemText: g.itemText, description: g.itemDescription, action: g.action, serialNumbers: [] }; labelGroups.push(ex); }
+                    g.serials.forEach(s => ex.serialNumbers.push(s.serialNumber));
+                });
+                result.failed.forEach(g => {
+                    g.serials.forEach(s => { failedGroups.push({ serialNumber: s.serialNumber, itemText: g.itemText, action: g.action, error: g._error || 'Bin transfer failed' }); });
+                });
+                if (result.failed.length > 0) errors.push(result.failed.length + ' bin transfer group(s) failed');
             }
             if (serialChangeList.length > 0) {
-                try {
-                    const r = createSerialNumberChangeAdjustment(serialChangeList, 'Serial Change via WH Assistant');
-                    serialChangeTranId = r.tranId;
-                    serialChangeList.forEach(c => {
-                        let ex = labelGroups.find(lg => lg.itemId === c.itemId && lg.action === c.action);
-                        if (!ex) { ex = { itemId: c.itemId, itemText: c.itemText, description: c.itemDescription, action: c.action, serialNumbers: [] }; labelGroups.push(ex); }
-                        ex.serialNumbers.push(c.newSerialNumber);
-                    });
-                } catch (e) { log.error('Serial Change Error', e.message); createResultsPage(context, serialData, 'Serial change failed: ' + e.message, 'error'); return; }
+                const result = tryBatchThenIndividual(serialChangeList, createSerialNumberChangeAdjustment, 'Serial Change via WH Assistant');
+                if (result.tranIds.length > 0) serialChangeTranId = result.tranIds.join(', ');
+                result.succeeded.forEach(c => {
+                    let ex = labelGroups.find(lg => lg.itemId === c.itemId && lg.action === c.action);
+                    if (!ex) { ex = { itemId: c.itemId, itemText: c.itemText, description: c.itemDescription, action: c.action, serialNumbers: [] }; labelGroups.push(ex); }
+                    ex.serialNumbers.push(c.newSerialNumber);
+                });
+                result.failed.forEach(c => {
+                    failedGroups.push({ serialNumber: c.oldSerialNumber, itemText: c.itemText, action: c.action, error: c._error || 'Serial change failed' });
+                });
+                if (result.failed.length > 0) errors.push(result.failed.length + ' serial change(s) failed');
             }
             if (partNumberChangeList.length > 0) {
-                try {
-                    const r = createPartNumberChangeAdjustment(partNumberChangeList, 'Part # Change via WH Assistant');
-                    partNumberChangeTranId = r.tranId;
-                    partNumberChangeList.forEach(c => {
-                        let ex = labelGroups.find(lg => lg.itemId === c.newItemId && lg.action === c.action);
-                        if (!ex) { ex = { itemId: c.newItemId, itemText: c.newItemText, description: c.newItemDescription, action: c.action, serialNumbers: [] }; labelGroups.push(ex); }
-                        ex.serialNumbers.push(c.serialNumber);
-                    });
-                } catch (e) { log.error('Part Number Change Error', e.message); createResultsPage(context, serialData, 'Part number change failed: ' + e.message, 'error'); return; }
+                const result = tryBatchThenIndividual(partNumberChangeList, createPartNumberChangeAdjustment, 'Part # Change via WH Assistant');
+                if (result.tranIds.length > 0) partNumberChangeTranId = result.tranIds.join(', ');
+                result.succeeded.forEach(c => {
+                    let ex = labelGroups.find(lg => lg.itemId === c.newItemId && lg.action === c.action);
+                    if (!ex) { ex = { itemId: c.newItemId, itemText: c.newItemText, description: c.newItemDescription, action: c.action, serialNumbers: [] }; labelGroups.push(ex); }
+                    ex.serialNumbers.push(c.serialNumber);
+                });
+                result.failed.forEach(c => {
+                    failedGroups.push({ serialNumber: c.serialNumber, itemText: c.oldItemText || c.newItemText, action: c.action, error: c._error || 'Part # change failed' });
+                });
+                if (result.failed.length > 0) errors.push(result.failed.length + ' part # change(s) failed');
             }
             if (inventoryFoundGroups.length > 0) {
-                try {
-                    const r = createInventoryFoundAdjustment(inventoryFoundGroups, 'Inv Found via WH Assistant');
-                    inventoryFoundTranId = r.tranId;
-                    inventoryFoundGroups.forEach(g => {
-                        let ex = labelGroups.find(lg => lg.itemId === g.itemId && lg.action === g.action);
-                        if (!ex) { ex = { itemId: g.itemId, itemText: g.itemText, description: g.itemDescription, action: g.action, serialNumbers: [] }; labelGroups.push(ex); }
-                        g.serials.forEach(s => ex.serialNumbers.push(s.serialNumber));
-                    });
-                } catch (e) { log.error('Inventory Found Error', e.message); createResultsPage(context, serialData, 'Inventory found failed: ' + e.message, 'error'); return; }
+                const result = tryBatchThenIndividual(inventoryFoundGroups, createInventoryFoundAdjustment, 'Inv Found via WH Assistant');
+                if (result.tranIds.length > 0) inventoryFoundTranId = result.tranIds.join(', ');
+                result.succeeded.forEach(g => {
+                    let ex = labelGroups.find(lg => lg.itemId === g.itemId && lg.action === g.action);
+                    if (!ex) { ex = { itemId: g.itemId, itemText: g.itemText, description: g.itemDescription, action: g.action, serialNumbers: [] }; labelGroups.push(ex); }
+                    g.serials.forEach(s => ex.serialNumbers.push(s.serialNumber));
+                });
+                result.failed.forEach(g => {
+                    g.serials.forEach(s => { failedGroups.push({ serialNumber: s.serialNumber, itemText: g.itemText, action: g.action, error: g._error || 'Inventory found failed' }); });
+                });
+                if (result.failed.length > 0) errors.push(result.failed.length + ' inventory found group(s) failed');
             }
             if (transferUpchargeGroups.length > 0) {
-                try {
-                    const toTranIds = [];
-                    transferUpchargeGroups.forEach(g => {
+                const toTranIds = [];
+                transferUpchargeGroups.forEach(g => {
+                    try {
                         const r = createTransferOrderWithUpcharge({ itemId: g.itemId, itemText: g.itemText, serials: g.serials, upchargePerUnit: g.upchargePerUnit, memo: 'Xfer & Upcharge via WH Asst' });
                         toTranIds.push(r.transferOrderTranId);
                         let ex = labelGroups.find(lg => lg.itemId === g.itemId && lg.action === g.action);
                         if (!ex) { ex = { itemId: g.itemId, itemText: g.itemText, description: g.itemDescription, action: g.action, serialNumbers: [] }; labelGroups.push(ex); }
                         g.serials.forEach(s => ex.serialNumbers.push(s.serialNumber));
-                    });
-                    transferOrderTranId = toTranIds.join(', ');
-                } catch (e) { log.error('Transfer Order Error', e.message); createResultsPage(context, serialData, 'Transfer order failed: ' + e.message, 'error'); return; }
+                    } catch (e) {
+                        log.error('Transfer Order Error', e.message);
+                        g.serials.forEach(s => { failedGroups.push({ serialNumber: s.serialNumber, itemText: g.itemText, action: g.action, error: e.message }); });
+                        errors.push('Transfer order failed for ' + g.itemText + ': ' + e.message);
+                    }
+                });
+                if (toTranIds.length > 0) transferOrderTranId = toTranIds.join(', ');
             }
 
-            createSuccessPage(context, adjustmentTranId, binTransferTranId, labelGroups, serialChangeTranId, inventoryFoundTranId, partNumberChangeTranId, transferOrderTranId);
+            if (labelGroups.length === 0 && failedGroups.length > 0) {
+                createResultsPage(context, serialData, 'All operations failed: ' + errors.join('; '), 'error'); return;
+            }
+
+            createSuccessPage(context, adjustmentTranId, binTransferTranId, labelGroups, serialChangeTranId, inventoryFoundTranId, partNumberChangeTranId, transferOrderTranId, errors, failedGroups);
         }
 
         function handleProcessInventoryFound(context) {
@@ -2479,42 +2580,47 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/log', 'N/url', 'N/runtim
 
             let adjustmentTranId = null, binTransferTranId = null, inventoryFoundTranId = null, transferOrderTranId = null;
             const processedItems = [];
+            const failedItems = [];
 
             if (adjustmentRows.length > 0) {
-                try {
-                    const r = createNonSerializedAdjustmentMulti(adjustmentRows, 'Created via WH Assistant');
-                    adjustmentTranId = r.tranId;
-                    adjustmentRows.forEach(function(row) { processedItems.push({ itemText: row.targetDisplayName || row.targetItemName, description: row.targetDescription, quantity: row.quantity, action: row.action }); });
-                } catch (e) { log.error('NS Multi Adjustment Error', e.message); errors.push('Adjustment failed: ' + e.message); }
+                const result = tryBatchThenIndividual(adjustmentRows, createNonSerializedAdjustmentMulti, 'Created via WH Assistant');
+                if (result.tranIds.length > 0) adjustmentTranId = result.tranIds.join(', ');
+                result.succeeded.forEach(function(row) { processedItems.push({ itemText: row.targetDisplayName || row.targetItemName, description: row.targetDescription, quantity: row.quantity, action: row.action }); });
+                result.failed.forEach(function(row) { failedItems.push({ itemText: row.targetDisplayName || row.targetItemName || row.sourceItemName, description: row.targetDescription, quantity: row.quantity, action: row.action, error: row._error || 'Adjustment failed' }); });
+                if (result.failed.length > 0) errors.push(result.failed.length + ' adjustment row(s) failed');
             }
             if (binTransferRows.length > 0) {
-                try {
-                    const r = createNonSerializedBinTransferMulti(binTransferRows, 'Via WH Assistant');
-                    binTransferTranId = r.tranId;
-                    binTransferRows.forEach(function(row) { processedItems.push({ itemText: row.itemText, description: row.description, quantity: row.quantity, action: row.action }); });
-                } catch (e) { log.error('NS Multi Bin Transfer Error', e.message); errors.push('Bin transfer failed: ' + e.message); }
+                const result = tryBatchThenIndividual(binTransferRows, createNonSerializedBinTransferMulti, 'Via WH Assistant');
+                if (result.tranIds.length > 0) binTransferTranId = result.tranIds.join(', ');
+                result.succeeded.forEach(function(row) { processedItems.push({ itemText: row.itemText, description: row.description, quantity: row.quantity, action: row.action }); });
+                result.failed.forEach(function(row) { failedItems.push({ itemText: row.itemText, description: row.description, quantity: row.quantity, action: row.action, error: row._error || 'Bin transfer failed' }); });
+                if (result.failed.length > 0) errors.push(result.failed.length + ' bin transfer row(s) failed');
             }
             if (inventoryFoundRows.length > 0) {
-                try {
-                    const r = createNonSerializedInventoryFoundMulti(inventoryFoundRows, 'Inv Found via WH Assistant');
-                    inventoryFoundTranId = r.tranId;
-                    inventoryFoundRows.forEach(function(row) { processedItems.push({ itemText: row.itemText, description: row.description, quantity: row.quantity, action: row.action }); });
-                } catch (e) { log.error('NS Multi Inv Found Error', e.message); errors.push('Inventory found failed: ' + e.message); }
+                const result = tryBatchThenIndividual(inventoryFoundRows, createNonSerializedInventoryFoundMulti, 'Inv Found via WH Assistant');
+                if (result.tranIds.length > 0) inventoryFoundTranId = result.tranIds.join(', ');
+                result.succeeded.forEach(function(row) { processedItems.push({ itemText: row.itemText, description: row.description, quantity: row.quantity, action: row.action }); });
+                result.failed.forEach(function(row) { failedItems.push({ itemText: row.itemText, description: row.description, quantity: row.quantity, action: row.action, error: row._error || 'Inventory found failed' }); });
+                if (result.failed.length > 0) errors.push(result.failed.length + ' inventory found row(s) failed');
             }
             if (transferUpchargeRows.length > 0) {
-                try {
-                    const toTranIds = [];
-                    transferUpchargeRows.forEach(function(row) {
+                const toTranIds = [];
+                transferUpchargeRows.forEach(function(row) {
+                    try {
                         const r = createTransferOrderWithUpcharge({ itemId: row.itemId, itemText: row.itemText, serials: [], quantity: row.quantity, upchargePerUnit: row.upcharge, memo: 'Xfer & Upcharge via WH Asst' });
                         toTranIds.push(r.transferOrderTranId);
                         processedItems.push({ itemText: row.itemText, description: row.description, quantity: row.quantity, action: row.action });
-                    });
-                    transferOrderTranId = toTranIds.join(', ');
-                } catch (e) { log.error('NS Multi Transfer Error', e.message); errors.push('Transfer order failed: ' + e.message); }
+                    } catch (e) {
+                        log.error('NS Transfer Error', e.message);
+                        failedItems.push({ itemText: row.itemText, description: row.description, quantity: row.quantity, action: row.action, error: e.message });
+                        errors.push('Transfer failed for ' + row.itemText + ': ' + e.message);
+                    }
+                });
+                if (toTranIds.length > 0) transferOrderTranId = toTranIds.join(', ');
             }
 
-            if (processedItems.length === 0) { createEntryForm(context, 'All operations failed: ' + errors.join('; '), 'error'); return; }
-            createNonSerializedMultiSuccessPage(context, adjustmentTranId, binTransferTranId, inventoryFoundTranId, processedItems, errors, transferOrderTranId);
+            if (processedItems.length === 0 && failedItems.length > 0) { createEntryForm(context, 'All operations failed: ' + errors.join('; '), 'error'); return; }
+            createNonSerializedMultiSuccessPage(context, adjustmentTranId, binTransferTranId, inventoryFoundTranId, processedItems, errors, transferOrderTranId, failedItems);
         }
 
         function handleBinPutaway(context) {

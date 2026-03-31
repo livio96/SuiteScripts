@@ -2,7 +2,6 @@
  * SS_ShipStation_TrackingSync.js
  *
  * Scheduled Script — ShipStation Tracking & Cost Sync (API v2)
- * Currently in TEST MODE: runs against a single hardcoded internal ID
  *
  * Match strategy (external_shipment_id against):
  *   1. custbody_celigo_etail_order_id  (marketplace orders)
@@ -18,65 +17,47 @@ define(['N/search', 'N/record', 'N/https', 'N/runtime', 'N/log'],
 
     const SHIPSTATION_BASE = 'https://api.shipstation.com';
     const API_KEY          = '';
-    const LOOKBACK_HOURS = 4;
+    const LOOKBACK_HOURS = 1;
 
     const FIELDS = {
         celigoOrderId:  'custbody_celigo_etail_order_id',
-        trackingNumber: 'custbody_pacejet_if_carrier_tracking',
         shippingCost:   'custbody_pacejet_freight_costcurrency',
         synced:         'custbody_shipstation_synced'
     };
 
     const execute = (context) => {
-        log.audit('Step 1', 'Fetching shipments from ShipStation v2...');
-        const ssMap = buildShipStationMap();
-        log.audit('ShipStation Map Built', 'Total shipments with external_shipment_id: ' + Object.keys(ssMap).length);
+        const { map: ssMap, externalIds } = buildShipStationMap();
 
-        if (Object.keys(ssMap).length === 0) {
-            log.audit('Abort', 'No ShipStation shipments returned. Exiting.');
-            return;
-        }
+        if (Object.keys(ssMap).length === 0) return;
 
-        log.audit('Step 2', 'Fetching NetSuite orders...');
         const orders = getOrders();
-        log.audit('Orders Found', orders.length + ' orders to process');
-
-        let successCount = 0;
-        let failCount    = 0;
+        const allUpdatedFulfillments = [];
 
         for (const order of orders) {
-            if (runtime.getCurrentScript().getRemainingUsage() < 100) {
-                log.audit('Governance Limit', 'Stopping early.');
-                break;
-            }
+            if (runtime.getCurrentScript().getRemainingUsage() < 100) break;
             try {
-                if (syncOrder(order, ssMap)) successCount++;
-                else failCount++;
-            } catch (e) {
-                failCount++;
-                log.error('Error on SO ' + order.id, e.message || JSON.stringify(e));
-            }
+                const updatedFFs = syncOrder(order, ssMap);
+                allUpdatedFulfillments.push(...updatedFFs);
+            } catch (e) {}
         }
 
-        log.audit('Sync Complete', 'Success: ' + successCount + ' | Failed/Skipped: ' + failCount);
+        log.audit('ShipStation Sync', 'External Shipment IDs: ' + externalIds.join(', ') + ' | Updated Fulfillments: ' + allUpdatedFulfillments.join(', '));
     };
 
     const buildShipStationMap = () => {
         const map = {};
+        const externalIds = [];
         const cutoff = new Date();
         cutoff.setHours(cutoff.getHours() - LOOKBACK_HOURS);
-        const createdAtStart = cutoff.toISOString();
+        const modifiedAtStart = cutoff.toISOString();
 
         let page = 1;
         let totalPages = 1;
 
         while (page <= totalPages) {
-            if (runtime.getCurrentScript().getRemainingUsage() < 200) {
-                log.audit('Governance Limit', 'Stopping ShipStation fetch early.');
-                break;
-            }
+            if (runtime.getCurrentScript().getRemainingUsage() < 200) break;
 
-            const url = SHIPSTATION_BASE + '/v2/shipments?created_at_start=' + encodeURIComponent(createdAtStart) + '&shipment_status=label_purchased&page_size=100&page=' + page + '&sort_by=created_at&sort_dir=desc';
+            const url = SHIPSTATION_BASE + '/v2/shipments?modified_at_start=' + encodeURIComponent(modifiedAtStart) + '&shipment_status=label_purchased&page_size=100&page=' + page + '&sort_by=modified_at&sort_dir=desc';
 
             let response;
             try {
@@ -85,46 +66,35 @@ define(['N/search', 'N/record', 'N/https', 'N/runtime', 'N/log'],
                     headers: { 'API-Key': API_KEY, 'Content-Type': 'application/json' }
                 });
             } catch (e) {
-                log.error('ShipStation HTTP Error', e.message);
                 break;
             }
 
-            if (response.code !== 200) {
-                log.error('ShipStation Non-200', 'HTTP ' + response.code + ' | ' + response.body);
-                break;
-            }
+            if (response.code !== 200) break;
 
             let parsed;
             try {
                 parsed = JSON.parse(response.body);
             } catch (e) {
-                log.error('ShipStation Parse Error', response.body);
                 break;
             }
 
             totalPages = parsed.pages || 1;
             const shipments = parsed.shipments || [];
-            log.audit('SS Page ' + page + '/' + totalPages, shipments.length + ' shipments received');
 
             for (const s of shipments) {
-                log.audit('SS Shipment', 'shipment_id=' + s.shipment_id +
-                    ' | status=' + (s.shipment_status || '') +
-                    ' | external_id=' + (s.external_shipment_id || '') +
-                    ' | tracking=' + (s.tracking_number || '') +
-                    ' | carrier=' + (s.carrier_id || '') +
-                    ' | service=' + (s.service_code || '') +
-                    ' | ship_date=' + (s.ship_date || '') +
-                    ' | created=' + (s.created_at || ''));
                 const extId = (s.external_shipment_id || '').trim();
                 if (extId) {
+                    externalIds.push(extId);
                     map[extId.toLowerCase()] = s;
                 }
+                const shipNum = (s.shipment_number || '').trim();
+                if (shipNum) map[shipNum.toLowerCase()] = s;
             }
 
             page++;
         }
 
-        return map;
+        return { map, externalIds };
     };
 
     const fetchLabel = (shipmentId) => {
@@ -137,20 +107,15 @@ define(['N/search', 'N/record', 'N/https', 'N/runtime', 'N/log'],
                 headers: { 'API-Key': API_KEY, 'Content-Type': 'application/json' }
             });
         } catch (e) {
-            log.error('Label HTTP Error', 'shipment_id=' + shipmentId + ' | ' + e.message);
             return null;
         }
 
-        if (response.code !== 200) {
-            log.error('Label Non-200', 'shipment_id=' + shipmentId + ' | HTTP ' + response.code);
-            return null;
-        }
+        if (response.code !== 200) return null;
 
         let parsed;
         try {
             parsed = JSON.parse(response.body);
         } catch (e) {
-            log.error('Label Parse Error', response.body);
             return null;
         }
 
@@ -158,8 +123,6 @@ define(['N/search', 'N/record', 'N/https', 'N/runtime', 'N/log'],
         if (labels.length === 0) return null;
 
         const label = labels[0];
-        log.audit('Label Found', 'tracking="' + (label.tracking_number || 'NULL') + '" | cost="' + (label.shipment_cost ? JSON.stringify(label.shipment_cost) : 'NULL') + '"');
-
         return {
             trackingNumber: label.tracking_number || '',
             shippingCost:   label.shipment_cost && label.shipment_cost.amount ? label.shipment_cost.amount : 0
@@ -234,56 +197,35 @@ define(['N/search', 'N/record', 'N/https', 'N/runtime', 'N/log'],
         const tranid        = order.tranid;
         const celigoOrderId = order.celigoOrderId;
 
-        log.audit('Processing SO ' + id, 'tranid="' + tranid + '" | celigoOrderId="' + (celigoOrderId || 'none') + '" | internalId="' + id + '"');
-
         let shipment  = null;
-        let matchedBy = null;
 
-        // Attempt 1: external_shipment_id vs celigoOrderId (marketplace orders)
-        if (celigoOrderId) {
-            shipment = ssMap[celigoOrderId.toLowerCase()];
-            if (shipment) matchedBy = 'celigoOrderId="' + celigoOrderId + '"';
-        }
+        if (celigoOrderId) shipment = ssMap[celigoOrderId.toLowerCase()];
+        if (!shipment) shipment = ssMap[String(id)];
+        if (!shipment && tranid) shipment = ssMap[tranid.toLowerCase()];
 
-        // Attempt 2: external_shipment_id vs NetSuite internal ID (custom store orders)
-        if (!shipment) {
-            shipment = ssMap[String(id)];
-            if (shipment) matchedBy = 'internalId="' + id + '"';
-        }
-
-        // Attempt 3: external_shipment_id vs tranid (fallback)
-        if (!shipment && tranid) {
-            shipment = ssMap[tranid.toLowerCase()];
-            if (shipment) matchedBy = 'tranid="' + tranid + '"';
-        }
-
-        if (!shipment) {
-            log.audit('No Match — SO ' + id,
-                'Tried celigoOrderId="' + (celigoOrderId || 'none') + '"' +
-                ' | internalId="' + id + '"' +
-                ' | tranid="' + tranid + '"' +
-                ' against ' + Object.keys(ssMap).length + ' SS external_shipment_ids'
-            );
-            return false;
-        }
-
-        log.audit('Shipment Matched — SO ' + id, 'Matched by ' + matchedBy + ' | SS shipment_id="' + shipment.shipment_id + '"');
+        if (!shipment) return [];
 
         const labelData      = fetchLabel(shipment.shipment_id);
         const trackingNumber = labelData ? labelData.trackingNumber : '';
         const shippingCost   = labelData ? labelData.shippingCost   : 0;
 
-        if (!trackingNumber || !shippingCost) {
-            log.audit('Skipping SO ' + id, 'Missing tracking or cost — tracking="' + trackingNumber + '" | cost=' + shippingCost);
-            return false;
-        }
+        if (!trackingNumber || shippingCost === '' || shippingCost === null || shippingCost === undefined) return [];
 
-        // Update fulfillments — set status to Shipped (C), tracking, and cost
+        record.submitFields({
+            type: record.Type.SALES_ORDER,
+            id: id,
+            values: {
+                [FIELDS.shippingCost]: shippingCost,
+                [FIELDS.synced]: true,
+                'custbody_ship_station_tracking_number': trackingNumber
+            },
+            options: { ignoreMandatoryFields: true }
+        });
+
         const fulfillments = getFulfillments(id);
-        log.audit('Fulfillments Found — SO ' + id, fulfillments.length + ' fulfillment(s)');
+        const updatedIFs = [];
 
         for (const ff of fulfillments) {
-            log.audit('Updating IF ' + ff.id, 'tranid="' + ff.tranid + '" | current status="' + ff.status + '"');
             try {
                 const ifRec = record.load({
                     type: record.Type.ITEM_FULFILLMENT,
@@ -291,34 +233,23 @@ define(['N/search', 'N/record', 'N/https', 'N/runtime', 'N/log'],
                     isDynamic: false
                 });
 
-                ifRec.setValue({ fieldId: 'shipstatus', value: 'C' }); // Shipped
-                ifRec.setValue({ fieldId: 'custbody_pacejet_master_tracking_num', value: trackingNumber });
+                ifRec.setValue({ fieldId: 'shipstatus', value: 'C' });
                 ifRec.setValue({ fieldId: 'custbody_pacejet_freight_costcurrency', value: shippingCost });
                 ifRec.setValue({ fieldId: 'custbody_ship_station_tracking_number', value: trackingNumber });
+                ifRec.setValue({ fieldId: 'custbody_pacejet_master_tracking_num', value: trackingNumber });
 
-                const savedId = ifRec.save({ ignoreMandatoryFields: true });
-                log.audit('IF Updated ' + savedId, 'Status=Shipped | Tracking=' + trackingNumber + ' | Cost=$' + shippingCost);
-            } catch (e) {
-                log.error('IF Update Error ' + ff.id, e.message || JSON.stringify(e));
-            }
+                var etailChannel = ifRec.getValue({ fieldId: 'custbody_celigo_etail_channel' });
+                if (String(etailChannel) === '308' && shippingCost > 0) {
+                    var markedUpCost = Math.round(shippingCost * 1.2 * 100) / 100;
+                    ifRec.setValue({ fieldId: 'shippingcost', value: markedUpCost });
+                }
+
+                ifRec.save({ ignoreMandatoryFields: true });
+                updatedIFs.push(ff.tranid);
+            } catch (e) {}
         }
 
-        // Update sales order fields
-        const soRec = record.load({
-            type: record.Type.SALES_ORDER,
-            id: id,
-            isDynamic: false
-        });
-
-        soRec.setValue({ fieldId: FIELDS.trackingNumber, value: trackingNumber });
-        soRec.setValue({ fieldId: FIELDS.shippingCost, value: shippingCost });
-        soRec.setValue({ fieldId: FIELDS.synced, value: true });
-        soRec.setValue({ fieldId: 'custbody_ship_station_tracking_number', value: trackingNumber });
-
-        soRec.save({ ignoreMandatoryFields: true });
-
-        log.audit('Synced SO ' + id, 'Tracking: ' + trackingNumber + ' | Cost: $' + shippingCost + ' | Fulfillments updated: ' + fulfillments.length);
-        return true;
+        return updatedIFs;
     };
 
     return { execute };

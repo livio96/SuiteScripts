@@ -5922,6 +5922,9 @@ tr:hover td { background:var(--surface-hover); }
 .sopick-line-input input[type="number"] { max-width:140px; }
 .sopick-line-input select { max-width:280px; }
 .sopick-serial-count { font-size:11px; color:var(--text-dim); margin-top:4px; }
+.sopick-serial-count.has-dupe { color:#dc2626; font-weight:600; }
+.sopick-line-input textarea.has-dupe, .sopick-kit-component textarea.has-dupe { border-color:#dc2626 !important; box-shadow:0 0 0 3px rgba(220,38,38,.35); }
+.sopick-line-input textarea.dupe-shake, .sopick-kit-component textarea.dupe-shake { animation:porcvShake .45s ease; }
 .sopick-bin-row { display:flex; gap:10px; align-items:end; flex-wrap:wrap; margin-top:8px; }
 .sopick-bin-row .form-group { margin:0; flex:1; min-width:120px; }
 .sopick-kit-components { display:flex; flex-direction:column; gap:12px; margin-top:4px; }
@@ -8243,8 +8246,32 @@ function sopickRenderLine(line, idx) {
 
 function sopickUpdateCompSerialCount(idx, cidx, max) {
     const ta = document.getElementById('sopick-comp-serials-' + idx + '-' + cidx);
-    const count = ta.value.split('\\n').map(s => s.trim()).filter(s => s !== '').length;
-    document.getElementById('sopick-comp-serial-count-' + idx + '-' + cidx).textContent = count + ' of ' + max + ' serials entered';
+    const countEl = document.getElementById('sopick-comp-serial-count-' + idx + '-' + cidx);
+    const serials = ta.value.split('\\n').map(s => s.trim()).filter(s => s !== '');
+
+    const seen = new Set();
+    const dupes = [];
+    const deduped = serials.filter(s => { if (seen.has(s)) { dupes.push(s); return false; } seen.add(s); return true; });
+
+    if (dupes.length > 0) {
+        ta.value = deduped.join('\\n') + (ta.value.endsWith('\\n') ? '\\n' : '');
+        porcvDing();
+        ta.classList.remove('dupe-shake');
+        void ta.offsetWidth;
+        ta.classList.add('dupe-shake');
+        countEl.textContent = '\u26A0 Duplicate rejected: ' + [...new Set(dupes)].join(', ');
+        countEl.classList.add('has-dupe');
+        ta.classList.add('has-dupe');
+        setTimeout(() => {
+            countEl.textContent = deduped.length + ' of ' + max + ' serials entered';
+            countEl.classList.remove('has-dupe');
+            ta.classList.remove('has-dupe');
+        }, 2500);
+    } else {
+        countEl.textContent = deduped.length + ' of ' + max + ' serials entered';
+        countEl.classList.remove('has-dupe');
+        ta.classList.remove('has-dupe');
+    }
 }
 
 function sopickToggleLine(idx) {
@@ -8255,8 +8282,32 @@ function sopickToggleLine(idx) {
 
 function sopickUpdateSerialCount(idx, max) {
     const ta = document.getElementById('sopick-serials-' + idx);
-    const count = ta.value.split('\\n').map(s => s.trim()).filter(s => s !== '').length;
-    document.getElementById('sopick-serial-count-' + idx).textContent = count + ' of ' + max + ' serials entered';
+    const countEl = document.getElementById('sopick-serial-count-' + idx);
+    const serials = ta.value.split('\\n').map(s => s.trim()).filter(s => s !== '');
+
+    const seen = new Set();
+    const dupes = [];
+    const deduped = serials.filter(s => { if (seen.has(s)) { dupes.push(s); return false; } seen.add(s); return true; });
+
+    if (dupes.length > 0) {
+        ta.value = deduped.join('\\n') + (ta.value.endsWith('\\n') ? '\\n' : '');
+        porcvDing();
+        ta.classList.remove('dupe-shake');
+        void ta.offsetWidth;
+        ta.classList.add('dupe-shake');
+        countEl.textContent = '\u26A0 Duplicate rejected: ' + [...new Set(dupes)].join(', ');
+        countEl.classList.add('has-dupe');
+        ta.classList.add('has-dupe');
+        setTimeout(() => {
+            countEl.textContent = deduped.length + ' of ' + max + ' serials entered';
+            countEl.classList.remove('has-dupe');
+            ta.classList.remove('has-dupe');
+        }, 2500);
+    } else {
+        countEl.textContent = deduped.length + ' of ' + max + ' serials entered';
+        countEl.classList.remove('has-dupe');
+        ta.classList.remove('has-dupe');
+    }
 }
 
 async function sopickRefreshBins(locationId) {

@@ -2264,6 +2264,7 @@ define([
                             else invDetail.selectNewLine({ sublistId: 'inventoryassignment' });
                             invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'receiptinventorynumber', value: s.serialNumber });
                             invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity', value: 1 });
+                            invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'inventorystatus', value: BACK_TO_STOCK_STATUS_ID });
                             invDetail.commitLine({ sublistId: 'inventoryassignment' });
                         });
                     }
@@ -5893,6 +5894,10 @@ tr:hover td { background:var(--surface-hover); }
 .porcv-line-input textarea { font-family:var(--mono); font-size:13px; width:100%; }
 .porcv-line-input input[type="number"] { max-width:140px; }
 .porcv-serial-count { font-size:11px; color:var(--text-dim); margin-top:4px; }
+.porcv-serial-count.has-dupe { color:#dc2626; font-weight:600; }
+.porcv-line-input textarea.has-dupe { border-color:#dc2626 !important; box-shadow:0 0 0 3px rgba(220,38,38,.35); }
+@keyframes porcvShake { 0%,100%{transform:translateX(0)} 15%{transform:translateX(-6px)} 30%{transform:translateX(6px)} 45%{transform:translateX(-5px)} 60%{transform:translateX(5px)} 75%{transform:translateX(-3px)} 90%{transform:translateX(3px)} }
+.porcv-line-input textarea.dupe-shake { animation:porcvShake .45s ease; }
 
 /* ─── SO PICKING LINE CARDS ─── */
 .sopick-line {
@@ -7957,10 +7962,52 @@ function porcvToggleLine(idx) {
     if (checked) el.classList.add('selected'); else el.classList.remove('selected');
 }
 
+function porcvDing() {
+    try {
+        const ctx = new (window.AudioContext || window.webkitAudioContext)();
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(880, ctx.currentTime);
+        osc.frequency.exponentialRampToValueAtTime(220, ctx.currentTime + 0.25);
+        gain.gain.setValueAtTime(0.6, ctx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.35);
+        osc.start(ctx.currentTime);
+        osc.stop(ctx.currentTime + 0.35);
+    } catch(e) {}
+}
+
 function porcvUpdateSerialCount(idx, max) {
     const ta = document.getElementById('porcv-serials-' + idx);
-    const count = ta.value.split('\\n').map(s => s.trim()).filter(s => s !== '').length;
-    document.getElementById('porcv-serial-count-' + idx).textContent = count + ' of ' + max + ' serials entered';
+    const countEl = document.getElementById('porcv-serial-count-' + idx);
+    const serials = ta.value.split('\\n').map(s => s.trim()).filter(s => s !== '');
+
+    const seen = new Set();
+    const dupes = [];
+    const deduped = serials.filter(s => { if (seen.has(s)) { dupes.push(s); return false; } seen.add(s); return true; });
+
+    if (dupes.length > 0) {
+        // Rewrite textarea without the duplicates, preserving cursor at end
+        ta.value = deduped.join('\\n') + (ta.value.endsWith('\\n') ? '\\n' : '');
+        porcvDing();
+        ta.classList.remove('dupe-shake');
+        void ta.offsetWidth;
+        ta.classList.add('dupe-shake');
+        countEl.textContent = '\u26A0 Duplicate rejected: ' + [...new Set(dupes)].join(', ');
+        countEl.classList.add('has-dupe');
+        ta.classList.add('has-dupe');
+        setTimeout(() => {
+            countEl.textContent = deduped.length + ' of ' + max + ' serials entered';
+            countEl.classList.remove('has-dupe');
+            ta.classList.remove('has-dupe');
+        }, 2500);
+    } else {
+        countEl.textContent = deduped.length + ' of ' + max + ' serials entered';
+        countEl.classList.remove('has-dupe');
+        ta.classList.remove('has-dupe');
+    }
 }
 
 async function porcvSubmit() {
@@ -7984,6 +8031,9 @@ async function porcvSubmit() {
             const ta = document.getElementById('porcv-serials-' + idx);
             const serialNumbers = ta.value.split('\\n').map(s => s.trim()).filter(s => s !== '');
             if (!serialNumbers.length) { toast('Enter serial numbers for ' + line.itemText + '.', 'error'); validationFailed = true; return; }
+            const dupeCheck = new Set();
+            const dupeFound = serialNumbers.find(s => { if (dupeCheck.has(s)) return true; dupeCheck.add(s); return false; });
+            if (dupeFound) { toast('Duplicate serial number "' + dupeFound + '" in ' + line.itemText + '. Remove duplicates before submitting.', 'error'); validationFailed = true; return; }
             if (serialNumbers.length > line.quantityRemaining) { toast('Serial count (' + serialNumbers.length + ') for ' + line.itemText + ' exceeds remaining (' + line.quantityRemaining + ').', 'error'); validationFailed = true; return; }
             selectedLines.push({ lineNum: line.lineNum, itemId: line.itemId, itemText: line.itemText, description: line.description, isSerialized: true, serialNumbers, quantity: serialNumbers.length });
         } else {

@@ -31,7 +31,7 @@ define([
         if (ajaxAction) {
             try {
                 if (ajaxAction === 'validate') {
-                    const result = plValidateSerialNumbers(context.request.parameters.serials);
+                    const result = plValidateSerialNumbers(context.request.parameters.serials, context.request.parameters.item || null);
                     context.response.setHeader({ name: 'Content-Type', value: 'application/json' });
                     context.response.write(JSON.stringify(result));
                     return;
@@ -140,6 +140,14 @@ define([
                     return respondJson(context, getStatusOptions());
                 case 'getStatusCodes':
                     return respondJson(context, getStatusCodeOptions());
+                case 'getPlateStats':
+                    return respondJson(context, getPlateStats());
+                case 'getEmployees':
+                    return respondJson(context, getEmployeeOptions());
+                case 'getStockCountItems':
+                    return respondJson(context, getStockCountItems(context.request.parameters));
+                case 'createStockCount':
+                    return respondJson(context, createStockCount(JSON.parse(context.request.body)));
                 case 'lookupPOSerials':
                     return respondJson(context, lookupPOSerials(context.request.parameters));
                 case 'createFromPO':
@@ -317,6 +325,20 @@ define([
             pageCount: pagedData.pageRanges.length,
             page
         };
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  PLATE STATS (accurate aggregate counts for dashboard)
+    // ═══════════════════════════════════════════════════════════
+    const getPlateStats = () => {
+        const baseFilter = [['isinactive', 'is', 'F']];
+        const total = search.create({ type: RECORD_TYPE, filters: baseFilter })
+            .runPaged({ pageSize: 1 }).count;
+        const active = search.create({
+            type: RECORD_TYPE,
+            filters: [...baseFilter, 'AND', ['custrecord_tq_license_plate_status', 'noneof', ['3']]]
+        }).runPaged({ pageSize: 1 }).count;
+        return { success: true, total, active };
     };
 
     // ═══════════════════════════════════════════════════════════
@@ -812,6 +834,112 @@ define([
             }
         }
         return { success: true, results };
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  EMPLOYEE OPTIONS
+    // ═══════════════════════════════════════════════════════════
+    const getEmployeeOptions = () => {
+        const results = [];
+        try {
+            search.create({
+                type: search.Type.EMPLOYEE,
+                filters: [['isinactive', 'is', 'F']],
+                columns: [search.createColumn({ name: 'entityid', sort: search.Sort.ASC })]
+            }).run().getRange({ start: 0, end: 200 }).forEach(r => {
+                results.push({ id: r.id, name: r.getValue('entityid') });
+            });
+        } catch (e) {
+            log.error('getEmployeeOptions Error', e.message);
+        }
+        return { success: true, results };
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  STOCK COUNT
+    // ═══════════════════════════════════════════════════════════
+    const getStockCountItems = (params) => {
+        const binId     = params.binId;
+        const locationId = params.locationId;
+        if (!binId || !locationId) return { success: false, message: 'Bin and location required.' };
+
+        const itemMap = {};
+
+        // Step 1: all items with inventory in this bin
+        try {
+            search.create({
+                type: 'inventorybalance',
+                filters: [
+                    ['location',   'anyof',        locationId],
+                    'AND',
+                    ['binnumber',  'anyof',         binId],
+                    'AND',
+                    ['onhand',     'greaterthan',   '0']
+                ],
+                columns: [
+                    search.createColumn({ name: 'item' }),
+                    search.createColumn({ name: 'onhand' })
+                ]
+            }).run().each(r => {
+                const id   = r.getValue({ name: 'item' });
+                const name = r.getText({ name: 'item' });
+                if (id && !itemMap[id]) {
+                    itemMap[id] = { itemId: id, itemName: name, serialized: false, serialNumbers: [] };
+                }
+                return true;
+            });
+        } catch (e) {
+            log.error('getStockCountItems inventorybalance', e.message);
+            return { success: false, message: 'Could not fetch bin inventory: ' + e.message };
+        }
+
+        if (Object.keys(itemMap).length === 0) return { success: true, results: [] };
+
+        // Step 2: serial numbers in this bin — marks which items are serialized
+        try {
+            search.create({
+                type: 'inventorynumber',
+                filters: [
+                    ['location',  'anyof', locationId],
+                    'AND',
+                    ['binnumber', 'anyof', binId]
+                ],
+                columns: [
+                    search.createColumn({ name: 'item' }),
+                    search.createColumn({ name: 'inventorynumber' })
+                ]
+            }).run().each(r => {
+                const id = r.getValue({ name: 'item' });
+                const sn = r.getValue({ name: 'inventorynumber' });
+                if (id && itemMap[id]) {
+                    itemMap[id].serialized = true;
+                    if (sn) itemMap[id].serialNumbers.push(sn);
+                }
+                return true;
+            });
+        } catch (e) {
+            log.error('getStockCountItems inventorynumber', e.message);
+        }
+
+        return { success: true, results: Object.values(itemMap) };
+    };
+
+    const createStockCount = (data) => {
+        try {
+            const rec = record.create({ type: 'customrecord_wh_stock_count', isDynamic: true });
+            if (data.locationId)  rec.setValue({ fieldId: 'custrecord_sc_location',     value: data.locationId });
+            if (data.binId)       rec.setValue({ fieldId: 'custrecord_sc_bin_id',        value: String(data.binId) });
+            if (data.binName)     rec.setValue({ fieldId: 'custrecord_sc_bin_name',      value: data.binName });
+            if (data.assignedTo)  rec.setValue({ fieldId: 'custrecord_sc_assigned_to',   value: data.assignedTo });
+            if (data.itemsJson)   rec.setValue({ fieldId: 'custrecordsc_items_json',     value: data.itemsJson });
+            rec.setValue({ fieldId: 'custrecord_sc_status', value: 'pending' });
+            const id = rec.save({ enableSourcing: true, ignoreMandatoryFields: false });
+            log.audit('Stock Count Created', 'ID: ' + id + ', Items: ' + (data.itemsJson ? JSON.parse(data.itemsJson).length : 0));
+            return { success: true, id, message: 'Stock count created successfully.' };
+        } catch (e) {
+            log.error('createStockCount Error', e.message);
+            return { success: false, message: e.message };
+        }
     };
 
     // ═══════════════════════════════════════════════════════════
@@ -4383,7 +4511,7 @@ define([
     //  PRINT LABEL DASHBOARD — Server-side code (embedded, pl-prefixed)
     // ═══════════════════════════════════════════════════════════════════
 
-        function plValidateSerialNumbers(serialNumbers) {
+        function plValidateSerialNumbers(serialNumbers, itemId) {
             if (!serialNumbers) return { valid: [], invalid: [], details: {} };
 
             const cleanedSerials = serialNumbers
@@ -4396,11 +4524,16 @@ define([
 
             if (cleanedSerials.length === 0) return { valid: [], invalid: [], details: {} };
 
-            const filterExpression = [];
+            const serialFilters = [];
             cleanedSerials.forEach((serial, index) => {
-                if (index > 0) filterExpression.push('OR');
-                filterExpression.push(['inventorynumber', 'is', serial]);
+                if (index > 0) serialFilters.push('OR');
+                serialFilters.push(['inventorynumber', 'is', serial]);
             });
+
+            // When an item is specified, require the serial to belong to that item
+            const filterExpression = itemId
+                ? [serialFilters, 'AND', ['item', 'anyof', itemId]]
+                : serialFilters;
 
             const foundSerials = {};
 
@@ -5539,9 +5672,9 @@ setTimeout(doPrint, 2000);
 
             let validSerials = [];
             if (serialNumbers.trim()) {
-                const result = plValidateSerialNumbers(serialNumbers);
+                const result = plValidateSerialNumbers(serialNumbers, item);
                 if (result.invalid.length > 0) {
-                    plCreateEntryForm(context, 'Invalid serials: ' + result.invalid.join(', '), 'error', { item, serialNumbers, poNumber });
+                    plCreateEntryForm(context, 'Invalid serials (not found or do not belong to selected item): ' + result.invalid.join(', '), 'error', { item, serialNumbers, poNumber });
                     return;
                 }
                 validSerials = result.valid;
@@ -6294,6 +6427,11 @@ tr:hover td { background:var(--surface-hover); }
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
         Create from IR
     </div>
+    <div class="mob-more-section">Stock Counts</div>
+    <div class="mob-more-item" data-view="sc-create" onclick="mobNavTo('sc-create')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 5H7a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-2"/><rect x="9" y="3" width="6" height="4" rx="1"/><line x1="9" y1="12" x2="15" y2="12"/><line x1="9" y1="16" x2="12" y2="16"/></svg>
+        Create Stock Count
+    </div>
 </div>
 
 <!-- ═══ LAYOUT ═══ -->
@@ -6367,6 +6505,21 @@ tr:hover td { background:var(--surface-hover); }
             </div>
         </div>
     </div>
+    <div class="nav-group">
+        <div class="nav-group-toggle" onclick="toggleNavGroup(this)">
+            <div style="display:flex;align-items:center;gap:10px;">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:18px;height:18px;flex-shrink:0;"><path d="M9 5H7a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-2"/><rect x="9" y="3" width="6" height="4" rx="1"/><line x1="9" y1="12" x2="15" y2="12"/><line x1="9" y1="16" x2="12" y2="16"/></svg>
+                Stock Counts
+            </div>
+            <svg class="nav-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:14px;height:14px;flex-shrink:0;transition:transform .2s;"><polyline points="6 9 12 15 18 9"/></svg>
+        </div>
+        <div class="nav-group-items">
+            <div class="nav-item nav-sub" data-view="sc-create">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="16"/><line x1="8" y1="12" x2="16" y2="12"/></svg>
+                Create Stock Count
+            </div>
+        </div>
+    </div>
 </nav>
 
 <!-- ═══ MAIN CONTENT ═══ -->
@@ -6398,11 +6551,12 @@ tr:hover td { background:var(--surface-hover); }
         <div class="stat-card"><div class="label">Active</div><div class="value" id="stat-active" style="color:var(--success)">—</div></div>
     </div>
     <div class="card">
-        <div class="card-title">Recent License Plates</div>
+        <div class="card-title">All License Plates</div>
         <div class="table-wrap"><table>
             <thead><tr><th>Plate ID</th><th>Item</th><th>Bin</th><th>Serials</th><th>Status</th><th>Created</th></tr></thead>
             <tbody id="dashboard-table"><tr><td colspan="6" style="text-align:center;color:var(--text-dim)">Loading…</td></tr></tbody>
         </table></div>
+        <div id="dashboard-pagination" style="margin-top:12px; display:flex; gap:8px; justify-content:center; flex-wrap:wrap;"></div>
     </div>
 </div>
 
@@ -6825,6 +6979,62 @@ tr:hover td { background:var(--surface-hover); }
                 <button class="btn btn-primary" onclick="sopickReloadSO()" style="min-width:160px;">Reload This SO</button>
                 <button class="btn" onclick="sopickReset()" style="min-width:160px;">New SO</button>
             </div>
+        </div>
+    </div>
+</div>
+
+<!-- ═══════ STOCK COUNT — CREATE VIEW ═══════ -->
+<div class="view" id="view-sc-create">
+    <div class="page-header">
+        <div><div class="page-title">Stock Counts</div><div class="page-subtitle">Create a new stock count</div></div>
+    </div>
+
+    <!-- Phase 1: setup -->
+    <div class="card" style="max-width:620px;">
+        <div class="card-title">Setup</div>
+        <div class="form-grid">
+            <div class="form-group">
+                <label class="form-label">Location *</label>
+                <select id="sc-location" onchange="scOnLocationChange()"></select>
+            </div>
+            <div class="form-group">
+                <label class="form-label">Bin *</label>
+                <select id="sc-bin">
+                    <option value="">— select a location first —</option>
+                </select>
+            </div>
+            <div class="form-group" style="grid-column:1/-1;">
+                <label class="form-label">Assigned To *</label>
+                <select id="sc-assigned-to"></select>
+            </div>
+        </div>
+        <div style="margin-top:20px;">
+            <button class="btn btn-primary" id="sc-load-btn" onclick="scLoadItems()">Load Items</button>
+        </div>
+    </div>
+
+    <!-- Phase 2: items table (hidden until Load Items is clicked) -->
+    <div class="card" id="sc-items-card" style="max-width:900px; display:none; margin-top:16px;">
+        <div class="card-title" id="sc-items-title">Items in Bin</div>
+        <div id="sc-items-msg" style="display:none; margin-bottom:12px;"></div>
+        <div class="table-wrap">
+            <table>
+                <thead>
+                    <tr>
+                        <th style="width:40px;"><input type="checkbox" id="sc-select-all" onchange="scToggleAll(this)" title="Select all"></th>
+                        <th>Item</th>
+                        <th style="width:130px;">Type</th>
+                        <th>Serial Numbers</th>
+                    </tr>
+                </thead>
+                <tbody id="sc-items-body">
+                </tbody>
+            </table>
+        </div>
+        <div id="sc-save-msg" style="display:none; margin-top:12px;"></div>
+        <div style="margin-top:16px; display:flex; gap:10px; align-items:center;">
+            <button class="btn btn-primary" id="sc-submit-btn" onclick="submitStockCount()">Create Stock Count</button>
+            <button class="btn" onclick="scResetToSetup()">Back</button>
         </div>
     </div>
 </div>
@@ -7286,22 +7496,28 @@ function hideItemDropdown() {
 // ═══════════════════════════════════════════════════════════
 //  DASHBOARD
 // ═══════════════════════════════════════════════════════════
-async function loadDashboard() {
-    const data = await apiGet('searchPlates', {});
+async function loadDashboard(page = 0) {
+    const data = await apiGet('searchPlates', { page });
     if (!data.success) return;
 
     document.getElementById('stat-total').textContent = data.total;
+    // Fetch accurate active count in background (doesn't block table render)
+    apiGet('getPlateStats').then(stats => {
+        if (stats && stats.success) {
+            document.getElementById('stat-active').textContent = stats.active;
+        }
+    }).catch(() => {});
     let totalSerials = 0;
     data.results.forEach(p => totalSerials += p.serialCount);
     document.getElementById('stat-serials').textContent = totalSerials;
-    document.getElementById('stat-active').textContent = data.results.filter(p => p.statusId !== '3').length; // rough
 
     const tbody = document.getElementById('dashboard-table');
     if (!data.results.length) {
         tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--text-dim)">No plates found</td></tr>';
+        document.getElementById('dashboard-pagination').innerHTML = '';
         return;
     }
-    tbody.innerHTML = data.results.slice(0, 15).map(p => 
+    tbody.innerHTML = data.results.map(p =>
         '<tr class="clickable-row" onclick="viewPlateModal(' + p.id + ')">' +
         '<td style="font-family:var(--mono);font-weight:600;">' + escHtml(p.name) + '</td>' +
         '<td>' + escHtml(p.item || '—') + '</td>' +
@@ -7311,6 +7527,17 @@ async function loadDashboard() {
         '<td style="color:var(--text-muted);font-size:12px;">' + escHtml(p.created || '') + '</td>' +
         '</tr>'
     ).join('');
+
+    const pagDiv = document.getElementById('dashboard-pagination');
+    if (data.pageCount > 1) {
+        let html = '';
+        for (let i = 0; i < data.pageCount; i++) {
+            html += '<button class="btn btn-sm ' + (i === page ? 'btn-primary' : '') + '" onclick="loadDashboard(' + i + ')">' + (i + 1) + '</button>';
+        }
+        pagDiv.innerHTML = html;
+    } else {
+        pagDiv.innerHTML = '';
+    }
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -8624,13 +8851,158 @@ async function createPlateFromIR() {
 }
 
 // ═══════════════════════════════════════════════════════════
+//  STOCK COUNTS
+// ═══════════════════════════════════════════════════════════
+let _scItems = [];
+
+async function initStockCountForm() {
+    const [locs, emps] = await Promise.all([loadLocations(), apiGet('getEmployees')]);
+    populateSelect(document.getElementById('sc-location'), locs);
+    if (emps && emps.results) populateSelect(document.getElementById('sc-assigned-to'), emps.results);
+    if (locs.length) await scLoadBins(locs[0].id);
+}
+
+async function scLoadBins(locationId) {
+    const binSel = document.getElementById('sc-bin');
+    binSel.innerHTML = '<option value="">Loading…</option>';
+    try {
+        const data = await apiGet('getBins', { location: locationId });
+        binSel.innerHTML = '<option value="">— select a bin —</option>';
+        (data.results || []).forEach(b => {
+            const opt = document.createElement('option');
+            opt.value = b.id;
+            opt.textContent = b.name;
+            opt.dataset.name = b.name;
+            binSel.appendChild(opt);
+        });
+    } catch (e) {
+        binSel.innerHTML = '<option value="">Failed to load bins</option>';
+    }
+}
+
+async function scOnLocationChange() {
+    const locationId = document.getElementById('sc-location').value;
+    scResetToSetup();
+    if (locationId) await scLoadBins(locationId);
+}
+
+function scResetToSetup() {
+    document.getElementById('sc-items-card').style.display = 'none';
+    document.getElementById('sc-save-msg').style.display = 'none';
+    document.getElementById('sc-items-body').innerHTML = '';
+    _scItems = [];
+}
+
+async function scLoadItems() {
+    const locationId = document.getElementById('sc-location').value;
+    const binSel     = document.getElementById('sc-bin');
+    const binId      = binSel.value;
+    const binName    = binSel.options[binSel.selectedIndex]?.dataset.name || binSel.options[binSel.selectedIndex]?.text || '';
+    const assignedTo = document.getElementById('sc-assigned-to').value;
+
+    if (!locationId) { toast('Please select a location.', 'error'); return; }
+    if (!binId)      { toast('Please select a bin.', 'error'); return; }
+    if (!assignedTo) { toast('Please select who this is assigned to.', 'error'); return; }
+
+    const btn = document.getElementById('sc-load-btn');
+    _btnWait(btn);
+    showProcessing('Loading bin inventory…', 'Fetching items');
+    try {
+        const data = await apiGet('getStockCountItems', { binId, locationId });
+        if (!data.success) { toast(data.message || 'Failed to load items.', 'error'); return; }
+        _scItems = data.results || [];
+        const title = document.getElementById('sc-items-title');
+        title.textContent = 'Items in ' + binName + ' (' + _scItems.length + ' item' + (_scItems.length !== 1 ? 's' : '') + ')';
+        const tbody = document.getElementById('sc-items-body');
+        if (_scItems.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--text-dim)">No inventory found in this bin.</td></tr>';
+            document.getElementById('sc-select-all').style.display = 'none';
+        } else {
+            document.getElementById('sc-select-all').style.display = '';
+            document.getElementById('sc-select-all').checked = true;
+            tbody.innerHTML = _scItems.map((item, idx) => {
+                const typeBadge = item.serialized
+                    ? '<span class="badge badge-info">Serialized</span>'
+                    : '<span class="badge" style="background:var(--surface-hover)">Non-Serialized</span>';
+                const serialsCell = item.serialized && item.serialNumbers.length
+                    ? '<span style="font-size:12px;font-family:var(--mono);word-break:break-all;">' + escHtml(item.serialNumbers.join(', ')) + '</span>'
+                    : '<span style="color:var(--text-dim)">—</span>';
+                return '<tr>' +
+                    '<td><input type="checkbox" class="sc-item-cb" data-idx="' + idx + '" checked onchange="scUpdateSelectAll()"></td>' +
+                    '<td style="font-weight:500;">' + escHtml(item.itemName) + '</td>' +
+                    '<td>' + typeBadge + '</td>' +
+                    '<td>' + serialsCell + '</td>' +
+                    '</tr>';
+            }).join('');
+        }
+        document.getElementById('sc-items-card').style.display = '';
+        document.getElementById('sc-save-msg').style.display = 'none';
+    } catch (err) {
+        toast('Error loading items: ' + err.message, 'error');
+    } finally {
+        _btnReset(btn);
+        hideProcessing();
+    }
+}
+
+function scToggleAll(cb) {
+    document.querySelectorAll('.sc-item-cb').forEach(el => { el.checked = cb.checked; });
+}
+
+function scUpdateSelectAll() {
+    const all  = document.querySelectorAll('.sc-item-cb');
+    const checked = document.querySelectorAll('.sc-item-cb:checked');
+    const selectAll = document.getElementById('sc-select-all');
+    selectAll.indeterminate = checked.length > 0 && checked.length < all.length;
+    selectAll.checked = checked.length === all.length;
+}
+
+async function submitStockCount() {
+    const locationId = document.getElementById('sc-location').value;
+    const binSel     = document.getElementById('sc-bin');
+    const binId      = binSel.value;
+    const binName    = binSel.options[binSel.selectedIndex]?.dataset.name || binSel.options[binSel.selectedIndex]?.text || '';
+    const assignedTo = document.getElementById('sc-assigned-to').value;
+    const msgDiv     = document.getElementById('sc-save-msg');
+    const btn        = document.getElementById('sc-submit-btn');
+
+    const selected = [];
+    document.querySelectorAll('.sc-item-cb:checked').forEach(cb => {
+        selected.push(_scItems[parseInt(cb.dataset.idx)]);
+    });
+    if (selected.length === 0) { toast('Select at least one item.', 'error'); return; }
+
+    _btnWait(btn);
+    msgDiv.style.display = 'none';
+    try {
+        const data = await apiPost('createStockCount', { locationId, binId, binName, assignedTo, itemsJson: JSON.stringify(selected) });
+        if (data.success) {
+            msgDiv.style.display = 'block';
+            msgDiv.className = 'alert alert-success';
+            msgDiv.textContent = 'Stock count #' + data.id + ' created with ' + selected.length + ' item(s).';
+            scResetToSetup();
+        } else {
+            msgDiv.style.display = 'block';
+            msgDiv.className = 'alert alert-error';
+            msgDiv.textContent = data.message || 'Failed to create stock count.';
+        }
+    } catch (err) {
+        msgDiv.style.display = 'block';
+        msgDiv.className = 'alert alert-error';
+        msgDiv.textContent = 'Error: ' + err.message;
+    } finally {
+        _btnReset(btn);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
 //  INIT
 // ═══════════════════════════════════════════════════════════
 (async function init() {
     // Set initial padding for warehouse view (default)
     document.querySelector('.main').style.padding = '0';
 
-    await Promise.all([initCreateForm(), initSearchForm(), initPOForm(), initIRForm(), initPORcvForm(), initSOPickForm()]);
+    await Promise.all([initCreateForm(), initSearchForm(), initPOForm(), initIRForm(), initPORcvForm(), initSOPickForm(), initStockCountForm()]);
     // Dashboard loads lazily on first nav click (warehouse is default view)
 
     // Also populate search bin dropdown

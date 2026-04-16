@@ -148,6 +148,14 @@ define([
                     return respondJson(context, getStockCountItems(context.request.parameters));
                 case 'createStockCount':
                     return respondJson(context, createStockCount(JSON.parse(context.request.body)));
+                case 'getStockCounts':
+                    return respondJson(context, getStockCounts(context.request.parameters));
+                case 'getStockCountById':
+                    return respondJson(context, getStockCountById(context.request.parameters));
+                case 'updateStockCount':
+                    return respondJson(context, updateStockCount(JSON.parse(context.request.body)));
+                case 'createStockCountAdjustment':
+                    return respondJson(context, createStockCountAdjustment(JSON.parse(context.request.body)));
                 case 'lookupPOSerials':
                     return respondJson(context, lookupPOSerials(context.request.parameters));
                 case 'createFromPO':
@@ -878,13 +886,27 @@ define([
                 ],
                 columns: [
                     search.createColumn({ name: 'item' }),
-                    search.createColumn({ name: 'onhand' })
+                    search.createColumn({ name: 'onhand' }),
+                    search.createColumn({ name: 'inventorynumber' })
                 ]
             }).run().each(r => {
                 const id   = r.getValue({ name: 'item' });
                 const name = r.getText({ name: 'item' });
-                if (id && !itemMap[id]) {
-                    itemMap[id] = { itemId: id, itemName: name, serialized: false, serialNumbers: [] };
+                const sn   = r.getText({ name: 'inventorynumber' });
+                const onhand = parseFloat(r.getValue({ name: 'onhand' })) || 0;
+                log.debug('InvBalance Row', 'Item: ' + id + ' (' + name + '), SN: ' + sn + ', OnHand: ' + onhand);
+                if (id) {
+                    if (!itemMap[id]) {
+                        itemMap[id] = { itemId: id, itemName: name, serialized: false, serialNumbers: [], expectedQty: 0 };
+                    }
+                    // If this row has an inventory number, item is serialized
+                    if (sn) {
+                        itemMap[id].serialized = true;
+                        itemMap[id].serialNumbers.push(sn);
+                    } else {
+                        // Non-serialized: accumulate onhand quantity
+                        itemMap[id].expectedQty += onhand;
+                    }
                 }
                 return true;
             });
@@ -893,35 +915,48 @@ define([
             return { success: false, message: 'Could not fetch bin inventory: ' + e.message };
         }
 
+        log.audit('After InvBalance', 'Items found: ' + Object.keys(itemMap).length);
+
         if (Object.keys(itemMap).length === 0) return { success: true, results: [] };
 
-        // Step 2: serial numbers in this bin — marks which items are serialized
+        // Step 2: Check item record directly for serial/lot flags
+        const itemIds = Object.keys(itemMap);
+        log.audit('Checking items', 'IDs: ' + itemIds.join(', '));
         try {
             search.create({
-                type: 'inventorynumber',
-                filters: [
-                    ['location',  'anyof', locationId],
-                    'AND',
-                    ['binnumber', 'anyof', binId]
-                ],
+                type: 'item',
+                filters: [['internalid', 'anyof', itemIds]],
                 columns: [
-                    search.createColumn({ name: 'item' }),
-                    search.createColumn({ name: 'inventorynumber' })
+                    search.createColumn({ name: 'internalid' }),
+                    search.createColumn({ name: 'itemid' }),
+                    search.createColumn({ name: 'isserialitem' }),
+                    search.createColumn({ name: 'islotitem' })
                 ]
             }).run().each(r => {
-                const id = r.getValue({ name: 'item' });
-                const sn = r.getValue({ name: 'inventorynumber' });
+                const id = r.getValue({ name: 'internalid' });
+                const itemName = r.getValue({ name: 'itemid' });
+                const isSerial = r.getValue({ name: 'isserialitem' });
+                const isLot = r.getValue({ name: 'islotitem' });
+                log.debug('Item Record', 'ID: ' + id + ', Name: ' + itemName + ', isserialitem: ' + isSerial + ' (type: ' + typeof isSerial + '), islotitem: ' + isLot + ' (type: ' + typeof isLot + ')');
                 if (id && itemMap[id]) {
-                    itemMap[id].serialized = true;
-                    if (sn) itemMap[id].serialNumbers.push(sn);
+                    if (isSerial === true || isSerial === 'T' || isLot === true || isLot === 'T') {
+                        itemMap[id].serialized = true;
+                        log.audit('Marked Serialized', 'Item ' + id + ' marked as serialized');
+                    }
                 }
                 return true;
             });
         } catch (e) {
-            log.error('getStockCountItems inventorynumber', e.message);
+            log.error('getStockCountItems item lookup', e.message);
         }
 
-        return { success: true, results: Object.values(itemMap) };
+        // Log final results
+        const results = Object.values(itemMap);
+        results.forEach(item => {
+            log.audit('Final Item', 'ID: ' + item.itemId + ', Name: ' + item.itemName + ', Serialized: ' + item.serialized + ', SNs: ' + item.serialNumbers.length);
+        });
+
+        return { success: true, results: results };
     };
 
     const createStockCount = (data) => {
@@ -938,6 +973,260 @@ define([
             return { success: true, id, message: 'Stock count created successfully.' };
         } catch (e) {
             log.error('createStockCount Error', e.message);
+            return { success: false, message: e.message };
+        }
+    };
+
+    const getStockCounts = (params) => {
+        try {
+            const filters = [['isinactive', 'is', 'F']];
+            if (params.status) {
+                filters.push('AND');
+                filters.push(['custrecord_sc_status', 'is', params.status]);
+            }
+            const results = [];
+            search.create({
+                type: 'customrecord_wh_stock_count',
+                filters: filters,
+                columns: [
+                    search.createColumn({ name: 'internalid' }),
+                    search.createColumn({ name: 'custrecord_sc_location' }),
+                    search.createColumn({ name: 'custrecord_sc_bin_name' }),
+                    search.createColumn({ name: 'custrecord_sc_assigned_to' }),
+                    search.createColumn({ name: 'custrecord_sc_status' }),
+                    search.createColumn({ name: 'custrecordsc_items_json' }),
+                    search.createColumn({ name: 'custrecord_sc_adj_id' }),
+                    search.createColumn({ name: 'created', sort: search.Sort.DESC })
+                ]
+            }).run().each(r => {
+                const itemsJson = r.getValue({ name: 'custrecordsc_items_json' }) || '[]';
+                let itemCount = 0;
+                try { itemCount = JSON.parse(itemsJson).length; } catch(e) {}
+                results.push({
+                    id: r.getValue({ name: 'internalid' }),
+                    location: r.getText({ name: 'custrecord_sc_location' }),
+                    locationId: r.getValue({ name: 'custrecord_sc_location' }),
+                    binName: r.getValue({ name: 'custrecord_sc_bin_name' }),
+                    assignedTo: r.getText({ name: 'custrecord_sc_assigned_to' }),
+                    assignedToId: r.getValue({ name: 'custrecord_sc_assigned_to' }),
+                    status: r.getValue({ name: 'custrecord_sc_status' }),
+                    itemCount: itemCount,
+                    adjustmentId: r.getValue({ name: 'custrecord_sc_adj_id' }) || null,
+                    created: r.getValue({ name: 'created' })
+                });
+                return true;
+            });
+            return { success: true, results };
+        } catch (e) {
+            log.error('getStockCounts Error', e.message);
+            return { success: false, message: e.message };
+        }
+    };
+
+    const getStockCountById = (params) => {
+        try {
+            const id = params.id;
+            if (!id) return { success: false, message: 'Stock count ID required.' };
+            const rec = record.load({ type: 'customrecord_wh_stock_count', id: id });
+            const itemsJson = rec.getValue({ fieldId: 'custrecordsc_items_json' }) || '[]';
+            const countedJson = rec.getValue({ fieldId: 'custrecordsc_count_json' }) || '[]';
+            let items = [];
+            let counted = [];
+            try { items = JSON.parse(itemsJson); } catch(e) {}
+            try { counted = JSON.parse(countedJson); } catch(e) {}
+            return {
+                success: true,
+                data: {
+                    id: id,
+                    locationId: rec.getValue({ fieldId: 'custrecord_sc_location' }),
+                    location: rec.getText({ fieldId: 'custrecord_sc_location' }),
+                    binId: rec.getValue({ fieldId: 'custrecord_sc_bin_id' }),
+                    binName: rec.getValue({ fieldId: 'custrecord_sc_bin_name' }),
+                    assignedToId: rec.getValue({ fieldId: 'custrecord_sc_assigned_to' }),
+                    assignedTo: rec.getText({ fieldId: 'custrecord_sc_assigned_to' }),
+                    status: rec.getValue({ fieldId: 'custrecord_sc_status' }),
+                    adjustmentId: rec.getValue({ fieldId: 'custrecord_sc_adj_id' }) || null,
+                    items: items,
+                    counted: counted
+                }
+            };
+        } catch (e) {
+            log.error('getStockCountById Error', e.message);
+            return { success: false, message: e.message };
+        }
+    };
+
+    const updateStockCount = (data) => {
+        try {
+            const id = data.id;
+            if (!id) return { success: false, message: 'Stock count ID required.' };
+            const rec = record.load({ type: 'customrecord_wh_stock_count', id: id, isDynamic: true });
+            if (data.status) rec.setValue({ fieldId: 'custrecord_sc_status', value: data.status });
+            if (data.countedJson !== undefined) rec.setValue({ fieldId: 'custrecordsc_count_json', value: data.countedJson });
+            if (data.adjustmentId !== undefined) rec.setValue({ fieldId: 'custrecord_sc_adj_id', value: data.adjustmentId });
+            rec.save({ enableSourcing: true, ignoreMandatoryFields: false });
+            log.audit('Stock Count Updated', 'ID: ' + id + ', Status: ' + (data.status || 'unchanged'));
+            return { success: true, id, message: 'Stock count updated successfully.' };
+        } catch (e) {
+            log.error('updateStockCount Error', e.message);
+            return { success: false, message: e.message };
+        }
+    };
+
+    const createStockCountAdjustment = (data) => {
+        try {
+            const { stockCountId, locationId, binId, adjustments } = data;
+            if (!stockCountId) return { success: false, message: 'Stock count ID required.' };
+            if (!locationId) return { success: false, message: 'Location ID required.' };
+            if (!adjustments || adjustments.length === 0) return { success: false, message: 'No adjustments provided.' };
+
+            // Check if any adjustments actually need to be made
+            const hasChanges = adjustments.some(adj => {
+                if (adj.serialized) {
+                    return (adj.addSerials && adj.addSerials.length > 0) || (adj.removeSerials && adj.removeSerials.length > 0);
+                } else {
+                    return adj.adjustQty !== 0;
+                }
+            });
+
+            if (!hasChanges) {
+                // No actual changes needed, just mark the stock count as approved
+                const scRec = record.load({ type: 'customrecord_wh_stock_count', id: stockCountId, isDynamic: true });
+                scRec.setValue({ fieldId: 'custrecord_sc_status', value: 'approved' });
+                scRec.save({ enableSourcing: true, ignoreMandatoryFields: false });
+                return { success: true, message: 'No adjustments needed. Stock count approved.' };
+            }
+
+            // Look up serial IDs for removal operations
+            const serialsToRemove = [];
+            adjustments.forEach(adj => {
+                if (adj.serialized && adj.removeSerials && adj.removeSerials.length > 0) {
+                    adj.removeSerials.forEach(sn => serialsToRemove.push(sn));
+                }
+            });
+
+            const serialIdMap = {};
+            if (serialsToRemove.length > 0) {
+                try {
+                    // Build OR filter for all serials
+                    const serialFilter = [];
+                    serialsToRemove.forEach((sn, i) => {
+                        if (i > 0) serialFilter.push('OR');
+                        serialFilter.push(['inventorynumber', 'is', sn]);
+                    });
+                    search.create({
+                        type: 'inventorynumber',
+                        filters: serialFilter,
+                        columns: ['internalid', 'inventorynumber']
+                    }).run().each(r => {
+                        const sn = r.getValue({ name: 'inventorynumber' });
+                        const id = r.getValue({ name: 'internalid' });
+                        serialIdMap[sn] = id;
+                        log.debug('Serial mapped', sn + ' -> ' + id);
+                        return true;
+                    });
+                    log.audit('Serial lookup complete', 'Found ' + Object.keys(serialIdMap).length + ' of ' + serialsToRemove.length + ' serials');
+                } catch (e) {
+                    log.error('Serial lookup error', e.message);
+                }
+            }
+
+            // Get item costs
+            const itemIds = adjustments.map(a => a.itemId);
+            const costCache = {};
+            itemIds.forEach(itemId => {
+                try {
+                    const costLookup = search.lookupFields({ type: search.Type.ITEM, id: itemId, columns: ['averagecost'] });
+                    costCache[itemId] = parseFloat(costLookup.averagecost) || 0;
+                } catch (e) { costCache[itemId] = 0; }
+            });
+
+            // Create inventory adjustment
+            const adjRecord = record.create({ type: record.Type.INVENTORY_ADJUSTMENT, isDynamic: true });
+            adjRecord.setValue({ fieldId: 'subsidiary', value: '1' });
+            adjRecord.setValue({ fieldId: 'account', value: '154' });
+            adjRecord.setValue({ fieldId: 'memo', value: 'Stock Count #' + stockCountId + ' Adjustment' });
+
+            adjustments.forEach(adj => {
+                const itemCost = costCache[adj.itemId] || 0;
+
+                if (adj.serialized) {
+                    // Remove serials (expected but not counted)
+                    if (adj.removeSerials && adj.removeSerials.length > 0) {
+                        adjRecord.selectNewLine({ sublistId: 'inventory' });
+                        adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'item', value: adj.itemId });
+                        adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'location', value: locationId });
+                        adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'adjustqtyby', value: -adj.removeSerials.length });
+                        if (itemCost > 0) adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'unitcost', value: itemCost });
+
+                        const removeDetail = adjRecord.getCurrentSublistSubrecord({ sublistId: 'inventory', fieldId: 'inventorydetail' });
+                        adj.removeSerials.forEach(sn => {
+                            removeDetail.selectNewLine({ sublistId: 'inventoryassignment' });
+                            removeDetail.setCurrentSublistText({ sublistId: 'inventoryassignment', fieldId: 'issueinventorynumber', text: sn });
+                            removeDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity', value: -1 });
+                            if (binId) removeDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', value: binId });
+                            removeDetail.commitLine({ sublistId: 'inventoryassignment' });
+                        });
+                        adjRecord.commitLine({ sublistId: 'inventory' });
+                    }
+
+                    // Add serials (counted but not expected)
+                    if (adj.addSerials && adj.addSerials.length > 0) {
+                        adjRecord.selectNewLine({ sublistId: 'inventory' });
+                        adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'item', value: adj.itemId });
+                        adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'location', value: locationId });
+                        adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'adjustqtyby', value: adj.addSerials.length });
+                        if (itemCost > 0) adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'unitcost', value: itemCost });
+
+                        const addDetail = adjRecord.getCurrentSublistSubrecord({ sublistId: 'inventory', fieldId: 'inventorydetail' });
+                        adj.addSerials.forEach(sn => {
+                            addDetail.selectNewLine({ sublistId: 'inventoryassignment' });
+                            addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'receiptinventorynumber', value: sn });
+                            addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity', value: 1 });
+                            if (binId) addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', value: binId });
+                            addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'inventorystatus', value: BACK_TO_STOCK_STATUS_ID });
+                            addDetail.commitLine({ sublistId: 'inventoryassignment' });
+                        });
+                        adjRecord.commitLine({ sublistId: 'inventory' });
+                    }
+                } else {
+                    // Non-serialized: quantity adjustment with inventory detail
+                    if (adj.adjustQty !== 0) {
+                        adjRecord.selectNewLine({ sublistId: 'inventory' });
+                        adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'item', value: adj.itemId });
+                        adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'location', value: locationId });
+                        adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'adjustqtyby', value: adj.adjustQty });
+                        if (itemCost > 0) adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'unitcost', value: itemCost });
+
+                        // Must configure inventory detail for bin-managed locations
+                        const invDetail = adjRecord.getCurrentSublistSubrecord({ sublistId: 'inventory', fieldId: 'inventorydetail' });
+                        invDetail.selectNewLine({ sublistId: 'inventoryassignment' });
+                        invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity', value: adj.adjustQty });
+                        if (binId) invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', value: binId });
+                        invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'inventorystatus', value: BACK_TO_STOCK_STATUS_ID });
+                        invDetail.commitLine({ sublistId: 'inventoryassignment' });
+                        adjRecord.commitLine({ sublistId: 'inventory' });
+                    }
+                }
+            });
+
+            const adjId = adjRecord.save({ enableSourcing: true, ignoreMandatoryFields: false });
+            let tranId = String(adjId);
+            try {
+                const l = search.lookupFields({ type: search.Type.INVENTORY_ADJUSTMENT, id: adjId, columns: ['tranid'] });
+                tranId = l.tranid || String(adjId);
+            } catch (e) {}
+
+            // Update stock count record with adjustment ID
+            const scRec = record.load({ type: 'customrecord_wh_stock_count', id: stockCountId, isDynamic: true });
+            scRec.setValue({ fieldId: 'custrecord_sc_adj_id', value: adjId });
+            scRec.setValue({ fieldId: 'custrecord_sc_status', value: 'approved' });
+            scRec.save({ enableSourcing: true, ignoreMandatoryFields: false });
+
+            log.audit('Stock Count Adjustment Created', 'SC#' + stockCountId + ' -> Adj#' + tranId);
+            return { success: true, adjustmentId: adjId, tranId: tranId, message: 'Inventory adjustment created: ' + tranId };
+        } catch (e) {
+            log.error('createStockCountAdjustment Error', e.message + '\n' + e.stack);
             return { success: false, message: e.message };
         }
     };
@@ -2952,6 +3241,8 @@ define([
                         + '<option value="defective">Defective</option>'
                         + '<option value="move_refurbishing">Move to Refurbishing</option>'
                         + '<option value="move_testing">Move to Testing</option>'
+                        + '<option value="part_number_change">Part Number Change</option>'
+                        + '<option value="part_number_change_stock">Part Number Change &amp; Back to Stock</option>'
                         + '<option value="return_to_vendor">Return to Vendor</option>'
                         + '<option value="trash">Trash</option>'
                         + '<option value="inventory_found">Inventory Found</option>'
@@ -2967,6 +3258,7 @@ define([
                             + '<td data-label="From Bin"><input type="text" class="ns-grid-input ns-bin-input" data-row="' + nsGridRowId + '" list="ns-bin-datalist" autocomplete="off" placeholder="Type bin" style="min-width:120px;padding:10px;border:1.5px solid #d1d5db;border-radius:6px;font-size:16px;min-height:44px;"></td>'
                             + '<td data-label="Qty"><input type="number" class="ns-grid-input ns-qty-input" data-row="' + nsGridRowId + '" placeholder="Qty" min="1" style="width:80px;padding:10px;border:1.5px solid #d1d5db;border-radius:6px;font-size:16px;min-height:44px;"></td>'
                             + '<td data-label="Action"><select class="action-select ns-action-input" data-row="' + nsGridRowId + '" style="min-width:180px;min-height:44px;" onchange="handleNsActionChange(this)">' + nsActionOptions + '</select>'
+                            + '<input type="text" class="ns-grid-input ns-new-item-input" data-row="' + nsGridRowId + '" placeholder="New item name / SKU" style="display:none;margin-top:6px;width:100%;padding:10px;border:1.5px solid #d1d5db;border-radius:6px;font-size:16px;min-height:44px;">'
                             + '<input type="number" class="ns-grid-input ns-upcharge-input" data-row="' + nsGridRowId + '" placeholder="Upcharge $/unit" min="0" step="0.01" style="display:none;margin-top:6px;width:100%;padding:10px;border:1.5px solid #d1d5db;border-radius:6px;font-size:16px;min-height:44px;"></td>'
                             + '<td><button type="button" onclick="removeNsGridRow(' + nsGridRowId + ')" style="background:none;border:none;color:#ef4444;cursor:pointer;font-size:20px;padding:6px 10px;min-height:44px;min-width:44px;" title="Remove">&times;</button></td>';
                         tbody.appendChild(tr);
@@ -2999,6 +3291,12 @@ define([
                     function handleNsActionChange(selectEl) {
                         var row = selectEl.closest('tr');
                         if (!row) return;
+                        var isPnc = selectEl.value === 'part_number_change' || selectEl.value === 'part_number_change_stock';
+                        var newItemInput = row.querySelector('.ns-new-item-input');
+                        if (newItemInput) {
+                            newItemInput.style.display = isPnc ? 'block' : 'none';
+                            if (!isPnc) newItemInput.value = '';
+                        }
                         var upchargeInput = row.querySelector('.ns-upcharge-input');
                         if (upchargeInput) {
                             upchargeInput.style.display = selectEl.value === 'transfer_upcharge' ? 'block' : 'none';
@@ -3016,19 +3314,23 @@ define([
                             var binInput = row.querySelector('.ns-bin-input');
                             var qtyInput = row.querySelector('.ns-qty-input');
                             var actionSelect = row.querySelector('.ns-action-input');
+                            var newItemInput = row.querySelector('.ns-new-item-input');
                             var upchargeInput = row.querySelector('.ns-upcharge-input');
                             var itemName = itemInput ? itemInput.value.trim() : '';
                             var binNumber = binInput ? binInput.value.trim() : '';
                             var qty = qtyInput ? parseInt(qtyInput.value) || 0 : 0;
                             var action = actionSelect ? actionSelect.value : '';
+                            var newItemName = newItemInput ? newItemInput.value.trim() : '';
                             var upcharge = upchargeInput ? parseFloat(upchargeInput.value) || 0 : 0;
+                            var isPnc = action === 'part_number_change' || action === 'part_number_change_stock';
                             if (!itemName && !binNumber && qty === 0 && !action) continue;
                             if (!itemName) { if (itemInput) itemInput.style.borderColor = '#ef4444'; hasError = true; } else { if (itemInput) itemInput.style.borderColor = '#d1d5db'; }
                             if (!binNumber) { if (binInput) binInput.style.borderColor = '#ef4444'; hasError = true; } else { if (binInput) binInput.style.borderColor = '#d1d5db'; }
                             if (qty <= 0) { if (qtyInput) qtyInput.style.borderColor = '#ef4444'; hasError = true; } else { if (qtyInput) qtyInput.style.borderColor = '#d1d5db'; }
                             if (!action) { if (actionSelect) actionSelect.style.borderColor = '#ef4444'; hasError = true; } else { if (actionSelect) actionSelect.style.borderColor = '#d1d5db'; }
+                            if (isPnc && !newItemName) { if (newItemInput) newItemInput.style.borderColor = '#ef4444'; hasError = true; } else { if (newItemInput) newItemInput.style.borderColor = '#d1d5db'; }
                             if (upchargeInput) upchargeInput.style.borderColor = '#d1d5db';
-                            gridData.push({ itemName:itemName, binNumber:binNumber, quantity:qty, action:action, upcharge: action === 'transfer_upcharge' ? upcharge : 0 });
+                            gridData.push({ itemName:itemName, binNumber:binNumber, quantity:qty, action:action, newItemName: isPnc ? newItemName : '', upcharge: action === 'transfer_upcharge' ? upcharge : 0 });
                         }
                         if (gridData.length === 0) { alert('Please fill in at least one row.'); return; }
                         if (hasError) { alert('Please fix the highlighted fields.'); return; }
@@ -3277,6 +3579,28 @@ define([
                         form.appendChild(ai); _disableAllBtns(); form.submit();
                     }
 
+                    var _sortState = { col: null, dir: 1 };
+                    function sortTable(col) {
+                        var tbody = document.querySelector('.results-table tbody');
+                        if (!tbody) return;
+                        if (_sortState.col === col) { _sortState.dir *= -1; } else { _sortState.col = col; _sortState.dir = 1; }
+                        var rows = Array.from(tbody.querySelectorAll('tr'));
+                        rows.sort(function(a, b) {
+                            var av = (a.getAttribute('data-' + col) || '').toLowerCase();
+                            var bv = (b.getAttribute('data-' + col) || '').toLowerCase();
+                            if (av < bv) return -_sortState.dir;
+                            if (av > bv) return _sortState.dir;
+                            return 0;
+                        });
+                        rows.forEach(function(r) { tbody.appendChild(r); });
+                        var ths = document.querySelectorAll('.results-table thead th[data-sort]');
+                        ths.forEach(function(th) {
+                            var ind = th.querySelector('.sort-indicator');
+                            if (!ind) return;
+                            ind.textContent = th.getAttribute('data-sort') === col ? (_sortState.dir === 1 ? ' ▲' : ' ▼') : ' ⇅';
+                        });
+                    }
+
                     document.addEventListener('DOMContentLoaded', function() {
                         window.onbeforeunload = null;
                         var selects = document.querySelectorAll('select.action-select[data-index]');
@@ -3427,6 +3751,8 @@ define([
             nsActionField.addSelectOption({ value: 'defective', text: 'Defective' });
             nsActionField.addSelectOption({ value: 'move_refurbishing', text: 'Move to Refurbishing' });
             nsActionField.addSelectOption({ value: 'move_testing', text: 'Move to Testing' });
+            nsActionField.addSelectOption({ value: 'part_number_change', text: 'Part Number Change' });
+            nsActionField.addSelectOption({ value: 'part_number_change_stock', text: 'Part Number Change & Back to Stock' });
             nsActionField.addSelectOption({ value: 'return_to_vendor', text: 'Return to Vendor' });
             nsActionField.addSelectOption({ value: 'trash', text: 'Trash' });
             nsActionField.addSelectOption({ value: 'inventory_found', text: 'Inventory Found' });
@@ -3466,7 +3792,7 @@ define([
             serialData.valid.forEach((s, idx) => {
                 const isLoc26 = String(s.locationId) === TRANSFER_SOURCE_LOCATION_ID;
                 const transferOption = isLoc26 ? '<option value="transfer_upcharge">Transfer to A &amp; Upcharge</option>' : '';
-                rows += '<tr>'
+                rows += '<tr data-serial="' + escapeXml(s.serialNumber || '') + '" data-item="' + escapeXml(s.itemText || '') + '" data-bin="' + escapeXml(s.binText || '') + '" data-location="' + escapeXml(s.locationText || '') + '">'
                     + '<td data-label="Serial" style="font-family:\'SF Mono\',Monaco,monospace;font-size:14px;">' + escapeXml(s.serialNumber) + '</td>'
                     + '<td data-label="Item"><strong>' + escapeXml(s.itemText) + '</strong></td>'
                     + '<td data-label="Bin">' + (escapeXml(s.binText) || '<span style="color:#9ca3af;">N/A</span>') + '</td>'
@@ -3543,7 +3869,13 @@ define([
                                 </div>
                             </div>
                             <table class="results-table">
-                                <thead><tr><th>Serial</th><th>Item</th><th>Bin</th><th>Location</th><th>Action</th></tr></thead>
+                                <thead><tr>
+                                    <th data-sort="serial" onclick="sortTable('serial')" style="cursor:pointer;user-select:none;">Serial<span class="sort-indicator"> ⇅</span></th>
+                                    <th data-sort="item" onclick="sortTable('item')" style="cursor:pointer;user-select:none;">Item<span class="sort-indicator"> ⇅</span></th>
+                                    <th data-sort="bin" onclick="sortTable('bin')" style="cursor:pointer;user-select:none;">Bin<span class="sort-indicator"> ⇅</span></th>
+                                    <th data-sort="location" onclick="sortTable('location')" style="cursor:pointer;user-select:none;">Location<span class="sort-indicator"> ⇅</span></th>
+                                    <th>Action</th>
+                                </tr></thead>
                                 <tbody>${rows}</tbody>
                             </table>
                         </div>
@@ -3563,7 +3895,7 @@ define([
 
         function createSuccessPage(context, adjustmentTranId, binTransferTranId, labelGroups, serialChangeTranId, inventoryFoundTranId, partNumberChangeTranId, transferOrderTranId, errors, failedGroups, returnAction) {
             const form = serverWidget.createForm({ title: 'Transactions Created' });
-            const suiteletUrl = url.resolveScript({ scriptId: runtime.getCurrentScript().id, deploymentId: runtime.getCurrentScript().deploymentId, returnExternalUrl: true });
+            const suiteletUrl = url.resolveScript({ scriptId: runtime.getCurrentScript().id, deploymentId: runtime.getCurrentScript().deploymentId, returnExternalUrl: false });
             errors = errors || [];
             failedGroups = failedGroups || [];
 
@@ -3663,7 +3995,7 @@ define([
 
         function createNonSerializedSuccessPage(context, adjustmentTranId, binTransferTranId, itemDetails, quantity, action, inventoryFoundTranId) {
             const form = serverWidget.createForm({ title: 'Transactions Created' });
-            const suiteletUrl = url.resolveScript({ scriptId: runtime.getCurrentScript().id, deploymentId: runtime.getCurrentScript().deploymentId, returnExternalUrl: true });
+            const suiteletUrl = url.resolveScript({ scriptId: runtime.getCurrentScript().id, deploymentId: runtime.getCurrentScript().deploymentId, returnExternalUrl: false });
             const printData = [{ itemText: itemDetails.displayname || itemDetails.itemid, description: itemDetails.description || '', quantity: quantity }];
             const recordIdForPrint = adjustmentTranId || binTransferTranId || inventoryFoundTranId || '';
 
@@ -3698,9 +4030,9 @@ define([
             context.response.writePage(form);
         }
 
-        function createNonSerializedMultiSuccessPage(context, adjustmentTranId, binTransferTranId, inventoryFoundTranId, processedItems, errors, transferOrderTranId, failedItems, returnAction) {
+        function createNonSerializedMultiSuccessPage(context, adjustmentTranId, binTransferTranId, inventoryFoundTranId, processedItems, errors, transferOrderTranId, failedItems, returnAction, partNumberChangeTranId) {
             const form = serverWidget.createForm({ title: 'Transactions Created' });
-            const suiteletUrl = url.resolveScript({ scriptId: runtime.getCurrentScript().id, deploymentId: runtime.getCurrentScript().deploymentId, returnExternalUrl: true });
+            const suiteletUrl = url.resolveScript({ scriptId: runtime.getCurrentScript().id, deploymentId: runtime.getCurrentScript().deploymentId, returnExternalUrl: false });
             const printData = processedItems.map(function(item) { return { itemText: item.itemText || '', description: item.description || '', quantity: item.quantity }; });
             const recordIdForPrint = adjustmentTranId || binTransferTranId || inventoryFoundTranId || transferOrderTranId || '';
             failedItems = failedItems || [];
@@ -3712,13 +4044,14 @@ define([
             const printRecordIdField = form.addField({ id: 'custpage_print_record_id', type: serverWidget.FieldType.TEXT, label: 'Print Record ID' });
             printRecordIdField.updateDisplayType({ displayType: serverWidget.FieldDisplayType.HIDDEN }); printRecordIdField.defaultValue = String(recordIdForPrint);
 
-            const ACTION_LABELS = {'back_to_stock':'Back to Stock','defective':'Defective','likenew':'Change to Like New','likenew_stock':'Change to Like New & Back to Stock','move_refurbishing':'Move to Refurbishing','move_testing':'Move to Testing','return_to_vendor':'Return to Vendor','trash':'Trash','inventory_found':'Inventory Found','bin_putaway':'Bin Putaway','transfer_upcharge':'Transfer to A & Upcharge'};
+            const ACTION_LABELS = {'back_to_stock':'Back to Stock','defective':'Defective','likenew':'Change to Like New','likenew_stock':'Change to Like New & Back to Stock','move_refurbishing':'Move to Refurbishing','move_testing':'Move to Testing','part_number_change':'Part Number Change','part_number_change_stock':'Part Number Change & Back to Stock','return_to_vendor':'Return to Vendor','trash':'Trash','inventory_found':'Inventory Found','bin_putaway':'Bin Putaway','transfer_upcharge':'Transfer to A & Upcharge'};
 
             let transactionInfoHtml = '';
             if (adjustmentTranId) transactionInfoHtml += '<p style="font-size:15px;margin:6px 0;color:#1a4971;"><strong>Inv. Adjustment:</strong> ' + escapeXml(String(adjustmentTranId)) + '</p>';
             if (binTransferTranId) transactionInfoHtml += '<p style="font-size:15px;margin:6px 0;color:#1a4971;"><strong>Bin Transfer:</strong> ' + escapeXml(String(binTransferTranId)) + '</p>';
             if (inventoryFoundTranId) transactionInfoHtml += '<p style="font-size:15px;margin:6px 0;color:#1a4971;"><strong>Inv. Found:</strong> ' + escapeXml(String(inventoryFoundTranId)) + '</p>';
             if (transferOrderTranId) transactionInfoHtml += '<p style="font-size:15px;margin:6px 0;color:#1a4971;"><strong>Transfer Order:</strong> ' + escapeXml(String(transferOrderTranId)) + '</p>';
+            if (partNumberChangeTranId) transactionInfoHtml += '<p style="font-size:15px;margin:6px 0;color:#1a4971;"><strong>Part # Change:</strong> ' + escapeXml(String(partNumberChangeTranId)) + '</p>';
 
             let itemRows = '', totalQty = 0;
             processedItems.forEach(function(item) {
@@ -4052,8 +4385,9 @@ define([
             const BIN_TRANSFER_ACTIONS = ['move_testing', 'move_refurbishing', 'back_to_stock', 'defective', 'trash', 'return_to_vendor'];
             const INVENTORY_FOUND_ACTIONS = ['inventory_found'];
             const TRANSFER_UPCHARGE_ACTIONS = ['transfer_upcharge'];
+            const PART_NUMBER_CHANGE_ACTIONS = ['part_number_change', 'part_number_change_stock'];
             const locationId = '1'; const errors = [];
-            const adjustmentRows = [], binTransferRows = [], inventoryFoundRows = [], transferUpchargeRows = [];
+            const adjustmentRows = [], binTransferRows = [], inventoryFoundRows = [], transferUpchargeRows = [], partNumberChangeRows = [];
             const itemCache = {}, binCache = {}, targetItemCache = {};
 
             cartRows.forEach(function(row, idx) {
@@ -4084,16 +4418,25 @@ define([
                     binTransferRows.push({ itemId: itemData.id, itemText: itemData.displayname || itemData.itemid, description: itemData.description, locationId: locationId, quantity: quantity, fromBinId: fromBinId, toBinId: toBinId, toStatusId: toStatusId, action: action });
                 } else if (INVENTORY_FOUND_ACTIONS.indexOf(action) !== -1) {
                     inventoryFoundRows.push({ itemId: itemData.id, itemText: itemData.displayname || itemData.itemid, description: itemData.description, locationId: locationId, quantity: quantity, action: action });
+                } else if (PART_NUMBER_CHANGE_ACTIONS.indexOf(action) !== -1) {
+                    const newItemName = (row.newItemName || '').trim();
+                    if (!newItemName) { errors.push(rowLabel + ': new item name required for Part Number Change'); return; }
+                    if (!targetItemCache['pnc_' + newItemName]) { const ti = findItemByName(newItemName); if (!ti) { errors.push(rowLabel + ': new item not found "' + newItemName + '"'); targetItemCache['pnc_' + newItemName] = { found: false }; } else targetItemCache['pnc_' + newItemName] = { found: true, targetItem: ti }; }
+                    if (!targetItemCache['pnc_' + newItemName].found) return;
+                    const pnc = targetItemCache['pnc_' + newItemName];
+                    let toBinId = fromBinId, toStatusId = null;
+                    if (action === 'part_number_change_stock') { toBinId = BACK_TO_STOCK_BIN_ID; toStatusId = BACK_TO_STOCK_STATUS_ID; }
+                    partNumberChangeRows.push({ sourceItemId: itemData.id, sourceItemName: itemData.itemid, targetItemId: pnc.targetItem.id, targetItemName: pnc.targetItem.itemid, targetDisplayName: pnc.targetItem.displayname, targetDescription: pnc.targetItem.description, locationId: locationId, quantity: quantity, fromBinId: fromBinId, toBinId: toBinId, toStatusId: toStatusId, action: action });
                 } else if (TRANSFER_UPCHARGE_ACTIONS.indexOf(action) !== -1) {
                     transferUpchargeRows.push({ itemId: itemData.id, itemText: itemData.displayname || itemData.itemid, description: itemData.description, locationId: locationId, quantity: quantity, upcharge: upcharge, action: action });
                 }
             });
 
-            if (adjustmentRows.length === 0 && binTransferRows.length === 0 && inventoryFoundRows.length === 0 && transferUpchargeRows.length === 0) {
+            if (adjustmentRows.length === 0 && binTransferRows.length === 0 && inventoryFoundRows.length === 0 && transferUpchargeRows.length === 0 && partNumberChangeRows.length === 0) {
                 createEntryForm(context, errors.length > 0 ? 'Errors: ' + errors.join('; ') : 'No valid items to process.', 'error'); return;
             }
 
-            let adjustmentTranId = null, binTransferTranId = null, inventoryFoundTranId = null, transferOrderTranId = null;
+            let adjustmentTranId = null, binTransferTranId = null, inventoryFoundTranId = null, transferOrderTranId = null, partNumberChangeTranId = null;
             const processedItems = [];
             const failedItems = [];
 
@@ -4133,9 +4476,16 @@ define([
                 });
                 if (toTranIds.length > 0) transferOrderTranId = toTranIds.join(', ');
             }
+            if (partNumberChangeRows.length > 0) {
+                const result = tryBatchThenIndividual(partNumberChangeRows, createNonSerializedAdjustmentMulti, 'Part # Change via WH Assistant');
+                if (result.tranIds.length > 0) partNumberChangeTranId = result.tranIds.join(', ');
+                result.succeeded.forEach(function(row) { processedItems.push({ itemText: row.targetDisplayName || row.targetItemName, description: row.targetDescription, quantity: row.quantity, action: row.action }); });
+                result.failed.forEach(function(row) { failedItems.push({ itemText: row.targetDisplayName || row.targetItemName || row.sourceItemName, description: row.targetDescription, quantity: row.quantity, action: row.action, error: row._error || 'Part # change failed' }); });
+                if (result.failed.length > 0) errors.push(result.failed.length + ' part # change row(s) failed');
+            }
 
             if (processedItems.length === 0 && failedItems.length > 0) { createEntryForm(context, 'All operations failed: ' + errors.join('; '), 'error'); return; }
-            createNonSerializedMultiSuccessPage(context, adjustmentTranId, binTransferTranId, inventoryFoundTranId, processedItems, errors, transferOrderTranId, failedItems);
+            createNonSerializedMultiSuccessPage(context, adjustmentTranId, binTransferTranId, inventoryFoundTranId, processedItems, errors, transferOrderTranId, failedItems, null, partNumberChangeTranId);
         }
 
         // ====================================================================
@@ -5453,7 +5803,7 @@ define([
             const suiteletUrl = url.resolveScript({
                 scriptId: runtime.getCurrentScript().id,
                 deploymentId: runtime.getCurrentScript().deploymentId,
-                returnExternalUrl: true,
+                returnExternalUrl: false,
                 params: { action: 'printlabel' }
             });
 
@@ -5532,7 +5882,7 @@ define([
             const pdfUrl = url.resolveScript({
                 scriptId: runtime.getCurrentScript().id,
                 deploymentId: runtime.getCurrentScript().deploymentId,
-                returnExternalUrl: true,
+                returnExternalUrl: false,
                 params: { ajax_action: 'printpdf', record_id: recordId, item_text: itemText, description: description, serials: serials }
             });
 
@@ -6428,6 +6778,14 @@ tr:hover td { background:var(--surface-hover); }
         Create from IR
     </div>
     <div class="mob-more-section">Stock Counts</div>
+    <div class="mob-more-item" data-view="sc-dashboard" onclick="mobNavTo('sc-dashboard')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="9" y1="21" x2="9" y2="9"/></svg>
+        Dashboard
+    </div>
+    <div class="mob-more-item" data-view="sc-pending-review" onclick="mobNavTo('sc-pending-review')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
+        Pending Review
+    </div>
     <div class="mob-more-item" data-view="sc-create" onclick="mobNavTo('sc-create')">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 5H7a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-2"/><rect x="9" y="3" width="6" height="4" rx="1"/><line x1="9" y1="12" x2="15" y2="12"/><line x1="9" y1="16" x2="12" y2="16"/></svg>
         Create Stock Count
@@ -6514,6 +6872,14 @@ tr:hover td { background:var(--surface-hover); }
             <svg class="nav-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:14px;height:14px;flex-shrink:0;transition:transform .2s;"><polyline points="6 9 12 15 18 9"/></svg>
         </div>
         <div class="nav-group-items">
+            <div class="nav-item nav-sub" data-view="sc-dashboard">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="9" y1="21" x2="9" y2="9"/></svg>
+                Dashboard
+            </div>
+            <div class="nav-item nav-sub" data-view="sc-pending-review">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
+                Pending Review
+            </div>
             <div class="nav-item nav-sub" data-view="sc-create">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="16"/><line x1="8" y1="12" x2="16" y2="12"/></svg>
                 Create Stock Count
@@ -7024,7 +7390,6 @@ tr:hover td { background:var(--surface-hover); }
                         <th style="width:40px;"><input type="checkbox" id="sc-select-all" onchange="scToggleAll(this)" title="Select all"></th>
                         <th>Item</th>
                         <th style="width:130px;">Type</th>
-                        <th>Serial Numbers</th>
                     </tr>
                 </thead>
                 <tbody id="sc-items-body">
@@ -7036,6 +7401,256 @@ tr:hover td { background:var(--surface-hover); }
             <button class="btn btn-primary" id="sc-submit-btn" onclick="submitStockCount()">Create Stock Count</button>
             <button class="btn" onclick="scResetToSetup()">Back</button>
         </div>
+    </div>
+</div>
+
+<!-- ═══════ STOCK COUNT — DASHBOARD VIEW ═══════ -->
+<div class="view" id="view-sc-dashboard">
+    <div class="page-header">
+        <div><div class="page-title">Stock Count Dashboard</div><div class="page-subtitle">View and manage all stock counts</div></div>
+    </div>
+
+    <!-- Filters -->
+    <div class="card" style="max-width:900px;">
+        <div class="card-title">Filters</div>
+        <div class="form-grid" style="grid-template-columns:repeat(auto-fit, minmax(200px, 1fr));">
+            <div class="form-group">
+                <label class="form-label">Status</label>
+                <select id="scd-status-filter" onchange="scdLoadStockCounts()">
+                    <option value="">All Statuses</option>
+                    <option value="pending">Pending</option>
+                    <option value="in_progress">In Progress</option>
+                    <option value="completed">Completed</option>
+                    <option value="approved">Approved</option>
+                </select>
+            </div>
+            <div class="form-group" style="display:flex;align-items:flex-end;">
+                <button class="btn" onclick="scdLoadStockCounts()">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:16px;height:16px;margin-right:6px;"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+                    Refresh
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Stock Counts Table -->
+    <div class="card" style="max-width:1100px; margin-top:16px;">
+        <div class="card-title">Stock Counts</div>
+        <div class="table-wrap">
+            <table>
+                <thead>
+                    <tr>
+                        <th style="width:70px;">ID</th>
+                        <th>Location</th>
+                        <th>Bin</th>
+                        <th>Assigned To</th>
+                        <th style="width:80px;">Items</th>
+                        <th style="width:120px;">Status</th>
+                        <th style="width:140px;">Created</th>
+                        <th style="width:140px;">Actions</th>
+                    </tr>
+                </thead>
+                <tbody id="scd-table-body">
+                    <tr><td colspan="8" style="text-align:center;color:var(--text-dim)">Loading...</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<!-- ═══════ STOCK COUNT — PENDING REVIEW VIEW ═══════ -->
+<div class="view" id="view-sc-pending-review">
+    <div class="page-header">
+        <div><div class="page-title">Pending Review</div><div class="page-subtitle">Stock counts awaiting approval</div></div>
+    </div>
+
+    <!-- Pending Review Table -->
+    <div class="card" style="max-width:1100px;">
+        <div class="card-title">Counts Pending Review</div>
+        <div class="table-wrap">
+            <table>
+                <thead>
+                    <tr>
+                        <th style="width:70px;">ID</th>
+                        <th>Location</th>
+                        <th>Bin</th>
+                        <th>Assigned To</th>
+                        <th style="width:80px;">Items</th>
+                        <th style="width:140px;">Created</th>
+                        <th style="width:140px;">Actions</th>
+                    </tr>
+                </thead>
+                <tbody id="scpr-table-body">
+                    <tr><td colspan="7" style="text-align:center;color:var(--text-dim)">Loading...</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<!-- ═══════ STOCK COUNT — EXECUTE VIEW ═══════ -->
+<div class="view" id="view-sc-execute">
+    <div class="page-header">
+        <div>
+            <div class="page-title">Count Stock</div>
+            <div class="page-subtitle" id="sce-subtitle">Stock Count #<span id="sce-count-id">—</span> | <span id="sce-bin-name">—</span></div>
+        </div>
+        <button class="btn" onclick="navigateTo('sc-dashboard')">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:16px;height:16px;margin-right:6px;"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></svg>
+            Back to Dashboard
+        </button>
+    </div>
+
+    <!-- Progress Summary -->
+    <div class="stats-row" id="sce-stats" style="max-width:600px;">
+        <div class="stat-card"><div class="label">Total Items</div><div class="value" id="sce-stat-total">—</div></div>
+        <div class="stat-card"><div class="label">Counted</div><div class="value" id="sce-stat-counted" style="color:var(--success)">—</div></div>
+        <div class="stat-card"><div class="label">Remaining</div><div class="value" id="sce-stat-remaining" style="color:var(--warning)">—</div></div>
+    </div>
+
+    <!-- Current Item Card -->
+    <div class="card" style="max-width:700px; margin-top:16px;" id="sce-current-item-card">
+        <div class="card-title">Current Item</div>
+        <div id="sce-no-items" style="display:none; text-align:center; padding:30px; color:var(--text-dim);">
+            All items have been counted!
+        </div>
+        <div id="sce-item-details">
+            <div style="margin-bottom:16px;">
+                <div style="font-size:12px; color:var(--text-dim); margin-bottom:4px;">Item Name</div>
+                <div style="font-size:16px; font-weight:600;" id="sce-item-name">—</div>
+            </div>
+
+            <!-- Serialized Item: Scan serials -->
+            <div id="sce-serial-section" style="display:none;">
+                <div class="form-group">
+                    <label class="form-label">Scan Serial Number</label>
+                    <div style="display:flex; gap:10px;">
+                        <input type="text" id="sce-serial-input" placeholder="Scan or enter serial number" onkeydown="if(event.key==='Enter')sceAddSerial()" style="flex:1;">
+                        <button class="btn btn-primary" onclick="sceAddSerial()">Add</button>
+                    </div>
+                </div>
+
+                <div style="font-size:12px; color:var(--text-dim); margin-bottom:8px; margin-top:16px;">Scanned Serials (<span id="sce-scanned-count">0</span>)</div>
+                <div id="sce-scanned-serials" style="background:var(--surface); border:1px solid var(--border); padding:10px; border-radius:6px; min-height:60px; max-height:150px; overflow-y:auto;">
+                    <span style="color:var(--text-dim)">No serials scanned yet</span>
+                </div>
+            </div>
+
+            <!-- Non-Serialized Item: Enter quantity -->
+            <div id="sce-qty-section" style="display:none;">
+                <div class="form-group">
+                    <label class="form-label">Enter Counted Quantity</label>
+                    <input type="number" id="sce-qty-input" min="0" placeholder="0" style="max-width:200px;">
+                </div>
+            </div>
+
+            <div style="margin-top:20px; display:flex; gap:10px; flex-wrap:wrap;">
+                <button class="btn btn-primary" id="sce-confirm-btn" onclick="sceConfirmItem()">Confirm & Next</button>
+                <button class="btn" onclick="sceSkipItem()">Skip</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Counted Items Summary -->
+    <div class="card" style="max-width:900px; margin-top:16px;">
+        <div class="card-title">Counted Items</div>
+        <div class="table-wrap">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Item</th>
+                        <th style="width:80px;">Qty</th>
+                        <th style="width:80px;">Action</th>
+                    </tr>
+                </thead>
+                <tbody id="sce-counted-body">
+                    <tr><td colspan="3" style="text-align:center;color:var(--text-dim)">No items counted yet</td></tr>
+                </tbody>
+            </table>
+        </div>
+        <div style="margin-top:16px; display:flex; gap:10px; flex-wrap:wrap;">
+            <button class="btn btn-primary" id="sce-save-btn" onclick="sceSaveProgress()">Save Progress</button>
+            <button class="btn" id="sce-complete-btn" onclick="sceCompleteCount()" style="background:var(--success);color:white;">Complete Count</button>
+        </div>
+    </div>
+</div>
+
+<!-- ═══════ STOCK COUNT — REVIEW/APPROVE VIEW ═══════ -->
+<div class="view" id="view-sc-review">
+    <div class="page-header">
+        <div><div class="page-title">Review Stock Count</div><div class="page-subtitle">Compare expected vs counted and approve adjustments</div></div>
+        <button class="btn" onclick="navigateTo('sc-dashboard')">Back to Dashboard</button>
+    </div>
+
+    <!-- Count Info Card -->
+    <div class="card" style="max-width:1200px;">
+        <div class="card-title">Count Details</div>
+        <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(150px, 1fr)); gap:16px;">
+            <div><div style="font-size:12px; color:var(--text-dim);">Count ID</div><div style="font-weight:600;" id="scr-count-id">—</div></div>
+            <div><div style="font-size:12px; color:var(--text-dim);">Location</div><div style="font-weight:600;" id="scr-location">—</div></div>
+            <div><div style="font-size:12px; color:var(--text-dim);">Bin</div><div style="font-weight:600;" id="scr-bin">—</div></div>
+            <div><div style="font-size:12px; color:var(--text-dim);">Status</div><div style="font-weight:600;" id="scr-status">—</div></div>
+        </div>
+    </div>
+
+    <!-- Summary Stats -->
+    <div class="card" style="max-width:1200px; margin-top:16px;">
+        <div class="card-title">Discrepancy Summary</div>
+        <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(120px, 1fr)); gap:16px; text-align:center;">
+            <div style="padding:12px; background:var(--surface-hover); border-radius:8px;">
+                <div style="font-size:24px; font-weight:700;" id="scr-total-items">0</div>
+                <div style="font-size:12px; color:var(--text-dim);">Total Items</div>
+            </div>
+            <div style="padding:12px; background:var(--surface-hover); border-radius:8px;">
+                <div style="font-size:24px; font-weight:700; color:var(--success);" id="scr-matched">0</div>
+                <div style="font-size:12px; color:var(--text-dim);">Matched</div>
+            </div>
+            <div style="padding:12px; background:var(--surface-hover); border-radius:8px;">
+                <div style="font-size:24px; font-weight:700; color:var(--error);" id="scr-discrepancies">0</div>
+                <div style="font-size:12px; color:var(--text-dim);">Discrepancies</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Discrepancy Table -->
+    <div class="card" style="max-width:1200px; margin-top:16px;">
+        <div class="card-title">Item Comparison</div>
+        <div class="table-wrap">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Item</th>
+                        <th style="width:100px;">Type</th>
+                        <th>Expected</th>
+                        <th>Counted</th>
+                        <th style="width:180px;">Discrepancy</th>
+                        <th style="width:180px;">Action</th>
+                    </tr>
+                </thead>
+                <tbody id="scr-review-body">
+                    <tr><td colspan="6" style="text-align:center; color:var(--text-dim);">Loading...</td></tr>
+                </tbody>
+            </table>
+        </div>
+        <div id="scr-action-msg" style="display:none; margin-top:12px;"></div>
+        <div id="scr-pending-msg" style="margin-top:12px; padding:12px; background:rgba(255,193,7,0.15); border-radius:8px; color:var(--warning); display:none;">
+            <strong>Note:</strong> You must approve or reject all items before the count can be finalized.
+        </div>
+        <div style="margin-top:16px; display:flex; gap:10px; flex-wrap:wrap;">
+            <button class="btn btn-primary" id="scr-finalize-btn" onclick="scrFinalizeCount()" disabled>Finalize Count</button>
+            <button class="btn" onclick="navigateTo('sc-dashboard')">Cancel</button>
+        </div>
+    </div>
+</div>
+
+<!-- ═══ SERIAL DISCREPANCY POPUP ═══ -->
+<div class="modal-overlay" id="scr-serial-modal">
+    <div class="modal" style="max-width:500px;">
+        <div class="modal-title">
+            <span id="scr-serial-modal-title">Serial Discrepancies</span>
+            <button class="modal-close" onclick="scrCloseSerialModal()">&times;</button>
+        </div>
+        <div id="scr-serial-modal-body" style="max-height:400px; overflow-y:auto;"></div>
     </div>
 </div>
 
@@ -7302,6 +7917,23 @@ async function sopickLoadLP() {
 //  NAVIGATION
 // ═══════════════════════════════════════════════════════════
 let dashboardLoaded = false;
+let _scdLoaded = false;
+let _scprLoaded = false;
+
+function navigateTo(view) {
+    const navItem = document.querySelector('.nav-item[data-view="' + view + '"]');
+    if (navItem) {
+        navItem.click();
+    } else {
+        // For programmatic views without nav items (like sc-execute)
+        document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+        document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
+        const viewEl = document.getElementById('view-' + view);
+        if (viewEl) viewEl.classList.add('active');
+        // Reset main padding for regular views
+        document.querySelector('.main').style.padding = '';
+    }
+}
 document.querySelectorAll('.nav-item[data-view]').forEach(el => {
     el.addEventListener('click', () => {
         document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
@@ -7323,6 +7955,18 @@ document.querySelectorAll('.nav-item[data-view]').forEach(el => {
         if (el.dataset.view === 'dashboard' && !dashboardLoaded) {
             dashboardLoaded = true;
             loadDashboard();
+        }
+
+        // Lazy-load stock count dashboard on first visit
+        if (el.dataset.view === 'sc-dashboard' && !_scdLoaded) {
+            _scdLoaded = true;
+            scdLoadStockCounts();
+        }
+
+        // Lazy-load pending review on first visit
+        if (el.dataset.view === 'sc-pending-review' && !_scprLoaded) {
+            _scprLoaded = true;
+            scprLoadPendingReview();
         }
 
         // Close mobile menu on nav
@@ -8924,14 +9568,10 @@ async function scLoadItems() {
                 const typeBadge = item.serialized
                     ? '<span class="badge badge-info">Serialized</span>'
                     : '<span class="badge" style="background:var(--surface-hover)">Non-Serialized</span>';
-                const serialsCell = item.serialized && item.serialNumbers.length
-                    ? '<span style="font-size:12px;font-family:var(--mono);word-break:break-all;">' + escHtml(item.serialNumbers.join(', ')) + '</span>'
-                    : '<span style="color:var(--text-dim)">—</span>';
                 return '<tr>' +
                     '<td><input type="checkbox" class="sc-item-cb" data-idx="' + idx + '" checked onchange="scUpdateSelectAll()"></td>' +
                     '<td style="font-weight:500;">' + escHtml(item.itemName) + '</td>' +
                     '<td>' + typeBadge + '</td>' +
-                    '<td>' + serialsCell + '</td>' +
                     '</tr>';
             }).join('');
         }
@@ -8977,9 +9617,7 @@ async function submitStockCount() {
     try {
         const data = await apiPost('createStockCount', { locationId, binId, binName, assignedTo, itemsJson: JSON.stringify(selected) });
         if (data.success) {
-            msgDiv.style.display = 'block';
-            msgDiv.className = 'alert alert-success';
-            msgDiv.textContent = 'Stock count #' + data.id + ' created with ' + selected.length + ' item(s).';
+            toast('Stock count #' + data.id + ' created successfully with ' + selected.length + ' item(s).', 'success');
             scResetToSetup();
         } else {
             msgDiv.style.display = 'block';
@@ -8993,6 +9631,764 @@ async function submitStockCount() {
     } finally {
         _btnReset(btn);
     }
+}
+
+// ═══════════════════════════════════════════════════════════
+//  STOCK COUNT DASHBOARD
+// ═══════════════════════════════════════════════════════════
+
+async function scdLoadStockCounts() {
+    const status = document.getElementById('scd-status-filter').value;
+    const tbody = document.getElementById('scd-table-body');
+    tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--text-dim)">Loading...</td></tr>';
+
+    try {
+        const params = status ? { status } : {};
+        const data = await apiGet('getStockCounts', params);
+        if (!data.success) {
+            tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--danger)">' + escHtml(data.message || 'Failed to load') + '</td></tr>';
+            return;
+        }
+        const results = data.results || [];
+        if (results.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--text-dim)">No stock counts found</td></tr>';
+            return;
+        }
+        tbody.innerHTML = results.map(sc => {
+            const statusBadge = scdGetStatusBadge(sc.status);
+            const actionBtn = scdGetActionButton(sc);
+            return '<tr>' +
+                '<td style="font-weight:500;">#' + escHtml(sc.id) + '</td>' +
+                '<td>' + escHtml(sc.location || '—') + '</td>' +
+                '<td>' + escHtml(sc.binName || '—') + '</td>' +
+                '<td>' + escHtml(sc.assignedTo || '—') + '</td>' +
+                '<td style="text-align:center;">' + sc.itemCount + '</td>' +
+                '<td>' + statusBadge + '</td>' +
+                '<td style="font-size:12px;">' + escHtml(sc.created || '—') + '</td>' +
+                '<td>' + actionBtn + '</td>' +
+                '</tr>';
+        }).join('');
+    } catch (err) {
+        tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--danger)">Error: ' + escHtml(err.message) + '</td></tr>';
+    }
+}
+
+async function scprLoadPendingReview() {
+    const tbody = document.getElementById('scpr-table-body');
+    tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--text-dim)">Loading...</td></tr>';
+
+    try {
+        const data = await apiGet('getStockCounts', { status: 'completed' });
+        if (!data.success) {
+            tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--danger)">' + escHtml(data.message || 'Failed to load') + '</td></tr>';
+            return;
+        }
+        // Filter only completed counts without adjustment ID (pending review)
+        const results = (data.results || []).filter(sc => !sc.adjustmentId);
+        if (results.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--text-dim)">No counts pending review</td></tr>';
+            return;
+        }
+        tbody.innerHTML = results.map(sc => {
+            return '<tr>' +
+                '<td style="font-weight:500;">#' + escHtml(sc.id) + '</td>' +
+                '<td>' + escHtml(sc.location || '—') + '</td>' +
+                '<td>' + escHtml(sc.binName || '—') + '</td>' +
+                '<td>' + escHtml(sc.assignedTo || '—') + '</td>' +
+                '<td style="text-align:center;">' + sc.itemCount + '</td>' +
+                '<td style="font-size:12px;">' + escHtml(sc.created || '—') + '</td>' +
+                '<td><button class="btn" style="padding:6px 12px;font-size:12px;background:var(--warning);color:#000;" onclick="scrStartReview(' + sc.id + ')">Review</button></td>' +
+                '</tr>';
+        }).join('');
+    } catch (err) {
+        tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--danger)">Error: ' + escHtml(err.message) + '</td></tr>';
+    }
+}
+
+function scdGetStatusBadge(status) {
+    switch(status) {
+        case 'pending':
+            return '<span class="badge" style="background:var(--surface-hover);color:var(--text);">Pending</span>';
+        case 'in_progress':
+            return '<span class="badge badge-info">In Progress</span>';
+        case 'completed':
+            return '<span class="badge" style="background:var(--warning);color:#000;">Pending Review</span>';
+        case 'approved':
+            return '<span class="badge" style="background:var(--success);color:#fff;">Approved</span>';
+        case 'rejected':
+            return '<span class="badge badge-error">Rejected</span>';
+        default:
+            return '<span class="badge">' + escHtml(status || 'Unknown') + '</span>';
+    }
+}
+
+function scdGetActionButton(sc) {
+    if (sc.status === 'pending') {
+        return '<button class="btn btn-primary" style="padding:6px 12px;font-size:12px;" onclick="sceStartCount(' + sc.id + ')">Start Count</button>';
+    } else if (sc.status === 'in_progress') {
+        return '<button class="btn" style="padding:6px 12px;font-size:12px;" onclick="sceStartCount(' + sc.id + ')">Continue</button>';
+    } else if (sc.status === 'completed' && !sc.adjustmentId) {
+        return '<button class="btn" style="padding:6px 12px;font-size:12px;background:var(--warning);color:#000;" onclick="scrStartReview(' + sc.id + ')">Review</button>';
+    } else {
+        return '<button class="btn" style="padding:6px 12px;font-size:12px;" onclick="scrViewApproved(' + sc.id + ')">View</button>';
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
+//  STOCK COUNT EXECUTION
+// ═══════════════════════════════════════════════════════════
+let _sceData = null;
+let _sceItems = [];
+let _sceCounted = [];
+let _sceCurrentIdx = 0;
+let _sceScannedSerials = [];
+
+async function sceStartCount(id) {
+    showProcessing('Loading Stock Count...', 'Fetching details');
+    try {
+        const data = await apiGet('getStockCountById', { id });
+        if (!data.success) {
+            toast(data.message || 'Failed to load stock count.', 'error');
+            return;
+        }
+        _sceData = data.data;
+        _sceItems = _sceData.items || [];
+        _sceCounted = _sceData.counted || [];
+        _sceCurrentIdx = 0;
+        _sceScannedSerials = [];
+
+        // Update status to in_progress if pending
+        if (_sceData.status === 'pending') {
+            await apiPost('updateStockCount', { id: _sceData.id, status: 'in_progress' });
+        }
+
+        // Find first uncounted item
+        _sceCurrentIdx = _sceItems.findIndex(item => !_sceCounted.find(c => c.itemId === item.itemId));
+        if (_sceCurrentIdx < 0) _sceCurrentIdx = 0;
+
+        navigateTo('sc-execute');
+        sceRenderUI();
+    } catch (err) {
+        toast('Error: ' + err.message, 'error');
+    } finally {
+        hideProcessing();
+    }
+}
+
+async function sceViewCount(id) {
+    await sceStartCount(id);
+}
+
+function sceRenderUI() {
+    if (!_sceData) return;
+
+    document.getElementById('sce-count-id').textContent = _sceData.id;
+    document.getElementById('sce-bin-name').textContent = _sceData.binName || '—';
+
+    // Stats
+    const totalItems = _sceItems.length;
+    const countedItems = _sceCounted.length;
+    const remaining = totalItems - countedItems;
+    document.getElementById('sce-stat-total').textContent = totalItems;
+    document.getElementById('sce-stat-counted').textContent = countedItems;
+    document.getElementById('sce-stat-remaining').textContent = remaining;
+
+    // Current item
+    const uncountedItems = _sceItems.filter(item => !_sceCounted.find(c => c.itemId === item.itemId));
+    if (uncountedItems.length === 0) {
+        document.getElementById('sce-no-items').style.display = 'block';
+        document.getElementById('sce-item-details').style.display = 'none';
+    } else {
+        document.getElementById('sce-no-items').style.display = 'none';
+        document.getElementById('sce-item-details').style.display = 'block';
+        const currentItem = uncountedItems[0];
+        sceRenderCurrentItem(currentItem);
+    }
+
+    // Counted table
+    sceRenderCountedTable();
+}
+
+function sceRenderCurrentItem(item) {
+    document.getElementById('sce-item-name').textContent = item.itemName || '—';
+
+    if (item.serialized) {
+        document.getElementById('sce-serial-section').style.display = 'block';
+        document.getElementById('sce-qty-section').style.display = 'none';
+
+        _sceScannedSerials = [];
+        sceRenderScannedSerials();
+        document.getElementById('sce-serial-input').value = '';
+        document.getElementById('sce-serial-input').focus();
+    } else {
+        document.getElementById('sce-serial-section').style.display = 'none';
+        document.getElementById('sce-qty-section').style.display = 'block';
+        document.getElementById('sce-qty-input').value = '';
+        document.getElementById('sce-qty-input').focus();
+    }
+}
+
+function sceRenderScannedSerials() {
+    const container = document.getElementById('sce-scanned-serials');
+    document.getElementById('sce-scanned-count').textContent = _sceScannedSerials.length;
+    if (_sceScannedSerials.length === 0) {
+        container.innerHTML = '<span style="color:var(--text-dim)">No serials scanned yet</span>';
+    } else {
+        container.innerHTML = _sceScannedSerials.map((sn, idx) =>
+            '<span style="display:inline-flex;align-items:center;gap:4px;background:var(--primary);color:#fff;padding:2px 8px;border-radius:4px;margin:2px;font-size:12px;">' +
+            escHtml(sn) +
+            '<span style="cursor:pointer;opacity:0.7;" onclick="sceRemoveSerial(' + idx + ')">&times;</span>' +
+            '</span>'
+        ).join('');
+    }
+}
+
+function sceAddSerial() {
+    const input = document.getElementById('sce-serial-input');
+    const sn = input.value.trim();
+    if (!sn) return;
+
+    if (_sceScannedSerials.includes(sn)) {
+        toast('Serial already scanned.', 'error');
+        return;
+    }
+
+    _sceScannedSerials.push(sn);
+    sceRenderScannedSerials();
+    input.value = '';
+    input.focus();
+    toast('Serial added: ' + sn, 'success');
+}
+
+function sceRemoveSerial(idx) {
+    _sceScannedSerials.splice(idx, 1);
+    sceRenderScannedSerials();
+}
+
+function sceConfirmItem() {
+    const uncountedItems = _sceItems.filter(item => !_sceCounted.find(c => c.itemId === item.itemId));
+    if (uncountedItems.length === 0) {
+        toast('No items to count.', 'info');
+        return;
+    }
+
+    const currentItem = uncountedItems[0];
+    let countedValue;
+
+    if (currentItem.serialized) {
+        if (_sceScannedSerials.length === 0) {
+            toast('Please scan at least one serial number.', 'error');
+            return;
+        }
+        countedValue = { serials: [..._sceScannedSerials] };
+    } else {
+        const qty = parseInt(document.getElementById('sce-qty-input').value) || 0;
+        if (qty < 0) {
+            toast('Quantity must be 0 or greater.', 'error');
+            return;
+        }
+        countedValue = { quantity: qty };
+    }
+
+    _sceCounted.push({
+        itemId: currentItem.itemId,
+        itemName: currentItem.itemName,
+        serialized: currentItem.serialized,
+        expected: currentItem.serialized ? (currentItem.serialNumbers || []) : null,
+        counted: countedValue
+    });
+
+    toast('Item counted: ' + currentItem.itemName, 'success');
+    sceRenderUI();
+}
+
+function sceSkipItem() {
+    const uncountedItems = _sceItems.filter(item => !_sceCounted.find(c => c.itemId === item.itemId));
+    if (uncountedItems.length <= 1) {
+        toast('No more items to skip to.', 'info');
+        return;
+    }
+    // Move current item to end of uncounted list by adding a skipped marker
+    const skipped = uncountedItems[0];
+    _sceItems = _sceItems.filter(i => i.itemId !== skipped.itemId);
+    _sceItems.push(skipped);
+    sceRenderUI();
+}
+
+function sceRenderCountedTable() {
+    const tbody = document.getElementById('sce-counted-body');
+    if (_sceCounted.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="3" style="text-align:center;color:var(--text-dim)">No items counted yet</td></tr>';
+        return;
+    }
+    tbody.innerHTML = _sceCounted.map((c, idx) => {
+        let countedVal;
+        if (c.serialized) {
+            const serials = c.counted.serials || [];
+            countedVal = serials.length;
+        } else {
+            countedVal = c.counted.quantity || 0;
+        }
+        const recountBtn = '<button class="btn" style="padding:2px 8px;font-size:11px;" onclick="sceRecountItem(' + idx + ')" title="Recount this item">↩ Redo</button>';
+        return '<tr>' +
+            '<td style="font-weight:500;">' + escHtml(c.itemName) + '</td>' +
+            '<td>' + countedVal + '</td>' +
+            '<td style="text-align:center;">' + recountBtn + '</td>' +
+            '</tr>';
+    }).join('');
+}
+
+function sceRecountItem(idx) {
+    if (idx < 0 || idx >= _sceCounted.length) return;
+
+    const item = _sceCounted[idx];
+    // Remove from counted
+    _sceCounted.splice(idx, 1);
+
+    // Move this item to the front of _sceItems so it becomes the current item
+    const itemIdx = _sceItems.findIndex(i => i.itemId === item.itemId);
+    if (itemIdx > -1) {
+        const [removed] = _sceItems.splice(itemIdx, 1);
+        _sceItems.unshift(removed);
+    }
+
+    // Re-render UI
+    sceRenderUI();
+    toast('Item ready for recount: ' + item.itemName, 'info');
+}
+
+async function sceSaveProgress() {
+    if (!_sceData) {
+        toast('No stock count loaded.', 'error');
+        return;
+    }
+
+    const btn = document.getElementById('sce-save-btn');
+    _btnWait(btn);
+    try {
+        const data = await apiPost('updateStockCount', {
+            id: _sceData.id,
+            countedJson: JSON.stringify(_sceCounted)
+        });
+        if (data.success) {
+            toast('Progress saved successfully.', 'success');
+        } else {
+            toast(data.message || 'Failed to save progress.', 'error');
+        }
+    } catch (err) {
+        toast('Error: ' + err.message, 'error');
+    } finally {
+        _btnReset(btn);
+    }
+}
+
+async function sceCompleteCount() {
+    if (!_sceData) {
+        toast('No stock count loaded.', 'error');
+        return;
+    }
+
+    const uncountedItems = _sceItems.filter(item => !_sceCounted.find(c => c.itemId === item.itemId));
+    if (uncountedItems.length > 0) {
+        if (!confirm('There are still ' + uncountedItems.length + ' uncounted item(s). Are you sure you want to complete this count?')) {
+            return;
+        }
+    }
+
+    const btn = document.getElementById('sce-complete-btn');
+    _btnWait(btn);
+    try {
+        const data = await apiPost('updateStockCount', {
+            id: _sceData.id,
+            status: 'completed',
+            countedJson: JSON.stringify(_sceCounted)
+        });
+        if (data.success) {
+            toast('Stock count completed successfully!', 'success');
+            navigateTo('sc-dashboard');
+            scdLoadStockCounts();
+        } else {
+            toast(data.message || 'Failed to complete count.', 'error');
+        }
+    } catch (err) {
+        toast('Error: ' + err.message, 'error');
+    } finally {
+        _btnReset(btn);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
+//  STOCK COUNT REVIEW / APPROVAL
+// ═══════════════════════════════════════════════════════════
+let _scrData = null;
+let _scrDiscrepancies = [];
+
+async function scrStartReview(id) {
+    showProcessing('Loading stock count...');
+    try {
+        const data = await apiGet('getStockCountById', { id });
+        if (!data.success) {
+            toast(data.message || 'Failed to load stock count.', 'error');
+            return;
+        }
+        _scrData = data.data;
+
+        // Calculate discrepancies
+        _scrDiscrepancies = scrCalculateDiscrepancies(_scrData.items, _scrData.counted);
+
+        // Populate UI
+        scrRenderReviewUI();
+        navigateTo('sc-review');
+    } catch (err) {
+        toast('Error: ' + err.message, 'error');
+    } finally {
+        hideProcessing();
+    }
+}
+
+function scrCalculateDiscrepancies(items, counted) {
+    const discrepancies = [];
+
+    // Create a map of counted items by itemId
+    const countedMap = {};
+    (counted || []).forEach(c => {
+        countedMap[c.itemId] = c;
+    });
+
+    // Compare each expected item
+    (items || []).forEach(item => {
+        const countedItem = countedMap[item.itemId];
+        const disc = {
+            itemId: item.itemId,
+            itemName: item.itemName,
+            serialized: item.serialized,
+            expectedSerials: item.serialNumbers || [],
+            expectedQty: item.serialized ? (item.serialNumbers || []).length : (item.expectedQty || 0),
+            countedSerials: [],
+            countedQty: null,
+            missingSerials: [],
+            extraSerials: [],
+            qtyDifference: 0,
+            hasDiscrepancy: false
+        };
+
+        if (countedItem) {
+            if (item.serialized) {
+                disc.countedSerials = countedItem.counted?.serials || [];
+                // Find missing serials (expected but not counted - need to remove from NetSuite)
+                disc.missingSerials = disc.expectedSerials.filter(sn => !disc.countedSerials.includes(sn));
+                // Find extra serials (counted but not expected - need to add to NetSuite)
+                disc.extraSerials = disc.countedSerials.filter(sn => !disc.expectedSerials.includes(sn));
+                disc.hasDiscrepancy = disc.missingSerials.length > 0 || disc.extraSerials.length > 0;
+            } else {
+                disc.countedQty = countedItem.counted?.quantity || 0;
+                // expectedQty already set from item.expectedQty above
+                disc.qtyDifference = disc.countedQty - disc.expectedQty;
+                disc.hasDiscrepancy = disc.qtyDifference !== 0;
+            }
+        } else {
+            // Item was not counted at all
+            if (item.serialized) {
+                disc.missingSerials = [...disc.expectedSerials];
+                disc.hasDiscrepancy = disc.expectedSerials.length > 0;
+            } else {
+                disc.countedQty = 0;
+                // expectedQty already set from item.expectedQty above
+                disc.qtyDifference = 0 - disc.expectedQty;
+                disc.hasDiscrepancy = disc.expectedQty > 0;
+            }
+        }
+
+        discrepancies.push(disc);
+    });
+
+    return discrepancies;
+}
+
+// Track per-item approval state: 'pending' | 'approved' | 'rejected'
+let _scrItemStates = [];
+
+function scrRenderReviewUI() {
+    // Header info
+    document.getElementById('scr-count-id').textContent = '#' + _scrData.id;
+    document.getElementById('scr-location').textContent = _scrData.location || '—';
+    document.getElementById('scr-bin').textContent = _scrData.binName || '—';
+    document.getElementById('scr-status').textContent = _scrData.status || '—';
+
+    // Initialize item states - items with no discrepancy are auto-approved
+    _scrItemStates = _scrDiscrepancies.map(d => d.hasDiscrepancy ? 'pending' : 'approved');
+
+    // Summary stats
+    const totalItems = _scrDiscrepancies.length;
+    const discrepancyCount = _scrDiscrepancies.filter(d => d.hasDiscrepancy).length;
+    const matchedCount = totalItems - discrepancyCount;
+
+    document.getElementById('scr-total-items').textContent = totalItems;
+    document.getElementById('scr-matched').textContent = matchedCount;
+    document.getElementById('scr-discrepancies').textContent = discrepancyCount;
+
+    // Render table
+    scrRenderReviewTable();
+    scrUpdateFinalizeButton();
+}
+
+function scrRenderReviewTable() {
+    const tbody = document.getElementById('scr-review-body');
+
+    if (_scrDiscrepancies.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--text-dim);">No items to review</td></tr>';
+        return;
+    }
+
+    tbody.innerHTML = _scrDiscrepancies.map((d, idx) => {
+        const typeBadge = d.serialized
+            ? '<span class="badge badge-info">Serialized</span>'
+            : '<span class="badge" style="background:var(--surface-hover)">Non-Serialized</span>';
+
+        let expectedCell, countedCell, discrepancyCell;
+        const state = _scrItemStates[idx];
+
+        if (d.serialized) {
+            expectedCell = d.expectedSerials.length > 0
+                ? '<span style="font-size:11px;">' + d.expectedSerials.length + ' serial(s)</span>'
+                : '<span style="color:var(--text-dim);">None</span>';
+            countedCell = d.countedSerials.length > 0
+                ? '<span style="font-size:11px;">' + d.countedSerials.length + ' serial(s)</span>'
+                : '<span style="color:var(--text-dim);">None</span>';
+
+            if (d.hasDiscrepancy) {
+                const parts = [];
+                if (d.missingSerials.length > 0) {
+                    parts.push('<span style="color:var(--danger);">-' + d.missingSerials.length + ' missing</span>');
+                }
+                if (d.extraSerials.length > 0) {
+                    parts.push('<span style="color:var(--success);">+' + d.extraSerials.length + ' extra</span>');
+                }
+                // Make discrepancy clickable to show popup
+                discrepancyCell = '<a href="#" onclick="scrShowSerialModal(' + idx + '); return false;" style="text-decoration:underline; cursor:pointer;">' + parts.join('<br>') + '</a>';
+            } else {
+                discrepancyCell = '<span style="color:var(--success);">Match</span>';
+            }
+        } else {
+            expectedCell = '<span style="font-size:11px;">Qty: ' + (d.expectedQty || 0) + '</span>';
+            countedCell = '<span style="font-size:11px;">Qty: ' + (d.countedQty || 0) + '</span>';
+
+            if (d.hasDiscrepancy) {
+                const sign = d.qtyDifference > 0 ? '+' : '';
+                const color = d.qtyDifference > 0 ? 'var(--success)' : 'var(--danger)';
+                discrepancyCell = '<span style="color:' + color + ';">' + sign + d.qtyDifference + '</span>';
+            } else {
+                discrepancyCell = '<span style="color:var(--success);">Match</span>';
+            }
+        }
+
+        // Action column based on state
+        let actionCell;
+        if (!d.hasDiscrepancy) {
+            actionCell = '<span style="color:var(--success); font-size:12px;">No action needed</span>';
+        } else if (state === 'approved') {
+            actionCell = '<span class="badge" style="background:var(--success);color:white;">Approved</span>' +
+                '<button class="btn" onclick="scrUndoItem(' + idx + ')" style="margin-left:8px;padding:4px 8px;font-size:11px;">Undo</button>';
+        } else if (state === 'rejected') {
+            actionCell = '<span class="badge badge-error">Rejected</span>' +
+                '<button class="btn" onclick="scrUndoItem(' + idx + ')" style="margin-left:8px;padding:4px 8px;font-size:11px;">Undo</button>';
+        } else {
+            actionCell = '<button class="btn" onclick="scrApproveItem(' + idx + ')" style="padding:4px 10px;font-size:11px;background:var(--success);color:white;">Approve</button>' +
+                '<button class="btn btn-danger" onclick="scrRejectItem(' + idx + ')" style="margin-left:6px;padding:4px 10px;font-size:11px;">Reject</button>';
+        }
+
+        // Row styling based on state
+        let rowStyle = '';
+        if (d.hasDiscrepancy) {
+            if (state === 'approved') {
+                rowStyle = 'background:rgba(34,197,94,0.15);';
+            } else if (state === 'rejected') {
+                rowStyle = 'background:rgba(220,38,38,0.15);';
+            } else {
+                rowStyle = 'background:rgba(255,193,7,0.15);';
+            }
+        }
+
+        return '<tr style="' + rowStyle + '">' +
+            '<td style="font-weight:500;">' + escHtml(d.itemName) + '</td>' +
+            '<td>' + typeBadge + '</td>' +
+            '<td>' + expectedCell + '</td>' +
+            '<td>' + countedCell + '</td>' +
+            '<td>' + discrepancyCell + '</td>' +
+            '<td style="white-space:nowrap;">' + actionCell + '</td>' +
+            '</tr>';
+    }).join('');
+}
+
+function scrApproveItem(idx) {
+    _scrItemStates[idx] = 'approved';
+    scrRenderReviewTable();
+    scrUpdateFinalizeButton();
+}
+
+function scrRejectItem(idx) {
+    _scrItemStates[idx] = 'rejected';
+    scrRenderReviewTable();
+    scrUpdateFinalizeButton();
+}
+
+function scrUndoItem(idx) {
+    _scrItemStates[idx] = 'pending';
+    scrRenderReviewTable();
+    scrUpdateFinalizeButton();
+}
+
+function scrUpdateFinalizeButton() {
+    const pendingCount = _scrItemStates.filter(s => s === 'pending').length;
+    const btn = document.getElementById('scr-finalize-btn');
+    const msg = document.getElementById('scr-pending-msg');
+
+    if (pendingCount === 0) {
+        btn.disabled = false;
+        msg.style.display = 'none';
+    } else {
+        btn.disabled = true;
+        msg.style.display = 'block';
+        msg.innerHTML = '<strong>Note:</strong> ' + pendingCount + ' item(s) still pending. You must approve or reject all items before finalizing.';
+    }
+}
+
+function scrShowSerialModal(idx) {
+    const d = _scrDiscrepancies[idx];
+    if (!d || !d.serialized) return;
+
+    document.getElementById('scr-serial-modal-title').textContent = escHtml(d.itemName) + ' - Serial Discrepancies';
+
+    let html = '<div style="padding:16px;">';
+
+    // Serials in NetSuite (Expected)
+    html += '<div style="margin-bottom:16px;">';
+    html += '<div style="font-weight:600; margin-bottom:8px; color:var(--primary);">Serials in NetSuite (' + d.expectedSerials.length + ')</div>';
+    if (d.expectedSerials.length > 0) {
+        html += '<div style="max-height:120px; overflow-y:auto; background:var(--surface); padding:8px; border-radius:6px; font-size:12px;">';
+        d.expectedSerials.forEach(sn => {
+            const isMissing = d.missingSerials.includes(sn);
+            const style = isMissing ? 'color:var(--danger); font-weight:500;' : 'color:var(--success);';
+            const icon = isMissing ? '✗' : '✓';
+            html += '<div style="padding:2px 0;' + style + '">' + icon + ' ' + escHtml(sn) + (isMissing ? ' <em>(not scanned)</em>' : '') + '</div>';
+        });
+        html += '</div>';
+    } else {
+        html += '<div style="color:var(--text-dim); font-size:12px;">None</div>';
+    }
+    html += '</div>';
+
+    // Serials Scanned
+    html += '<div style="margin-bottom:16px;">';
+    html += '<div style="font-weight:600; margin-bottom:8px; color:var(--primary);">Serials Scanned (' + d.countedSerials.length + ')</div>';
+    if (d.countedSerials.length > 0) {
+        html += '<div style="max-height:120px; overflow-y:auto; background:var(--surface); padding:8px; border-radius:6px; font-size:12px;">';
+        d.countedSerials.forEach(sn => {
+            const isExtra = d.extraSerials.includes(sn);
+            const style = isExtra ? 'color:var(--warning); font-weight:500;' : 'color:var(--success);';
+            const icon = isExtra ? '+' : '✓';
+            html += '<div style="padding:2px 0;' + style + '">' + icon + ' ' + escHtml(sn) + (isExtra ? ' <em>(not in NetSuite)</em>' : '') + '</div>';
+        });
+        html += '</div>';
+    } else {
+        html += '<div style="color:var(--text-dim); font-size:12px;">None scanned</div>';
+    }
+    html += '</div>';
+
+    // Summary
+    html += '<div style="padding:12px; background:var(--surface-hover); border-radius:8px;">';
+    html += '<div style="font-weight:600; margin-bottom:8px;">Summary</div>';
+    if (d.missingSerials.length > 0) {
+        html += '<div style="color:var(--danger); font-size:12px;">• ' + d.missingSerials.length + ' serial(s) in NetSuite but NOT scanned (will be removed if approved)</div>';
+    }
+    if (d.extraSerials.length > 0) {
+        html += '<div style="color:var(--warning); font-size:12px;">• ' + d.extraSerials.length + ' serial(s) scanned but NOT in NetSuite (will be added if approved)</div>';
+    }
+    html += '</div>';
+
+    html += '</div>';
+
+    document.getElementById('scr-serial-modal-body').innerHTML = html;
+    document.getElementById('scr-serial-modal').classList.add('open');
+}
+
+function scrCloseSerialModal() {
+    document.getElementById('scr-serial-modal').classList.remove('open');
+}
+
+async function scrFinalizeCount() {
+    // Get approved items that have discrepancies
+    const approvedDiscrepancies = [];
+    _scrDiscrepancies.forEach((d, idx) => {
+        if (d.hasDiscrepancy && _scrItemStates[idx] === 'approved') {
+            approvedDiscrepancies.push(d);
+        }
+    });
+
+    // Check if all items are handled
+    const pendingCount = _scrItemStates.filter(s => s === 'pending').length;
+    if (pendingCount > 0) {
+        toast('Please approve or reject all items before finalizing.', 'warning');
+        return;
+    }
+
+    const btn = document.getElementById('scr-finalize-btn');
+    _btnWait(btn);
+    showProcessing('Finalizing stock count...');
+
+    try {
+        // Only create adjustments for approved items
+        if (approvedDiscrepancies.length > 0) {
+            const adjustments = approvedDiscrepancies.map(d => ({
+                itemId: d.itemId,
+                itemName: d.itemName,
+                serialized: d.serialized,
+                addSerials: d.extraSerials || [],
+                removeSerials: d.missingSerials || [],
+                adjustQty: d.serialized ? 0 : d.qtyDifference
+            }));
+
+            const data = await apiPost('createStockCountAdjustment', {
+                stockCountId: _scrData.id,
+                locationId: _scrData.locationId,
+                binId: _scrData.binId,
+                adjustments: adjustments
+            });
+
+            if (data.success) {
+                toast('Inventory adjustment created: ' + (data.tranId || data.adjustmentId), 'success');
+            } else {
+                toast(data.message || 'Failed to create adjustment.', 'error');
+                return;
+            }
+        } else {
+            // No adjustments needed - just mark the count as approved
+            const data = await apiPost('updateStockCount', {
+                id: _scrData.id,
+                status: 'approved'
+            });
+
+            if (data.success) {
+                toast('Count finalized. No adjustments needed.', 'success');
+            } else {
+                toast(data.message || 'Failed to finalize count.', 'error');
+                return;
+            }
+        }
+
+        navigateTo('sc-dashboard');
+        scdLoadStockCounts();
+    } catch (err) {
+        toast('Error: ' + err.message, 'error');
+    } finally {
+        _btnReset(btn);
+        hideProcessing();
+    }
+}
+
+function scrViewApproved(id) {
+    // For viewing already-approved counts, just show the review screen in read-only mode
+    scrStartReview(id);
 }
 
 // ═══════════════════════════════════════════════════════════

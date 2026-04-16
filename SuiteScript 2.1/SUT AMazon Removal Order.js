@@ -224,6 +224,7 @@ define(['N/record', 'N/search', 'N/log', 'N/url', 'N/runtime', 'N/ui/serverWidge
                 }
 
                 toRec.setValue({ fieldId: 'orderstatus', value: 'B' });
+                toRec.setValue({ fieldId: 'shipmethod', value: 186632 });
                 results.transferOrderId = toRec.save({ enableSourcing: true, ignoreMandatoryFields: true });
                 results.transferOrderTranId = getTranId(record.Type.TRANSFER_ORDER, results.transferOrderId);
                 log.audit('TO Created', results.transferOrderTranId);
@@ -1911,10 +1912,14 @@ document.addEventListener('keydown', function(e) {
                 const itemName = whEscapeXml(group.itemText || '');
                 const description = whEscapeXml(group.description || '');
                 const escapedRecordId = whEscapeXml(recordId || '');
+                const isTesting = String(group.action || '').indexOf('testing') !== -1;
+                var wrapOpen = isTesting ? '<table width="100%" height="100%"><tr><td>' : '';
+                var wrapClose = isTesting ? '</td><td width="12mm" valign="middle" align="center" style="font-size:19px; color:#AAAAAA; font-weight:bold; line-height:21px;">T<br/>E<br/>S<br/>T<br/>I<br/>N<br/>G</td></tr></table>' : '';
                 if (group.serialNumbers && group.serialNumbers.length > 0) {
                     group.serialNumbers.forEach(serialNumber => {
                         const escapedSerial = whEscapeXml(serialNumber);
                         bodyContent += '<body width="101.6mm" height="76.2mm" padding="0.0in 0.1in 0.0in 0.15in">'
+                            + wrapOpen
                             + '<table align="right" width="98%" height="50%"><tr height="12%"><td align="center"><table width="100%"><tr>'
                             + '<td style="font-size:18px;">' + itemName + '</td>'
                             + '<td align="right"><table style="border:1px;"><tr><td style="font-size:16px;">' + escapedRecordId + '</td></tr></table></td>'
@@ -1927,11 +1932,13 @@ document.addEventListener('keydown', function(e) {
                             + '</td></tr>'
                             + '<tr><td align="left" style="font-size:25px;">'
                             + '<barcode height="60px" width="220px" codetype="code128" showtext="true" value="' + itemName + '"/>'
-                            + '</td></tr></table></body>';
+                            + '</td></tr></table>'
+                            + wrapClose + '</body>';
                     });
                 } else if (group.quantity && group.quantity > 0) {
                     for (let i = 0; i < group.quantity; i++) {
                         bodyContent += '<body width="101.6mm" height="76.2mm" padding="0.0in 0.1in 0.0in 0.15in">'
+                            + wrapOpen
                             + '<table align="right" width="98%" height="50%"><tr height="12%"><td align="center"><table width="100%"><tr>'
                             + '<td style="font-size:18px;">' + itemName + '</td>'
                             + '<td align="right"><table style="border:1px;"><tr><td style="font-size:16px;">' + escapedRecordId + '</td></tr></table></td>'
@@ -1942,7 +1949,8 @@ document.addEventListener('keydown', function(e) {
                             + '<tr height="60px"><td height="60px" align="left"></td></tr>'
                             + '<tr><td align="left" style="font-size:25px;">'
                             + '<barcode height="60px" width="220px" codetype="code128" showtext="true" value="' + itemName + '"/>'
-                            + '</td></tr></table></body>';
+                            + '</td></tr></table>'
+                            + wrapClose + '</body>';
                     }
                 }
             });
@@ -2768,7 +2776,7 @@ document.addEventListener('keydown', function(e) {
                     group.recordId = rec.save({ enableSourcing: true, ignoreMandatoryFields: false });
                 } catch (e) { log.error('Print Label Record Error', e.message); group.recordId = 'ERR'; }
             });
-            const printData = labelGroups.map(g => ({ itemText: g.itemText || '', description: g.description || '', serialNumbers: g.serialNumbers }));
+            const printData = labelGroups.map(g => ({ itemText: g.itemText || '', description: g.description || '', serialNumbers: g.serialNumbers, action: g.action || '' }));
             const recordIdForPrint = (adjustmentTranId || binTransferTranId || serialChangeTranId || partNumberChangeTranId || transferOrderTranId || '').split(',')[0].trim();
             const styleField = form.addField({ id: 'custpage_styles', type: serverWidget.FieldType.INLINEHTML, label: ' ' });
             styleField.defaultValue = whGetStyles() + whGetSuccessPageScript(returnAction);
@@ -2813,7 +2821,7 @@ document.addEventListener('keydown', function(e) {
 
         function createWhNonSerializedMultiSuccessPage(context, adjustmentTranId, binTransferTranId, inventoryFoundTranId, processedItems, errors, transferOrderTranId, failedItems, returnAction, partNumberChangeTranId) {
             const form = serverWidget.createForm({ title: 'Transactions Created' });
-            const printData = processedItems.map(function(item) { return { itemText: item.itemText || '', description: item.description || '', quantity: item.quantity }; });
+            const printData = processedItems.map(function(item) { return { itemText: item.itemText || '', description: item.description || '', quantity: item.quantity, action: item.action || '' }; });
             const recordIdForPrint = (adjustmentTranId || binTransferTranId || partNumberChangeTranId || inventoryFoundTranId || transferOrderTranId || '').split(',')[0].trim();
             failedItems = failedItems || [];
             const styleField = form.addField({ id: 'custpage_styles', type: serverWidget.FieldType.INLINEHTML, label: ' ' });
@@ -3595,7 +3603,7 @@ document.addEventListener('keydown', function(e) {
                     group.recordId = rec.save({ enableSourcing: true, ignoreMandatoryFields: false });
                 } catch (e) { log.error('Print Label Record Error', e.message); group.recordId = 'ERR'; }
             });
-            const printData = labelGroups.map(g => ({ itemText: g.itemText || '', description: g.description || '', serialNumbers: g.serialNumbers }));
+            const printData = labelGroups.map(g => ({ itemText: g.itemText || '', description: g.description || '', serialNumbers: g.serialNumbers, action: g.action || '' }));
             nsProcessedItems.forEach(item => { printData.push({ itemText: item.itemText || '', description: item.description || '', quantity: item.quantity }); });
             const recordIdForPrint = (adjustmentTranId || binTransferTranId || serialChangeTranId || partNumberChangeTranId || transferOrderTranId || nsAdjustmentTranId || nsBinTransferTranId || nsPartNumberChangeTranId || nsInventoryFoundTranId || nsTransferOrderTranId || '').split(',')[0].trim();
             const printDataField = form.addField({ id: 'custpage_print_data', type: serverWidget.FieldType.LONGTEXT, label: 'Print Data' });

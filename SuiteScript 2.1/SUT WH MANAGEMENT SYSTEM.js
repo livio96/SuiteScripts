@@ -31,7 +31,7 @@ define([
         if (ajaxAction) {
             try {
                 if (ajaxAction === 'validate') {
-                    const result = plValidateSerialNumbers(context.request.parameters.serials);
+                    const result = plValidateSerialNumbers(context.request.parameters.serials, context.request.parameters.item || null);
                     context.response.setHeader({ name: 'Content-Type', value: 'application/json' });
                     context.response.write(JSON.stringify(result));
                     return;
@@ -140,6 +140,22 @@ define([
                     return respondJson(context, getStatusOptions());
                 case 'getStatusCodes':
                     return respondJson(context, getStatusCodeOptions());
+                case 'getPlateStats':
+                    return respondJson(context, getPlateStats());
+                case 'getEmployees':
+                    return respondJson(context, getEmployeeOptions());
+                case 'getStockCountItems':
+                    return respondJson(context, getStockCountItems(context.request.parameters));
+                case 'createStockCount':
+                    return respondJson(context, createStockCount(JSON.parse(context.request.body)));
+                case 'getStockCounts':
+                    return respondJson(context, getStockCounts(context.request.parameters));
+                case 'getStockCountById':
+                    return respondJson(context, getStockCountById(context.request.parameters));
+                case 'updateStockCount':
+                    return respondJson(context, updateStockCount(JSON.parse(context.request.body)));
+                case 'createStockCountAdjustment':
+                    return respondJson(context, createStockCountAdjustment(JSON.parse(context.request.body)));
                 case 'lookupPOSerials':
                     return respondJson(context, lookupPOSerials(context.request.parameters));
                 case 'createFromPO':
@@ -156,6 +172,8 @@ define([
                     return respondJson(context, loadSOForPicking(context.request.parameters.soNumber));
                 case 'pickSOItems':
                     return respondJson(context, pickSOItems(JSON.parse(context.request.body)));
+                case 'getBinInventory':
+                    return respondJson(context, getBinInventory(context.request.parameters));
                 case 'printReceiptLabels': {
                     const labelDataRaw = context.request.parameters.labelData;
                     const recordId = context.request.parameters.recordId || '';
@@ -264,6 +282,14 @@ define([
             filters.push('AND');
             filters.push(['custrecord_tq_license_place_item', 'anyof', params.item]);
         }
+        if (params.createdFrom) {
+            filters.push('AND');
+            filters.push(['created', 'onorafter', params.createdFrom]);
+        }
+        if (params.createdTo) {
+            filters.push('AND');
+            filters.push(['created', 'onorbefore', params.createdTo]);
+        }
 
         const columns = [
             search.createColumn({ name: 'name', sort: search.Sort.DESC }),
@@ -315,6 +341,20 @@ define([
             pageCount: pagedData.pageRanges.length,
             page
         };
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  PLATE STATS (accurate aggregate counts for dashboard)
+    // ═══════════════════════════════════════════════════════════
+    const getPlateStats = () => {
+        const baseFilter = [['isinactive', 'is', 'F']];
+        const total = search.create({ type: RECORD_TYPE, filters: baseFilter })
+            .runPaged({ pageSize: 1 }).count;
+        const active = search.create({
+            type: RECORD_TYPE,
+            filters: [...baseFilter, 'AND', ['custrecord_tq_license_plate_status', 'noneof', ['3']]]
+        }).runPaged({ pageSize: 1 }).count;
+        return { success: true, total, active };
     };
 
     // ═══════════════════════════════════════════════════════════
@@ -509,6 +549,29 @@ define([
         return parseInt(res[0].id);
     };
 
+    // Bulk version: one search for all serials on an item. Returns { serialNumber: internalId }.
+    // Costs 1 search execution regardless of serial count vs N searches with getInventoryNumberId.
+    const bulkGetInventoryNumberIds = (itemId, serialNumbers) => {
+        const trimmed = serialNumbers.map(s => s.trim()).filter(s => s);
+        if (!trimmed.length) return {};
+        const serialFilter = [];
+        trimmed.forEach((s, i) => {
+            if (i > 0) serialFilter.push('OR');
+            serialFilter.push(['inventorynumber', 'is', s]);
+        });
+        const idMap = {};
+        search.create({
+            type: 'inventorynumber',
+            filters: [['item', 'anyof', [itemId]], 'AND', serialFilter],
+            columns: [search.createColumn({ name: 'inventorynumber' })]
+        }).run().each(r => {
+            const sn = (r.getValue({ name: 'inventorynumber' }) || '').trim();
+            if (sn) idMap[sn] = parseInt(r.id);
+            return true;
+        });
+        return idMap;
+    };
+
     // ═══════════════════════════════════════════════════════════
     //  FULFILL SALES ORDER
     //  Create item fulfillment from SO using serials on a plate
@@ -574,8 +637,11 @@ define([
                     invDetail.removeLine({ sublistId: 'inventoryassignment', line: x });
                 }
 
-                // Add serial number lines
+                // Add serial number lines — bulk lookup to avoid per-serial search governance cost
+                const plateSerialIdMap = bulkGetInventoryNumberIds(plate.itemId, plate.serialList);
                 plate.serialList.forEach((serial) => {
+                    const numId = plateSerialIdMap[serial.trim()];
+                    if (!numId) { log.debug('fulfillSalesOrder: serial not found in inventory: ' + serial); return; }
                     invDetail.selectNewLine({ sublistId: 'inventoryassignment' });
                     invDetail.setCurrentSublistValue({
                         sublistId: 'inventoryassignment',
@@ -585,7 +651,7 @@ define([
                     invDetail.setCurrentSublistValue({
                         sublistId: 'inventoryassignment',
                         fieldId: 'issueinventorynumber',
-                        value: getInventoryNumberId(plate.itemId, serial)
+                        value: numId
                     });
                     invDetail.commitLine({ sublistId: 'inventoryassignment' });
                 });
@@ -787,6 +853,411 @@ define([
     };
 
     // ═══════════════════════════════════════════════════════════
+    //  EMPLOYEE OPTIONS
+    // ═══════════════════════════════════════════════════════════
+    const getEmployeeOptions = () => {
+        const results = [];
+        try {
+            search.create({
+                type: search.Type.EMPLOYEE,
+                filters: [['isinactive', 'is', 'F']],
+                columns: [search.createColumn({ name: 'entityid', sort: search.Sort.ASC })]
+            }).run().getRange({ start: 0, end: 200 }).forEach(r => {
+                results.push({ id: r.id, name: r.getValue('entityid') });
+            });
+        } catch (e) {
+            log.error('getEmployeeOptions Error', e.message);
+        }
+        return { success: true, results };
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  STOCK COUNT
+    // ═══════════════════════════════════════════════════════════
+    const getStockCountItems = (params) => {
+        const binId     = params.binId;
+        const locationId = params.locationId;
+        if (!binId || !locationId) return { success: false, message: 'Bin and location required.' };
+
+        const itemMap = {};
+
+        // Step 1: all items with inventory in this bin
+        try {
+            search.create({
+                type: 'inventorybalance',
+                filters: [
+                    ['location',   'anyof',        locationId],
+                    'AND',
+                    ['binnumber',  'anyof',         binId],
+                    'AND',
+                    ['onhand',     'greaterthan',   '0']
+                ],
+                columns: [
+                    search.createColumn({ name: 'item' }),
+                    search.createColumn({ name: 'onhand' }),
+                    search.createColumn({ name: 'inventorynumber' })
+                ]
+            }).run().each(r => {
+                const id   = r.getValue({ name: 'item' });
+                const name = r.getText({ name: 'item' });
+                const sn   = r.getText({ name: 'inventorynumber' });
+                const onhand = parseFloat(r.getValue({ name: 'onhand' })) || 0;
+                log.debug('InvBalance Row', 'Item: ' + id + ' (' + name + '), SN: ' + sn + ', OnHand: ' + onhand);
+                if (id) {
+                    if (!itemMap[id]) {
+                        itemMap[id] = { itemId: id, itemName: name, serialized: false, serialNumbers: [], expectedQty: 0 };
+                    }
+                    // If this row has an inventory number, item is serialized
+                    if (sn) {
+                        itemMap[id].serialized = true;
+                        itemMap[id].serialNumbers.push(sn);
+                    } else {
+                        // Non-serialized: accumulate onhand quantity
+                        itemMap[id].expectedQty += onhand;
+                    }
+                }
+                return true;
+            });
+        } catch (e) {
+            log.error('getStockCountItems inventorybalance', e.message);
+            return { success: false, message: 'Could not fetch bin inventory: ' + e.message };
+        }
+
+        log.audit('After InvBalance', 'Items found: ' + Object.keys(itemMap).length);
+
+        if (Object.keys(itemMap).length === 0) return { success: true, results: [] };
+
+        // Step 2: Check item record directly for serial/lot flags
+        const itemIds = Object.keys(itemMap);
+        log.audit('Checking items', 'IDs: ' + itemIds.join(', '));
+        try {
+            search.create({
+                type: 'item',
+                filters: [['internalid', 'anyof', itemIds]],
+                columns: [
+                    search.createColumn({ name: 'internalid' }),
+                    search.createColumn({ name: 'itemid' }),
+                    search.createColumn({ name: 'isserialitem' }),
+                    search.createColumn({ name: 'islotitem' })
+                ]
+            }).run().each(r => {
+                const id = r.getValue({ name: 'internalid' });
+                const itemName = r.getValue({ name: 'itemid' });
+                const isSerial = r.getValue({ name: 'isserialitem' });
+                const isLot = r.getValue({ name: 'islotitem' });
+                log.debug('Item Record', 'ID: ' + id + ', Name: ' + itemName + ', isserialitem: ' + isSerial + ' (type: ' + typeof isSerial + '), islotitem: ' + isLot + ' (type: ' + typeof isLot + ')');
+                if (id && itemMap[id]) {
+                    if (isSerial === true || isSerial === 'T' || isLot === true || isLot === 'T') {
+                        itemMap[id].serialized = true;
+                        log.audit('Marked Serialized', 'Item ' + id + ' marked as serialized');
+                    }
+                }
+                return true;
+            });
+        } catch (e) {
+            log.error('getStockCountItems item lookup', e.message);
+        }
+
+        // Log final results
+        const results = Object.values(itemMap);
+        results.forEach(item => {
+            log.audit('Final Item', 'ID: ' + item.itemId + ', Name: ' + item.itemName + ', Serialized: ' + item.serialized + ', SNs: ' + item.serialNumbers.length);
+        });
+
+        return { success: true, results: results };
+    };
+
+    const createStockCount = (data) => {
+        try {
+            const rec = record.create({ type: 'customrecord_wh_stock_count', isDynamic: true });
+            if (data.locationId)  rec.setValue({ fieldId: 'custrecord_sc_location',     value: data.locationId });
+            if (data.binId)       rec.setValue({ fieldId: 'custrecord_sc_bin_id',        value: String(data.binId) });
+            if (data.binName)     rec.setValue({ fieldId: 'custrecord_sc_bin_name',      value: data.binName });
+            if (data.assignedTo)  rec.setValue({ fieldId: 'custrecord_sc_assigned_to',   value: data.assignedTo });
+            if (data.itemsJson)   rec.setValue({ fieldId: 'custrecordsc_items_json',     value: data.itemsJson });
+            rec.setValue({ fieldId: 'custrecord_sc_status', value: 'pending' });
+            const id = rec.save({ enableSourcing: true, ignoreMandatoryFields: false });
+            log.audit('Stock Count Created', 'ID: ' + id + ', Items: ' + (data.itemsJson ? JSON.parse(data.itemsJson).length : 0));
+            return { success: true, id, message: 'Stock count created successfully.' };
+        } catch (e) {
+            log.error('createStockCount Error', e.message);
+            return { success: false, message: e.message };
+        }
+    };
+
+    const getStockCounts = (params) => {
+        try {
+            const filters = [['isinactive', 'is', 'F']];
+            if (params.status) {
+                filters.push('AND');
+                filters.push(['custrecord_sc_status', 'is', params.status]);
+            }
+            const results = [];
+            search.create({
+                type: 'customrecord_wh_stock_count',
+                filters: filters,
+                columns: [
+                    search.createColumn({ name: 'internalid' }),
+                    search.createColumn({ name: 'custrecord_sc_location' }),
+                    search.createColumn({ name: 'custrecord_sc_bin_name' }),
+                    search.createColumn({ name: 'custrecord_sc_assigned_to' }),
+                    search.createColumn({ name: 'custrecord_sc_status' }),
+                    search.createColumn({ name: 'custrecordsc_items_json' }),
+                    search.createColumn({ name: 'custrecord_sc_adj_id' }),
+                    search.createColumn({ name: 'created', sort: search.Sort.DESC })
+                ]
+            }).run().each(r => {
+                const itemsJson = r.getValue({ name: 'custrecordsc_items_json' }) || '[]';
+                let itemCount = 0;
+                try { itemCount = JSON.parse(itemsJson).length; } catch(e) {}
+                results.push({
+                    id: r.getValue({ name: 'internalid' }),
+                    location: r.getText({ name: 'custrecord_sc_location' }),
+                    locationId: r.getValue({ name: 'custrecord_sc_location' }),
+                    binName: r.getValue({ name: 'custrecord_sc_bin_name' }),
+                    assignedTo: r.getText({ name: 'custrecord_sc_assigned_to' }),
+                    assignedToId: r.getValue({ name: 'custrecord_sc_assigned_to' }),
+                    status: r.getValue({ name: 'custrecord_sc_status' }),
+                    itemCount: itemCount,
+                    adjustmentId: r.getValue({ name: 'custrecord_sc_adj_id' }) || null,
+                    created: r.getValue({ name: 'created' })
+                });
+                return true;
+            });
+            return { success: true, results };
+        } catch (e) {
+            log.error('getStockCounts Error', e.message);
+            return { success: false, message: e.message };
+        }
+    };
+
+    const getStockCountById = (params) => {
+        try {
+            const id = params.id;
+            if (!id) return { success: false, message: 'Stock count ID required.' };
+            const rec = record.load({ type: 'customrecord_wh_stock_count', id: id });
+            const itemsJson = rec.getValue({ fieldId: 'custrecordsc_items_json' }) || '[]';
+            const countedJson = rec.getValue({ fieldId: 'custrecordsc_count_json' }) || '[]';
+            let items = [];
+            let counted = [];
+            try { items = JSON.parse(itemsJson); } catch(e) {}
+            try { counted = JSON.parse(countedJson); } catch(e) {}
+            return {
+                success: true,
+                data: {
+                    id: id,
+                    locationId: rec.getValue({ fieldId: 'custrecord_sc_location' }),
+                    location: rec.getText({ fieldId: 'custrecord_sc_location' }),
+                    binId: rec.getValue({ fieldId: 'custrecord_sc_bin_id' }),
+                    binName: rec.getValue({ fieldId: 'custrecord_sc_bin_name' }),
+                    assignedToId: rec.getValue({ fieldId: 'custrecord_sc_assigned_to' }),
+                    assignedTo: rec.getText({ fieldId: 'custrecord_sc_assigned_to' }),
+                    status: rec.getValue({ fieldId: 'custrecord_sc_status' }),
+                    adjustmentId: rec.getValue({ fieldId: 'custrecord_sc_adj_id' }) || null,
+                    items: items,
+                    counted: counted
+                }
+            };
+        } catch (e) {
+            log.error('getStockCountById Error', e.message);
+            return { success: false, message: e.message };
+        }
+    };
+
+    const updateStockCount = (data) => {
+        try {
+            const id = data.id;
+            if (!id) return { success: false, message: 'Stock count ID required.' };
+            const rec = record.load({ type: 'customrecord_wh_stock_count', id: id, isDynamic: true });
+            if (data.status) rec.setValue({ fieldId: 'custrecord_sc_status', value: data.status });
+            if (data.countedJson !== undefined) rec.setValue({ fieldId: 'custrecordsc_count_json', value: data.countedJson });
+            if (data.adjustmentId !== undefined) rec.setValue({ fieldId: 'custrecord_sc_adj_id', value: data.adjustmentId });
+            rec.save({ enableSourcing: true, ignoreMandatoryFields: false });
+            log.audit('Stock Count Updated', 'ID: ' + id + ', Status: ' + (data.status || 'unchanged'));
+            return { success: true, id, message: 'Stock count updated successfully.' };
+        } catch (e) {
+            log.error('updateStockCount Error', e.message);
+            return { success: false, message: e.message };
+        }
+    };
+
+    const createStockCountAdjustment = (data) => {
+        try {
+            const { stockCountId, locationId, binId, adjustments } = data;
+            if (!stockCountId) return { success: false, message: 'Stock count ID required.' };
+            if (!locationId) return { success: false, message: 'Location ID required.' };
+            if (!adjustments || adjustments.length === 0) return { success: false, message: 'No adjustments provided.' };
+
+            // Check if any adjustments actually need to be made
+            const hasChanges = adjustments.some(adj => {
+                if (adj.serialized) {
+                    return (adj.addSerials && adj.addSerials.length > 0) || (adj.removeSerials && adj.removeSerials.length > 0);
+                } else {
+                    return adj.adjustQty !== 0;
+                }
+            });
+
+            if (!hasChanges) {
+                // No actual changes needed, just mark the stock count as approved
+                const scRec = record.load({ type: 'customrecord_wh_stock_count', id: stockCountId, isDynamic: true });
+                scRec.setValue({ fieldId: 'custrecord_sc_status', value: 'approved' });
+                scRec.save({ enableSourcing: true, ignoreMandatoryFields: false });
+                return { success: true, message: 'No adjustments needed. Stock count approved.' };
+            }
+
+            // Look up serial IDs for removal operations
+            const serialsToRemove = [];
+            adjustments.forEach(adj => {
+                if (adj.serialized && adj.removeSerials && adj.removeSerials.length > 0) {
+                    adj.removeSerials.forEach(sn => serialsToRemove.push(sn));
+                }
+            });
+
+            const serialIdMap = {};
+            if (serialsToRemove.length > 0) {
+                try {
+                    // Build OR filter for all serials
+                    const serialFilter = [];
+                    serialsToRemove.forEach((sn, i) => {
+                        if (i > 0) serialFilter.push('OR');
+                        serialFilter.push(['inventorynumber', 'is', sn]);
+                    });
+                    search.create({
+                        type: 'inventorynumber',
+                        filters: serialFilter,
+                        columns: ['internalid', 'inventorynumber']
+                    }).run().each(r => {
+                        const sn = r.getValue({ name: 'inventorynumber' });
+                        const id = r.getValue({ name: 'internalid' });
+                        serialIdMap[sn] = id;
+                        log.debug('Serial mapped', sn + ' -> ' + id);
+                        return true;
+                    });
+                    log.audit('Serial lookup complete', 'Found ' + Object.keys(serialIdMap).length + ' of ' + serialsToRemove.length + ' serials');
+                } catch (e) {
+                    log.error('Serial lookup error', e.message);
+                }
+            }
+
+            // Get item costs
+            const itemIds = adjustments.map(a => a.itemId);
+            const costCache = {};
+            itemIds.forEach(itemId => {
+                try {
+                    const costLookup = search.lookupFields({ type: search.Type.ITEM, id: itemId, columns: ['averagecost'] });
+                    costCache[itemId] = parseFloat(costLookup.averagecost) || 0;
+                } catch (e) { costCache[itemId] = 0; }
+            });
+
+            // Create inventory adjustment
+            const adjRecord = record.create({ type: record.Type.INVENTORY_ADJUSTMENT, isDynamic: true });
+            adjRecord.setValue({ fieldId: 'subsidiary', value: '1' });
+            adjRecord.setValue({ fieldId: 'account', value: '154' });
+            adjRecord.setValue({ fieldId: 'memo', value: 'Stock Count #' + stockCountId + ' Adjustment' });
+
+            adjustments.forEach(adj => {
+                const itemCost = costCache[adj.itemId] || 0;
+
+                if (adj.serialized) {
+                    // Remove serials (expected but not counted)
+                    if (adj.removeSerials && adj.removeSerials.length > 0) {
+                        adjRecord.selectNewLine({ sublistId: 'inventory' });
+                        adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'item', value: adj.itemId });
+                        adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'location', value: locationId });
+                        adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'adjustqtyby', value: -adj.removeSerials.length });
+                        if (itemCost > 0) adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'unitcost', value: itemCost });
+
+                        const removeDetail = adjRecord.getCurrentSublistSubrecord({ sublistId: 'inventory', fieldId: 'inventorydetail' });
+                        adj.removeSerials.forEach(sn => {
+                            removeDetail.selectNewLine({ sublistId: 'inventoryassignment' });
+                            removeDetail.setCurrentSublistText({ sublistId: 'inventoryassignment', fieldId: 'issueinventorynumber', text: sn });
+                            removeDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity', value: -1 });
+                            if (binId) removeDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', value: binId });
+                            removeDetail.commitLine({ sublistId: 'inventoryassignment' });
+                        });
+                        adjRecord.commitLine({ sublistId: 'inventory' });
+                    }
+
+                    // Add serials (counted but not expected)
+                    if (adj.addSerials && adj.addSerials.length > 0) {
+                        adjRecord.selectNewLine({ sublistId: 'inventory' });
+                        adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'item', value: adj.itemId });
+                        adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'location', value: locationId });
+                        adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'adjustqtyby', value: adj.addSerials.length });
+                        if (itemCost > 0) adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'unitcost', value: itemCost });
+
+                        const addDetail = adjRecord.getCurrentSublistSubrecord({ sublistId: 'inventory', fieldId: 'inventorydetail' });
+                        adj.addSerials.forEach(sn => {
+                            addDetail.selectNewLine({ sublistId: 'inventoryassignment' });
+                            addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'receiptinventorynumber', value: sn });
+                            addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity', value: 1 });
+                            if (binId) addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', value: binId });
+                            addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'inventorystatus', value: BACK_TO_STOCK_STATUS_ID });
+                            addDetail.commitLine({ sublistId: 'inventoryassignment' });
+                        });
+                        adjRecord.commitLine({ sublistId: 'inventory' });
+                    }
+                } else {
+                    // Non-serialized: quantity adjustment with inventory detail
+                    if (adj.adjustQty !== 0) {
+                        adjRecord.selectNewLine({ sublistId: 'inventory' });
+                        adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'item', value: adj.itemId });
+                        adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'location', value: locationId });
+                        adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'adjustqtyby', value: adj.adjustQty });
+                        if (itemCost > 0) adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'unitcost', value: itemCost });
+
+                        // Must configure inventory detail for bin-managed locations
+                        const invDetail = adjRecord.getCurrentSublistSubrecord({ sublistId: 'inventory', fieldId: 'inventorydetail' });
+                        invDetail.selectNewLine({ sublistId: 'inventoryassignment' });
+                        invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity', value: adj.adjustQty });
+                        if (binId) invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', value: binId });
+                        invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'inventorystatus', value: BACK_TO_STOCK_STATUS_ID });
+                        invDetail.commitLine({ sublistId: 'inventoryassignment' });
+                        adjRecord.commitLine({ sublistId: 'inventory' });
+                    }
+                }
+            });
+
+            const adjId = adjRecord.save({ enableSourcing: true, ignoreMandatoryFields: false });
+            let tranId = String(adjId);
+            try {
+                const l = search.lookupFields({ type: search.Type.INVENTORY_ADJUSTMENT, id: adjId, columns: ['tranid'] });
+                tranId = l.tranid || String(adjId);
+            } catch (e) {}
+
+            // Update stock count record with adjustment ID
+            const scRec = record.load({ type: 'customrecord_wh_stock_count', id: stockCountId, isDynamic: true });
+            scRec.setValue({ fieldId: 'custrecord_sc_adj_id', value: adjId });
+            scRec.setValue({ fieldId: 'custrecord_sc_status', value: 'approved' });
+            scRec.save({ enableSourcing: true, ignoreMandatoryFields: false });
+
+            log.audit('Stock Count Adjustment Created', 'SC#' + stockCountId + ' -> Adj#' + tranId);
+            return { success: true, adjustmentId: adjId, tranId: tranId, message: 'Inventory adjustment created: ' + tranId };
+        } catch (e) {
+            log.error('createStockCountAdjustment Error', e.message + '\n' + e.stack);
+            return { success: false, message: e.message };
+        }
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  GET SERIALS ALREADY ON ACTIVE LICENSE PLATES
+    // ═══════════════════════════════════════════════════════════
+    const getSerialsOnPlates = () => {
+        const assignedSerials = new Set();
+        const plateSrch = search.create({
+            type: RECORD_TYPE,
+            filters: [['isinactive', 'is', 'F']],
+            columns: ['custrecord_tq_license_plate_serial_num']
+        });
+        plateSrch.run().each(r => {
+            const serials = r.getValue('custrecord_tq_license_plate_serial_num') || '';
+            serials.split(/\r?\n/).forEach(s => { if (s.trim()) assignedSerials.add(s.trim()); });
+            return true;
+        });
+        return assignedSerials;
+    };
+
+    // ═══════════════════════════════════════════════════════════
     //  LOOKUP PO SERIALS
     //  Find all serial numbers received on a PO for a given item
     // ═══════════════════════════════════════════════════════════
@@ -847,7 +1318,13 @@ define([
         });
 
         if (!serialNumbers.length) return { success: false, message: 'No serial numbers found on receipts for this item on PO ' + poTranId + '.' };
-        return { success: true, poId, poTranId, serialNumbers, serialCount: serialNumbers.length };
+
+        // Filter out serials already assigned to active license plates
+        const assignedSerials = getSerialsOnPlates();
+        const availableSerials = serialNumbers.filter(s => !assignedSerials.has(s));
+
+        if (!availableSerials.length) return { success: false, message: 'All serial numbers from PO ' + poTranId + ' are already assigned to license plates.' };
+        return { success: true, poId, poTranId, serialNumbers: availableSerials, serialCount: availableSerials.length };
     };
 
     // ═══════════════════════════════════════════════════════════
@@ -948,7 +1425,13 @@ define([
         }
 
         if (!serialNumbers.length) return { success: false, message: 'No serial numbers found for this item on IR ' + irTranId + '.' };
-        return { success: true, irId, irTranId, serialNumbers, serialCount: serialNumbers.length };
+
+        // Filter out serials already assigned to active license plates
+        const assignedSerials = getSerialsOnPlates();
+        const availableSerials = serialNumbers.filter(s => !assignedSerials.has(s));
+
+        if (!availableSerials.length) return { success: false, message: 'All serial numbers from IR ' + irTranId + ' are already assigned to license plates.' };
+        return { success: true, irId, irTranId, serialNumbers: availableSerials, serialCount: availableSerials.length };
     };
 
     // ═══════════════════════════════════════════════════════════
@@ -1182,7 +1665,7 @@ define([
             if (!itemIds.includes(itemId)) itemIds.push(itemId);
         }
 
-        const serializedItems = {};
+        const itemMeta = {}; // itemId -> { isSerialized, isKit }
         if (itemIds.length) {
             search.create({
                 type: search.Type.ITEM,
@@ -1191,8 +1674,56 @@ define([
             }).run().each(r => {
                 const itemType = r.getValue('type');
                 const serialFlag = r.getValue('isserialitem');
-                serializedItems[r.id] = (itemType === 'SerializedInventoryItem' || itemType === 'serializedinventoryitem' || serialFlag === 'T' || serialFlag === true);
+                itemMeta[r.id] = {
+                    isSerialized: (itemType === 'SerializedInventoryItem' || itemType === 'serializedinventoryitem' || serialFlag === 'T' || serialFlag === true),
+                    isKit: (itemType === 'Kit' || itemType === 'kit')
+                };
                 return true;
+            });
+        }
+
+        // Load kit components for any kit items
+        const kitComponents = {}; // kitItemId -> [{ itemId, itemText, quantityPerKit, isSerialized }]
+        const kitItemIds = Object.keys(itemMeta).filter(id => itemMeta[id].isKit);
+        if (kitItemIds.length) {
+            const componentItemIds = [];
+            kitItemIds.forEach(kitId => {
+                try {
+                    const kitRec = record.load({ type: 'kititem', id: parseInt(kitId) });
+                    const memberCount = kitRec.getLineCount({ sublistId: 'member' });
+                    kitComponents[kitId] = [];
+                    for (let m = 0; m < memberCount; m++) {
+                        const compItemId = String(kitRec.getSublistValue({ sublistId: 'member', fieldId: 'item', line: m }));
+                        const compItemText = kitRec.getSublistText({ sublistId: 'member', fieldId: 'item', line: m });
+                        const compQtyPerKit = parseFloat(kitRec.getSublistValue({ sublistId: 'member', fieldId: 'quantity', line: m })) || 1;
+                        kitComponents[kitId].push({ itemId: compItemId, itemText: compItemText, quantityPerKit: compQtyPerKit, isSerialized: false });
+                        if (!componentItemIds.includes(compItemId)) componentItemIds.push(compItemId);
+                    }
+                } catch (e) {
+                    log.debug('SO Picking: Failed to load kit components for ' + kitId, e.message);
+                }
+            });
+            // Resolve serialization for component items
+            if (componentItemIds.length) {
+                search.create({
+                    type: search.Type.ITEM,
+                    filters: [['internalid', 'anyof', componentItemIds]],
+                    columns: ['internalid', 'type', 'isserialitem']
+                }).run().each(r => {
+                    const itemType = r.getValue('type');
+                    const serialFlag = r.getValue('isserialitem');
+                    itemMeta[r.id] = {
+                        isSerialized: (itemType === 'SerializedInventoryItem' || itemType === 'serializedinventoryitem' || serialFlag === 'T' || serialFlag === true),
+                        isKit: false
+                    };
+                    return true;
+                });
+            }
+            // Stamp isSerialized onto each component
+            Object.keys(kitComponents).forEach(kitId => {
+                kitComponents[kitId].forEach(comp => {
+                    comp.isSerialized = !!(itemMeta[comp.itemId] && itemMeta[comp.itemId].isSerialized);
+                });
             });
         }
 
@@ -1205,13 +1736,26 @@ define([
             const quantityFulfilled = parseFloat(soRec.getSublistValue({ sublistId: 'item', fieldId: 'quantityfulfilled', line: i })) || 0;
             const quantityRemaining = Math.max(0, quantity - quantityFulfilled);
             const isFullyFulfilled = quantityRemaining <= 0;
+            const isKit = !!(itemMeta[itemId] && itemMeta[itemId].isKit);
 
-            lines.push({
+            const lineData = {
                 lineNum: i, itemId, itemText, description,
                 quantity, quantityFulfilled, quantityRemaining,
-                isSerialized: !!serializedItems[itemId],
-                isFullyFulfilled
-            });
+                isSerialized: !!(itemMeta[itemId] && itemMeta[itemId].isSerialized),
+                isFullyFulfilled, isKit
+            };
+
+            if (isKit && kitComponents[itemId]) {
+                lineData.components = kitComponents[itemId].map(comp => ({
+                    itemId: comp.itemId,
+                    itemText: comp.itemText,
+                    quantityPerKit: comp.quantityPerKit,
+                    totalQuantity: quantityRemaining * comp.quantityPerKit,
+                    isSerialized: comp.isSerialized
+                }));
+            }
+
+            lines.push(lineData);
         }
 
         return { success: true, soId, soTranId, soStatus: soStatusText, soCustomer, soDate, lines };
@@ -1233,9 +1777,18 @@ define([
 
         const pickQueue = {};
         data.lines.forEach(l => {
-            const key = String(l.itemId);
-            if (!pickQueue[key]) pickQueue[key] = [];
-            pickQueue[key].push(l);
+            if (l.isKit && l.components) {
+                // For kit lines expand to individual components
+                l.components.forEach(comp => {
+                    const key = String(comp.itemId);
+                    if (!pickQueue[key]) pickQueue[key] = [];
+                    pickQueue[key].push(comp);
+                });
+            } else {
+                const key = String(l.itemId);
+                if (!pickQueue[key]) pickQueue[key] = [];
+                pickQueue[key].push(l);
+            }
         });
 
         const lineCount = fulfillment.getLineCount({ sublistId: 'item' });
@@ -1250,32 +1803,49 @@ define([
                 fulfillment.setCurrentSublistValue({ sublistId: 'item', fieldId: 'itemreceive', value: false });
             } else {
                 fulfillment.setCurrentSublistValue({ sublistId: 'item', fieldId: 'itemreceive', value: true });
-                const qty = matchedLine.isSerialized ? matchedLine.serialNumbers.length : (parseFloat(matchedLine.quantity) || 0);
-                fulfillment.setCurrentSublistValue({ sublistId: 'item', fieldId: 'quantity', value: qty });
+                const requestedQty = matchedLine.isSerialized ? matchedLine.serialNumbers.length : (parseFloat(matchedLine.quantity) || 0);
+                // Set quantity BEFORE accessing the inventory detail subrecord — NetSuite snapshots
+                // the expected total from the line quantity at the moment the subrecord is opened.
+                // Setting it after causes "total inventory detail quantity must be N" errors.
+                fulfillment.setCurrentSublistValue({ sublistId: 'item', fieldId: 'quantity', value: requestedQty });
+                let finalQty = requestedQty;
 
                 try {
                     const invDetail = fulfillment.getCurrentSublistSubrecord({ sublistId: 'item', fieldId: 'inventorydetail' });
                     const existingLines = invDetail.getLineCount({ sublistId: 'inventoryassignment' });
                     for (let x = existingLines - 1; x >= 0; x--) {
-                        invDetail.removeLine({ sublistId: 'inventoryassignment', line: x });
+                        try { invDetail.removeLine({ sublistId: 'inventoryassignment', line: x }); } catch (re) { /* pre-populated line may not be removable */ }
                     }
 
                     if (matchedLine.isSerialized) {
+                        const serialIdMap = bulkGetInventoryNumberIds(matchedLine.itemId, matchedLine.serialNumbers);
+                        let added = 0;
                         matchedLine.serialNumbers.forEach(serial => {
-                            invDetail.selectNewLine({ sublistId: 'inventoryassignment' });
-                            invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity', value: 1 });
-                            invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'issueinventorynumber', value: getInventoryNumberId(matchedLine.itemId, serial) });
-                            invDetail.commitLine({ sublistId: 'inventoryassignment' });
+                            const numId = serialIdMap[serial.trim()];
+                            if (!numId) { log.debug('SO Picking: serial not found in inventory: ' + serial); return; }
+                            try {
+                                invDetail.selectNewLine({ sublistId: 'inventoryassignment' });
+                                invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity', value: 1 });
+                                invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'issueinventorynumber', value: numId });
+                                invDetail.commitLine({ sublistId: 'inventoryassignment' });
+                                added++;
+                            } catch (se) { log.debug('SO Picking: serial assignment failed for ' + serial, se.message); }
                         });
+                        finalQty = added;
                     } else {
                         invDetail.selectNewLine({ sublistId: 'inventoryassignment' });
-                        invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity', value: qty });
+                        invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity', value: requestedQty });
                         if (matchedLine.binId) invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', value: parseInt(matchedLine.binId) });
                         if (matchedLine.inventoryStatusId) invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'inventorystatus', value: parseInt(matchedLine.inventoryStatusId) });
                         invDetail.commitLine({ sublistId: 'inventoryassignment' });
                     }
                 } catch (invErr) {
                     log.debug('SO Picking: Inventory detail not available for line ' + i, invErr.message);
+                }
+
+                // If fewer serials were actually committed (e.g. some not found), realign the line qty.
+                if (finalQty !== requestedQty) {
+                    fulfillment.setCurrentSublistValue({ sublistId: 'item', fieldId: 'quantity', value: finalQty });
                 }
             }
             fulfillment.commitLine({ sublistId: 'item' });
@@ -1290,6 +1860,53 @@ define([
             fulfillmentId: ffId,
             fulfillmentTranId: ffTranId
         };
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  BIN INVENTORY LOOKUP
+    // ═══════════════════════════════════════════════════════════
+    const getBinInventory = (params) => {
+        const itemId = params.itemId;
+        const locationId = params.locationId;
+        if (!itemId || !locationId) return { success: false, message: 'Item and location are required.' };
+
+        const binMap = {};
+        try {
+            search.create({
+                type: 'inventorybalance',
+                filters: [
+                    ['item.isinactive', 'is', 'F'],
+                    'AND',
+                    ['item', 'anyof', [itemId]],
+                    'AND',
+                    ['location', 'anyof', [locationId]]
+                ],
+                columns: [
+                    search.createColumn({ name: 'binnumber' }),
+                    search.createColumn({ name: 'onhand' }),
+                    search.createColumn({ name: 'available' })
+                ]
+            }).run().each(r => {
+                const binName  = r.getText({ name: 'binnumber' }) || r.getValue({ name: 'binnumber' }) || '(No Bin)';
+                const qtyOH    = parseFloat(r.getValue({ name: 'onhand' })) || 0;
+                const qtyAvail = parseFloat(r.getValue({ name: 'available' })) || qtyOH;
+                if (qtyOH > 0) {
+                    if (binMap[binName]) {
+                        binMap[binName].qtyOH    += qtyOH;
+                        binMap[binName].qtyAvail += qtyAvail;
+                    } else {
+                        binMap[binName] = { bin: binName, qtyOH, qtyAvail };
+                    }
+                }
+                return true;
+            });
+        } catch (e) {
+            log.debug('getBinInventory error', e.message);
+            return { success: false, message: 'Could not retrieve bin inventory: ' + e.message };
+        }
+
+        const results = Object.values(binMap).sort((a, b) => b.qtyOH - a.qtyOH);
+        return { success: true, results };
     };
 
 
@@ -1314,6 +1931,8 @@ define([
         const TRASH_STATUS_ID = 10;
         const RETURN_TO_VENDOR_BIN_ID = 2143;
         const RETURN_TO_VENDOR_STATUS_ID = 21;
+        const NOT_COUNTED_BIN_ID = 4278;
+        const NOT_COUNTED_STATUS_ID = 14;
 
         // ====================================================================
         // UTILITY FUNCTIONS
@@ -1749,6 +2368,7 @@ define([
                 let toBinId, toStatusId;
                 if (group.action === 'move_testing') { toBinId = TESTING_BIN_ID; toStatusId = TESTING_STATUS_ID; }
                 else if (group.action === 'move_refurbishing') { toBinId = REFURBISHING_BIN_ID; toStatusId = REFURBISHING_STATUS_ID; }
+                else if (group.action === 'move_not_counted') { toBinId = NOT_COUNTED_BIN_ID; toStatusId = NOT_COUNTED_STATUS_ID; }
                 else if (group.action === 'back_to_stock') { toBinId = BACK_TO_STOCK_BIN_ID; toStatusId = BACK_TO_STOCK_STATUS_ID; }
                 else if (group.action === 'defective') { toBinId = DEFECTIVE_BIN_ID; toStatusId = DEFECTIVE_STATUS_ID; }
                 else if (group.action === 'trash') { toBinId = TRASH_BIN_ID; toStatusId = TRASH_STATUS_ID; }
@@ -2020,6 +2640,7 @@ define([
             toRecord.setValue({ fieldId: 'transferlocation', value: TRANSFER_DESTINATION_LOCATION_ID });
             toRecord.setValue({ fieldId: 'memo', value: memo });
             toRecord.setValue({ fieldId: 'orderstatus', value: 'B' });
+            toRecord.setValue({ fieldId: 'shipmethod', value: 186632 }); 
             toRecord.selectNewLine({ sublistId: 'item' });
             toRecord.setCurrentSublistValue({ sublistId: 'item', fieldId: 'item', value: itemId });
             toRecord.setCurrentSublistValue({ sublistId: 'item', fieldId: 'quantity', value: quantity });
@@ -2071,6 +2692,7 @@ define([
                             else invDetail.selectNewLine({ sublistId: 'inventoryassignment' });
                             invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'receiptinventorynumber', value: s.serialNumber });
                             invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity', value: 1 });
+                            invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'inventorystatus', value: BACK_TO_STOCK_STATUS_ID });
                             invDetail.commitLine({ sublistId: 'inventoryassignment' });
                         });
                     }
@@ -2219,6 +2841,75 @@ define([
                     addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'receiptinventorynumber', value: change.serialNumber });
                     addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity', value: 1 });
                     if (change.action === 'part_number_change_stock') {
+                        addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', value: BACK_TO_STOCK_BIN_ID });
+                        addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'inventorystatus', value: BACK_TO_STOCK_STATUS_ID });
+                    } else {
+                        if (change.binId) addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', value: change.binId });
+                        if (change.statusId) addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'inventorystatus', value: change.statusId });
+                    }
+                    addDetail.commitLine({ sublistId: 'inventoryassignment' });
+                });
+                adjRecord.commitLine({ sublistId: 'inventory' });
+            });
+
+            const adjId = adjRecord.save({ enableSourcing: true, ignoreMandatoryFields: false });
+            let tranId = String(adjId);
+            try { const l = search.lookupFields({ type: search.Type.INVENTORY_ADJUSTMENT, id: adjId, columns: ['tranid'] }); tranId = l.tranid || String(adjId); } catch (e) {}
+            return { adjId: adjId, tranId: tranId };
+        }
+
+        function createPartAndSerialChangeAdjustment(changes, memo) {
+            const adjRecord = record.create({ type: record.Type.INVENTORY_ADJUSTMENT, isDynamic: true });
+            adjRecord.setValue({ fieldId: 'subsidiary', value: '1' });
+            if (ADJUSTMENT_ACCOUNT_ID) adjRecord.setValue({ fieldId: 'account', value: ADJUSTMENT_ACCOUNT_ID });
+            adjRecord.setValue({ fieldId: 'memo', value: memo || 'Part & Serial Change via WH Assistant' });
+
+            const groupMap = {};
+            changes.forEach(change => {
+                const key = change.oldItemId + '_' + change.newItemId + '_' + change.locationId + '_' + change.action;
+                if (!groupMap[key]) groupMap[key] = { oldItemId: change.oldItemId, newItemId: change.newItemId, locationId: change.locationId, action: change.action, changes: [] };
+                groupMap[key].changes.push(change);
+            });
+
+            const costCache = {};
+            Object.values(groupMap).forEach(group => {
+                if (!costCache[group.oldItemId]) {
+                    try { const cl = search.lookupFields({ type: search.Type.ITEM, id: group.oldItemId, columns: ['averagecost'] }); costCache[group.oldItemId] = parseFloat(cl.averagecost) || 0; } catch (e) { costCache[group.oldItemId] = 0; }
+                }
+            });
+
+            Object.values(groupMap).forEach(group => {
+                const itemCost = costCache[group.oldItemId] || 0;
+                const changeCount = group.changes.length;
+
+                // Remove old serials from old item
+                adjRecord.selectNewLine({ sublistId: 'inventory' });
+                adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'item', value: group.oldItemId });
+                adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'location', value: group.locationId });
+                adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'adjustqtyby', value: -changeCount });
+                if (itemCost > 0) adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'unitcost', value: itemCost });
+                const removeDetail = adjRecord.getCurrentSublistSubrecord({ sublistId: 'inventory', fieldId: 'inventorydetail' });
+                group.changes.forEach(change => {
+                    removeDetail.selectNewLine({ sublistId: 'inventoryassignment' });
+                    removeDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'issueinventorynumber', value: change.oldSerialId });
+                    removeDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity', value: -1 });
+                    if (change.binId) removeDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', value: change.binId });
+                    removeDetail.commitLine({ sublistId: 'inventoryassignment' });
+                });
+                adjRecord.commitLine({ sublistId: 'inventory' });
+
+                // Add new serials to new item
+                adjRecord.selectNewLine({ sublistId: 'inventory' });
+                adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'item', value: group.newItemId });
+                adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'location', value: group.locationId });
+                adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'adjustqtyby', value: changeCount });
+                if (itemCost > 0) adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'unitcost', value: itemCost });
+                const addDetail = adjRecord.getCurrentSublistSubrecord({ sublistId: 'inventory', fieldId: 'inventorydetail' });
+                group.changes.forEach(change => {
+                    addDetail.selectNewLine({ sublistId: 'inventoryassignment' });
+                    addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'receiptinventorynumber', value: change.newSerialNumber });
+                    addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity', value: 1 });
+                    if (change.action === 'part_serial_change_stock') {
                         addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', value: BACK_TO_STOCK_BIN_ID });
                         addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'inventorystatus', value: BACK_TO_STOCK_STATUS_ID });
                     } else {
@@ -2585,15 +3276,43 @@ define([
         // CLIENT-SIDE SCRIPTS
         // ====================================================================
 
-        function getEntryFormScript(nsBinOptionsHtml) {
+        function getEntryFormScript(suiteletUrl) {
             return `
                 <script>
                     window.onbeforeunload = null;
                     if (typeof setWindowChanged === 'function') setWindowChanged(window, false);
 
+                    function _disableAllBtns() {
+                        var btns = document.querySelectorAll('.custom-btn');
+                        for (var i = 0; i < btns.length; i++) {
+                            btns[i].disabled = true;
+                            btns[i].style.opacity = '0.7';
+                            btns[i].style.cursor = 'not-allowed';
+                            btns[i].textContent = 'Please wait...';
+                        }
+                    }
+
                     var currentMode = 'serialized';
                     var nsGridRowId = 0;
-                    var nsBinOptions = '${(nsBinOptionsHtml || '').replace(/'/g, "\\'")}';
+                    var nsBinsApiUrl = '${(suiteletUrl || '').replace(/'/g, "\\'")}';
+
+                    async function loadNsBins() {
+                        try {
+                            var resp = await fetch(nsBinsApiUrl + '&action=getBins&location=1');
+                            var data = await resp.json();
+                            if (data.results && data.results.length) {
+                                var dl = document.getElementById('ns-bin-datalist');
+                                if (dl) {
+                                    dl.innerHTML = '';
+                                    data.results.forEach(function(b) {
+                                        var opt = document.createElement('option');
+                                        opt.value = b.name;
+                                        dl.appendChild(opt);
+                                    });
+                                }
+                            }
+                        } catch(e) { console.error('Failed to load bins:', e); }
+                    }
 
                     var nsActionOptions = '<option value="">-- Select Action --</option>'
                         + '<option value="back_to_stock">Back to Stock</option>'
@@ -2602,6 +3321,9 @@ define([
                         + '<option value="defective">Defective</option>'
                         + '<option value="move_refurbishing">Move to Refurbishing</option>'
                         + '<option value="move_testing">Move to Testing</option>'
+                        + '<option value="move_not_counted">Move to Not Counted</option>'
+                        + '<option value="part_number_change">Part Number Change</option>'
+                        + '<option value="part_number_change_stock">Part Number Change &amp; Back to Stock</option>'
                         + '<option value="return_to_vendor">Return to Vendor</option>'
                         + '<option value="trash">Trash</option>'
                         + '<option value="inventory_found">Inventory Found</option>'
@@ -2614,9 +3336,10 @@ define([
                         var tr = document.createElement('tr');
                         tr.setAttribute('data-row-id', nsGridRowId);
                         tr.innerHTML = '<td data-label="SKU"><input type="text" class="ns-grid-input ns-item-input" data-row="' + nsGridRowId + '" placeholder="Enter SKU" style="width:100%;padding:10px;border:1.5px solid #d1d5db;border-radius:6px;font-size:16px;box-sizing:border-box;min-height:44px;"></td>'
-                            + '<td data-label="From Bin"><select class="action-select ns-bin-input" data-row="' + nsGridRowId + '" style="min-width:120px;min-height:44px;">' + nsBinOptions + '</select></td>'
+                            + '<td data-label="From Bin"><input type="text" class="ns-grid-input ns-bin-input" data-row="' + nsGridRowId + '" list="ns-bin-datalist" autocomplete="off" placeholder="Type bin" style="min-width:120px;padding:10px;border:1.5px solid #d1d5db;border-radius:6px;font-size:16px;min-height:44px;"></td>'
                             + '<td data-label="Qty"><input type="number" class="ns-grid-input ns-qty-input" data-row="' + nsGridRowId + '" placeholder="Qty" min="1" style="width:80px;padding:10px;border:1.5px solid #d1d5db;border-radius:6px;font-size:16px;min-height:44px;"></td>'
                             + '<td data-label="Action"><select class="action-select ns-action-input" data-row="' + nsGridRowId + '" style="min-width:180px;min-height:44px;" onchange="handleNsActionChange(this)">' + nsActionOptions + '</select>'
+                            + '<input type="text" class="ns-grid-input ns-new-item-input" data-row="' + nsGridRowId + '" placeholder="New item name / SKU" style="display:none;margin-top:6px;width:100%;padding:10px;border:1.5px solid #d1d5db;border-radius:6px;font-size:16px;min-height:44px;">'
                             + '<input type="number" class="ns-grid-input ns-upcharge-input" data-row="' + nsGridRowId + '" placeholder="Upcharge $/unit" min="0" step="0.01" style="display:none;margin-top:6px;width:100%;padding:10px;border:1.5px solid #d1d5db;border-radius:6px;font-size:16px;min-height:44px;"></td>'
                             + '<td><button type="button" onclick="removeNsGridRow(' + nsGridRowId + ')" style="background:none;border:none;color:#ef4444;cursor:pointer;font-size:20px;padding:6px 10px;min-height:44px;min-width:44px;" title="Remove">&times;</button></td>';
                         tbody.appendChild(tr);
@@ -2649,6 +3372,12 @@ define([
                     function handleNsActionChange(selectEl) {
                         var row = selectEl.closest('tr');
                         if (!row) return;
+                        var isPnc = selectEl.value === 'part_number_change' || selectEl.value === 'part_number_change_stock';
+                        var newItemInput = row.querySelector('.ns-new-item-input');
+                        if (newItemInput) {
+                            newItemInput.style.display = isPnc ? 'block' : 'none';
+                            if (!isPnc) newItemInput.value = '';
+                        }
                         var upchargeInput = row.querySelector('.ns-upcharge-input');
                         if (upchargeInput) {
                             upchargeInput.style.display = selectEl.value === 'transfer_upcharge' ? 'block' : 'none';
@@ -2666,19 +3395,23 @@ define([
                             var binInput = row.querySelector('.ns-bin-input');
                             var qtyInput = row.querySelector('.ns-qty-input');
                             var actionSelect = row.querySelector('.ns-action-input');
+                            var newItemInput = row.querySelector('.ns-new-item-input');
                             var upchargeInput = row.querySelector('.ns-upcharge-input');
                             var itemName = itemInput ? itemInput.value.trim() : '';
                             var binNumber = binInput ? binInput.value.trim() : '';
                             var qty = qtyInput ? parseInt(qtyInput.value) || 0 : 0;
                             var action = actionSelect ? actionSelect.value : '';
+                            var newItemName = newItemInput ? newItemInput.value.trim() : '';
                             var upcharge = upchargeInput ? parseFloat(upchargeInput.value) || 0 : 0;
+                            var isPnc = action === 'part_number_change' || action === 'part_number_change_stock';
                             if (!itemName && !binNumber && qty === 0 && !action) continue;
                             if (!itemName) { if (itemInput) itemInput.style.borderColor = '#ef4444'; hasError = true; } else { if (itemInput) itemInput.style.borderColor = '#d1d5db'; }
                             if (!binNumber) { if (binInput) binInput.style.borderColor = '#ef4444'; hasError = true; } else { if (binInput) binInput.style.borderColor = '#d1d5db'; }
                             if (qty <= 0) { if (qtyInput) qtyInput.style.borderColor = '#ef4444'; hasError = true; } else { if (qtyInput) qtyInput.style.borderColor = '#d1d5db'; }
                             if (!action) { if (actionSelect) actionSelect.style.borderColor = '#ef4444'; hasError = true; } else { if (actionSelect) actionSelect.style.borderColor = '#d1d5db'; }
-                            if (action === 'transfer_upcharge' && upcharge <= 0) { if (upchargeInput) upchargeInput.style.borderColor = '#ef4444'; hasError = true; } else { if (upchargeInput) upchargeInput.style.borderColor = '#d1d5db'; }
-                            gridData.push({ itemName:itemName, binNumber:binNumber, quantity:qty, action:action, upcharge: action === 'transfer_upcharge' ? upcharge : 0 });
+                            if (isPnc && !newItemName) { if (newItemInput) newItemInput.style.borderColor = '#ef4444'; hasError = true; } else { if (newItemInput) newItemInput.style.borderColor = '#d1d5db'; }
+                            if (upchargeInput) upchargeInput.style.borderColor = '#d1d5db';
+                            gridData.push({ itemName:itemName, binNumber:binNumber, quantity:qty, action:action, newItemName: isPnc ? newItemName : '', upcharge: action === 'transfer_upcharge' ? upcharge : 0 });
                         }
                         if (gridData.length === 0) { alert('Please fill in at least one row.'); return; }
                         if (hasError) { alert('Please fix the highlighted fields.'); return; }
@@ -2689,6 +3422,7 @@ define([
                         var actionInput = document.createElement('input');
                         actionInput.type = 'hidden'; actionInput.name = 'custpage_action'; actionInput.value = 'process_nonserialized_multi';
                         form.appendChild(actionInput);
+                        _disableAllBtns();
                         form.submit();
                     }
 
@@ -2725,7 +3459,7 @@ define([
                         var form = document.forms[0];
                         var action = document.createElement('input');
                         action.type = 'hidden'; action.name = 'custpage_action'; action.value = 'lookup_serials';
-                        form.appendChild(action); form.submit();
+                        form.appendChild(action); _disableAllBtns(); form.submit();
                     }
 
                     function submitNonSerialized() {
@@ -2747,7 +3481,7 @@ define([
                         var form = document.forms[0];
                         var action = document.createElement('input');
                         action.type = 'hidden'; action.name = 'custpage_action'; action.value = 'process_nonserialized';
-                        form.appendChild(action); form.submit();
+                        form.appendChild(action); _disableAllBtns(); form.submit();
                     }
 
                     function showInventoryFoundModal() {
@@ -2773,7 +3507,7 @@ define([
                         if (ifSerialsField) ifSerialsField.value = serialsRaw;
                         var actionInput = document.createElement('input');
                         actionInput.type = 'hidden'; actionInput.name = 'custpage_action'; actionInput.value = 'process_inventory_found';
-                        form.appendChild(actionInput); form.submit();
+                        form.appendChild(actionInput); _disableAllBtns(); form.submit();
                     }
 
                     function clearForm() {
@@ -2801,8 +3535,18 @@ define([
                 <script>
                     window.onbeforeunload = null;
 
+                    function _disableAllBtns() {
+                        var btns = document.querySelectorAll('.custom-btn');
+                        for (var i = 0; i < btns.length; i++) {
+                            btns[i].disabled = true;
+                            btns[i].style.opacity = '0.7';
+                            btns[i].style.cursor = 'not-allowed';
+                            btns[i].textContent = 'Please wait...';
+                        }
+                    }
+
                     function setAllActions(value) {
-                        if (value === 'serial_change' || value === 'serial_change_stock') { alert('Serial change actions must be set individually.'); return; }
+                        if (value === 'serial_change' || value === 'serial_change_stock' || value === 'part_serial_change' || value === 'part_serial_change_stock') { alert('Actions that require a new serial must be set individually.'); return; }
                         var bulkNewItem = document.getElementById('bulk-new-item');
                         var bulkUpcharge = document.getElementById('bulk-upcharge');
                         if (bulkNewItem) { bulkNewItem.style.display = (value==='part_number_change'||value==='part_number_change_stock') ? 'block' : 'none'; if (value!=='part_number_change'&&value!=='part_number_change_stock') bulkNewItem.value=''; }
@@ -2848,8 +3592,8 @@ define([
                         var nsi = document.querySelector('.new-serial-input[data-index="'+idx+'"]');
                         var nii = document.querySelector('.new-item-input[data-index="'+idx+'"]');
                         var uci = document.querySelector('.upcharge-input[data-index="'+idx+'"]');
-                        if (nsi) { var show = selectEl.value==='serial_change'||selectEl.value==='serial_change_stock'; nsi.style.display = show?'block':'none'; if (!show) nsi.value=''; }
-                        if (nii) { var show = selectEl.value==='part_number_change'||selectEl.value==='part_number_change_stock'; nii.style.display = show?'block':'none'; if (!show) nii.value=''; }
+                        if (nsi) { var show = selectEl.value==='serial_change'||selectEl.value==='serial_change_stock'||selectEl.value==='part_serial_change'||selectEl.value==='part_serial_change_stock'; nsi.style.display = show?'block':'none'; if (!show) nsi.value=''; }
+                        if (nii) { var show = selectEl.value==='part_number_change'||selectEl.value==='part_number_change_stock'||selectEl.value==='part_serial_change'||selectEl.value==='part_serial_change_stock'; nii.style.display = show?'block':'none'; if (!show) nii.value=''; }
                         if (uci) { var show = selectEl.value==='transfer_upcharge'; uci.style.display = show?'block':'none'; if (!show) uci.value=''; }
                         updateActionCount();
                     }
@@ -2875,17 +3619,17 @@ define([
                             var idx = selects[i].getAttribute('data-index');
                             var val = selects[i].value;
                             var newSerial = '', newItemName = '', upcharge = 0;
-                            if (val==='serial_change'||val==='serial_change_stock') {
+                            if (val==='serial_change'||val==='serial_change_stock'||val==='part_serial_change'||val==='part_serial_change_stock') {
                                 var ni = document.querySelector('.new-serial-input[data-index="'+idx+'"]');
                                 if (ni) { newSerial = ni.value.trim(); if (!newSerial) { missingNewSerial=true; ni.style.borderColor='#ef4444'; } else { ni.style.borderColor='#d1d5db'; } }
                             }
-                            if (val==='part_number_change'||val==='part_number_change_stock') {
+                            if (val==='part_number_change'||val==='part_number_change_stock'||val==='part_serial_change'||val==='part_serial_change_stock') {
                                 var ni = document.querySelector('.new-item-input[data-index="'+idx+'"]');
                                 if (ni) { newItemName = ni.value.trim(); if (!newItemName && bulkItemName) { newItemName = bulkItemName; ni.value = bulkItemName; } if (!newItemName) { missingNewItem=true; ni.style.borderColor='#ef4444'; } else { ni.style.borderColor='#d1d5db'; } }
                             }
                             if (val==='transfer_upcharge') {
                                 var ui = document.querySelector('.upcharge-input[data-index="'+idx+'"]');
-                                if (ui) { var uv = ui.value.trim(); if (!uv && bulkUpchargeVal) { uv = bulkUpchargeVal; ui.value = bulkUpchargeVal; } upcharge = parseFloat(uv)||0; if (upcharge<=0) { missingUpcharge=true; ui.style.borderColor='#ef4444'; } else { ui.style.borderColor='#d1d5db'; } }
+                                if (ui) { var uv = ui.value.trim(); if (!uv && bulkUpchargeVal) { uv = bulkUpchargeVal; ui.value = bulkUpchargeVal; } upcharge = parseFloat(uv)||0; ui.style.borderColor='#d1d5db'; }
                             }
                             actions.push({ index:parseInt(idx), action:val, newSerial:newSerial, newItemName:newItemName, upcharge:upcharge });
                             if (val !== '') hasAction = true;
@@ -2894,7 +3638,6 @@ define([
                         if (!hasAction) { alert('Select an action for at least one serial'); return; }
                         if (missingNewSerial) { alert('Enter a new serial for all Serial Change actions'); return; }
                         if (missingNewItem) { alert('Enter a new item name for all Part Number Change actions'); return; }
-                        if (missingUpcharge) { alert('Enter an upcharge amount for all Transfer & Upcharge actions'); return; }
 
                         window.onbeforeunload = null;
                         var form = document.forms[0];
@@ -2902,7 +3645,7 @@ define([
                         if (jsonField) jsonField.value = JSON.stringify(actions);
                         var actionInput = document.createElement('input');
                         actionInput.type = 'hidden'; actionInput.name = 'custpage_action'; actionInput.value = 'process_actions';
-                        form.appendChild(actionInput); form.submit();
+                        form.appendChild(actionInput); _disableAllBtns(); form.submit();
                     }
 
                     /* SESSION-SAFE BACK: POST back to suitelet instead of GET navigation */
@@ -2914,7 +3657,29 @@ define([
                         for (var i = 0; i < existing.length; i++) existing[i].parentNode.removeChild(existing[i]);
                         var ai = document.createElement('input');
                         ai.type = 'hidden'; ai.name = 'custpage_action'; ai.value = 'go_home';
-                        form.appendChild(ai); form.submit();
+                        form.appendChild(ai); _disableAllBtns(); form.submit();
+                    }
+
+                    var _sortState = { col: null, dir: 1 };
+                    function sortTable(col) {
+                        var tbody = document.querySelector('.results-table tbody');
+                        if (!tbody) return;
+                        if (_sortState.col === col) { _sortState.dir *= -1; } else { _sortState.col = col; _sortState.dir = 1; }
+                        var rows = Array.from(tbody.querySelectorAll('tr'));
+                        rows.sort(function(a, b) {
+                            var av = (a.getAttribute('data-' + col) || '').toLowerCase();
+                            var bv = (b.getAttribute('data-' + col) || '').toLowerCase();
+                            if (av < bv) return -_sortState.dir;
+                            if (av > bv) return _sortState.dir;
+                            return 0;
+                        });
+                        rows.forEach(function(r) { tbody.appendChild(r); });
+                        var ths = document.querySelectorAll('.results-table thead th[data-sort]');
+                        ths.forEach(function(th) {
+                            var ind = th.querySelector('.sort-indicator');
+                            if (!ind) return;
+                            ind.textContent = th.getAttribute('data-sort') === col ? (_sortState.dir === 1 ? ' ▲' : ' ▼') : ' ⇅';
+                        });
                     }
 
                     document.addEventListener('DOMContentLoaded', function() {
@@ -2931,9 +3696,19 @@ define([
             const homeAction = returnAction || 'go_home';
             return `
                 <script>
+                    function _disableAllBtns() {
+                        var btns = document.querySelectorAll('.custom-btn');
+                        for (var i = 0; i < btns.length; i++) {
+                            btns[i].disabled = true;
+                            btns[i].style.opacity = '0.7';
+                            btns[i].style.cursor = 'not-allowed';
+                            btns[i].textContent = 'Please wait...';
+                        }
+                    }
                     function printLabels() {
                         window.onbeforeunload = null;
                         if (typeof setWindowChanged === 'function') setWindowChanged(window, false);
+                        _disableAllBtns();
                         var form = document.forms[0];
                         form.target = '_blank';
                         var action = document.createElement('input');
@@ -2950,7 +3725,7 @@ define([
                         for (var i = 0; i < existing.length; i++) existing[i].parentNode.removeChild(existing[i]);
                         var ai = document.createElement('input');
                         ai.type = 'hidden'; ai.name = 'custpage_action'; ai.value = '${homeAction}';
-                        form.appendChild(ai); form.submit();
+                        form.appendChild(ai); _disableAllBtns(); form.submit();
                     }
                 </script>
             `;
@@ -2963,14 +3738,10 @@ define([
         function createEntryForm(context, message, messageType, prefill) {
             const form = serverWidget.createForm({ title: 'Warehouse Assistant Dashboard' });
 
-            const binList = getBinsForLocation('1');
-            let nsBinOptionsHtml = '<option value="">-- Select Bin --</option>';
-            binList.forEach(function(b) {
-                nsBinOptionsHtml += '<option value="' + escapeXml(b.name) + '">' + escapeXml(b.name) + '</option>';
-            });
+            const suiteletUrl = url.resolveScript({ scriptId: runtime.getCurrentScript().id, deploymentId: runtime.getCurrentScript().deploymentId });
 
             const styleField = form.addField({ id: 'custpage_styles', type: serverWidget.FieldType.INLINEHTML, label: ' ' });
-            styleField.defaultValue = getStyles() + getEntryFormScript(nsBinOptionsHtml);
+            styleField.defaultValue = getStyles() + getEntryFormScript(suiteletUrl);
 
             let msgHtml = '';
             if (message) {
@@ -3001,6 +3772,7 @@ define([
                             </div>
 
                             <div id="nonserialized-section" class="form-section">
+                                <datalist id="ns-bin-datalist"></datalist>
                                 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
                                     <label class="custom-label" style="margin-bottom:0;">Items <span class="badge-count"><span id="ns_row_count">1</span> rows</span></label>
                                     <button type="button" class="custom-btn btn-outline" style="padding:8px 14px;font-size:12px;margin:0;min-height:36px;" onclick="addNsGridRow()">+ Add Row</button>
@@ -3060,6 +3832,9 @@ define([
             nsActionField.addSelectOption({ value: 'defective', text: 'Defective' });
             nsActionField.addSelectOption({ value: 'move_refurbishing', text: 'Move to Refurbishing' });
             nsActionField.addSelectOption({ value: 'move_testing', text: 'Move to Testing' });
+            nsActionField.addSelectOption({ value: 'move_not_counted', text: 'Move to Not Counted' });
+            nsActionField.addSelectOption({ value: 'part_number_change', text: 'Part Number Change' });
+            nsActionField.addSelectOption({ value: 'part_number_change_stock', text: 'Part Number Change & Back to Stock' });
             nsActionField.addSelectOption({ value: 'return_to_vendor', text: 'Return to Vendor' });
             nsActionField.addSelectOption({ value: 'trash', text: 'Trash' });
             nsActionField.addSelectOption({ value: 'inventory_found', text: 'Inventory Found' });
@@ -3074,11 +3849,12 @@ define([
             const containerEnd = form.addField({ id: 'custpage_container_end', type: serverWidget.FieldType.INLINEHTML, label: ' ' });
             containerEnd.defaultValue = `</div>
             <script>
-                document.addEventListener('DOMContentLoaded', function() {
+                document.addEventListener('DOMContentLoaded', async function() {
                     var sw = document.getElementById('serial-field-wrap');
                     var sl = document.getElementById('custpage_serial_numbers_fs_lbl_uir_label');
                     if (sw && sl) sw.appendChild(sl.parentNode);
                     updateCount();
+                    await loadNsBins();
                     addNsGridRow();
                 });
             </script>`;
@@ -3098,7 +3874,7 @@ define([
             serialData.valid.forEach((s, idx) => {
                 const isLoc26 = String(s.locationId) === TRANSFER_SOURCE_LOCATION_ID;
                 const transferOption = isLoc26 ? '<option value="transfer_upcharge">Transfer to A &amp; Upcharge</option>' : '';
-                rows += '<tr>'
+                rows += '<tr data-serial="' + escapeXml(s.serialNumber || '') + '" data-item="' + escapeXml(s.itemText || '') + '" data-bin="' + escapeXml(s.binText || '') + '" data-location="' + escapeXml(s.locationText || '') + '">'
                     + '<td data-label="Serial" style="font-family:\'SF Mono\',Monaco,monospace;font-size:14px;">' + escapeXml(s.serialNumber) + '</td>'
                     + '<td data-label="Item"><strong>' + escapeXml(s.itemText) + '</strong></td>'
                     + '<td data-label="Bin">' + (escapeXml(s.binText) || '<span style="color:#9ca3af;">N/A</span>') + '</td>'
@@ -3112,8 +3888,11 @@ define([
                     + '<option value="defective">Defective</option>'
                     + '<option value="move_refurbishing">Move to Refurbishing</option>'
                     + '<option value="move_testing">Move to Testing</option>'
+                    + '<option value="move_not_counted">Move to Not Counted</option>'
                     + '<option value="part_number_change">Part Number Change</option>'
                     + '<option value="part_number_change_stock">Part Number Change &amp; Back to Stock</option>'
+                    + '<option value="part_serial_change">Part &amp; Serial Change</option>'
+                    + '<option value="part_serial_change_stock">Part &amp; Serial Change &amp; Back to Stock</option>'
                     + '<option value="return_to_vendor">Return to Vendor</option>'
                     + '<option value="serial_change">Serial Number Change</option>'
                     + '<option value="trash">Trash</option>'
@@ -3158,8 +3937,11 @@ define([
                                     <option value="defective">Defective</option>
                                     <option value="move_refurbishing">Move to Refurbishing</option>
                                     <option value="move_testing">Move to Testing</option>
+                                    <option value="move_not_counted">Move to Not Counted</option>
                                     <option value="part_number_change">Part Number Change</option>
                                     <option value="part_number_change_stock">Part Number Change &amp; Back to Stock</option>
+                                    <option value="part_serial_change">Part &amp; Serial Change</option>
+                                    <option value="part_serial_change_stock">Part &amp; Serial Change &amp; Back to Stock</option>
                                     <option value="return_to_vendor">Return to Vendor</option>
                                     <option value="serial_change">Serial Number Change</option>
                                     <option value="trash">Trash</option>
@@ -3175,7 +3957,13 @@ define([
                                 </div>
                             </div>
                             <table class="results-table">
-                                <thead><tr><th>Serial</th><th>Item</th><th>Bin</th><th>Location</th><th>Action</th></tr></thead>
+                                <thead><tr>
+                                    <th data-sort="serial" onclick="sortTable('serial')" style="cursor:pointer;user-select:none;">Serial<span class="sort-indicator"> ⇅</span></th>
+                                    <th data-sort="item" onclick="sortTable('item')" style="cursor:pointer;user-select:none;">Item<span class="sort-indicator"> ⇅</span></th>
+                                    <th data-sort="bin" onclick="sortTable('bin')" style="cursor:pointer;user-select:none;">Bin<span class="sort-indicator"> ⇅</span></th>
+                                    <th data-sort="location" onclick="sortTable('location')" style="cursor:pointer;user-select:none;">Location<span class="sort-indicator"> ⇅</span></th>
+                                    <th>Action</th>
+                                </tr></thead>
                                 <tbody>${rows}</tbody>
                             </table>
                         </div>
@@ -3193,9 +3981,9 @@ define([
             context.response.writePage(form);
         }
 
-        function createSuccessPage(context, adjustmentTranId, binTransferTranId, labelGroups, serialChangeTranId, inventoryFoundTranId, partNumberChangeTranId, transferOrderTranId, errors, failedGroups, returnAction) {
+        function createSuccessPage(context, adjustmentTranId, binTransferTranId, labelGroups, serialChangeTranId, inventoryFoundTranId, partNumberChangeTranId, transferOrderTranId, errors, failedGroups, returnAction, partSerialChangeTranId) {
             const form = serverWidget.createForm({ title: 'Transactions Created' });
-            const suiteletUrl = url.resolveScript({ scriptId: runtime.getCurrentScript().id, deploymentId: runtime.getCurrentScript().deploymentId, returnExternalUrl: true });
+            const suiteletUrl = url.resolveScript({ scriptId: runtime.getCurrentScript().id, deploymentId: runtime.getCurrentScript().deploymentId, returnExternalUrl: false });
             errors = errors || [];
             failedGroups = failedGroups || [];
 
@@ -3209,7 +3997,7 @@ define([
             });
 
             const printData = labelGroups.map(g => ({ itemText: g.itemText || '', description: g.description || '', serialNumbers: g.serialNumbers }));
-            const recordIdForPrint = adjustmentTranId || binTransferTranId || serialChangeTranId || partNumberChangeTranId || transferOrderTranId || '';
+            const recordIdForPrint = adjustmentTranId || binTransferTranId || serialChangeTranId || partNumberChangeTranId || partSerialChangeTranId || transferOrderTranId || '';
 
             const styleField = form.addField({ id: 'custpage_styles', type: serverWidget.FieldType.INLINEHTML, label: ' ' });
             styleField.defaultValue = getStyles() + getSuccessPageScript(suiteletUrl, returnAction);
@@ -3224,9 +4012,10 @@ define([
             const ACTION_LABELS = {
                 'back_to_stock':'Back to Stock','defective':'Defective','likenew':'Like New',
                 'likenew_stock':'Like New + Back to Stock','move_refurbishing':'Move to Refurbishing',
-                'move_testing':'Move to Testing','return_to_vendor':'Return to Vendor',
+                'move_testing':'Move to Testing','move_not_counted':'Move to Not Counted','return_to_vendor':'Return to Vendor',
                 'serial_change':'Serial Number Change','serial_change_stock':'Change Serial & Back to Stock',
                 'part_number_change':'Part Number Change','part_number_change_stock':'Part Number Change & Back to Stock',
+                'part_serial_change':'Part & Serial Change','part_serial_change_stock':'Part & Serial Change & Back to Stock',
                 'trash':'Trash','inventory_found':'Inventory Found','bin_putaway':'Bin Putaway',
                 'transfer_upcharge':'Transfer to A & Upcharge'
             };
@@ -3265,6 +4054,7 @@ define([
             if (binTransferTranId) transactionInfoHtml += '<p style="font-size:15px;margin:6px 0;color:#1a4971;"><strong>Bin Transfer:</strong> ' + escapeXml(String(binTransferTranId)) + '</p>';
             if (serialChangeTranId) transactionInfoHtml += '<p style="font-size:15px;margin:6px 0;color:#1a4971;"><strong>Serial Change:</strong> ' + escapeXml(String(serialChangeTranId)) + '</p>';
             if (partNumberChangeTranId) transactionInfoHtml += '<p style="font-size:15px;margin:6px 0;color:#1a4971;"><strong>Part # Change:</strong> ' + escapeXml(String(partNumberChangeTranId)) + '</p>';
+            if (partSerialChangeTranId) transactionInfoHtml += '<p style="font-size:15px;margin:6px 0;color:#1a4971;"><strong>Part &amp; Serial Change:</strong> ' + escapeXml(String(partSerialChangeTranId)) + '</p>';
             if (inventoryFoundTranId) transactionInfoHtml += '<p style="font-size:15px;margin:6px 0;color:#1a4971;"><strong>Inv. Found:</strong> ' + escapeXml(String(inventoryFoundTranId)) + '</p>';
             if (transferOrderTranId) transactionInfoHtml += '<p style="font-size:15px;margin:6px 0;color:#1a4971;"><strong>Transfer Order:</strong> ' + escapeXml(String(transferOrderTranId)) + '</p>';
 
@@ -3295,7 +4085,7 @@ define([
 
         function createNonSerializedSuccessPage(context, adjustmentTranId, binTransferTranId, itemDetails, quantity, action, inventoryFoundTranId) {
             const form = serverWidget.createForm({ title: 'Transactions Created' });
-            const suiteletUrl = url.resolveScript({ scriptId: runtime.getCurrentScript().id, deploymentId: runtime.getCurrentScript().deploymentId, returnExternalUrl: true });
+            const suiteletUrl = url.resolveScript({ scriptId: runtime.getCurrentScript().id, deploymentId: runtime.getCurrentScript().deploymentId, returnExternalUrl: false });
             const printData = [{ itemText: itemDetails.displayname || itemDetails.itemid, description: itemDetails.description || '', quantity: quantity }];
             const recordIdForPrint = adjustmentTranId || binTransferTranId || inventoryFoundTranId || '';
 
@@ -3306,7 +4096,7 @@ define([
             const printRecordIdField = form.addField({ id: 'custpage_print_record_id', type: serverWidget.FieldType.TEXT, label: 'Print Record ID' });
             printRecordIdField.updateDisplayType({ displayType: serverWidget.FieldDisplayType.HIDDEN }); printRecordIdField.defaultValue = String(recordIdForPrint);
 
-            const ACTION_LABELS = {'back_to_stock':'Back to Stock','defective':'Defective','likenew':'Change to Like New','likenew_stock':'Change to Like New & Back to Stock','move_refurbishing':'Move to Refurbishing','move_testing':'Move to Testing','return_to_vendor':'Return to Vendor','trash':'Trash','inventory_found':'Inventory Found','bin_putaway':'Bin Putaway'};
+            const ACTION_LABELS = {'back_to_stock':'Back to Stock','defective':'Defective','likenew':'Change to Like New','likenew_stock':'Change to Like New & Back to Stock','move_refurbishing':'Move to Refurbishing','move_testing':'Move to Testing','move_not_counted':'Move to Not Counted','return_to_vendor':'Return to Vendor','trash':'Trash','inventory_found':'Inventory Found','bin_putaway':'Bin Putaway'};
 
             let transactionInfoHtml = '';
             if (adjustmentTranId) transactionInfoHtml += '<p style="font-size:15px;margin:6px 0;color:#1a4971;"><strong>Inv. Adjustment:</strong> ' + escapeXml(String(adjustmentTranId)) + '</p>';
@@ -3330,9 +4120,9 @@ define([
             context.response.writePage(form);
         }
 
-        function createNonSerializedMultiSuccessPage(context, adjustmentTranId, binTransferTranId, inventoryFoundTranId, processedItems, errors, transferOrderTranId, failedItems, returnAction) {
+        function createNonSerializedMultiSuccessPage(context, adjustmentTranId, binTransferTranId, inventoryFoundTranId, processedItems, errors, transferOrderTranId, failedItems, returnAction, partNumberChangeTranId) {
             const form = serverWidget.createForm({ title: 'Transactions Created' });
-            const suiteletUrl = url.resolveScript({ scriptId: runtime.getCurrentScript().id, deploymentId: runtime.getCurrentScript().deploymentId, returnExternalUrl: true });
+            const suiteletUrl = url.resolveScript({ scriptId: runtime.getCurrentScript().id, deploymentId: runtime.getCurrentScript().deploymentId, returnExternalUrl: false });
             const printData = processedItems.map(function(item) { return { itemText: item.itemText || '', description: item.description || '', quantity: item.quantity }; });
             const recordIdForPrint = adjustmentTranId || binTransferTranId || inventoryFoundTranId || transferOrderTranId || '';
             failedItems = failedItems || [];
@@ -3344,13 +4134,14 @@ define([
             const printRecordIdField = form.addField({ id: 'custpage_print_record_id', type: serverWidget.FieldType.TEXT, label: 'Print Record ID' });
             printRecordIdField.updateDisplayType({ displayType: serverWidget.FieldDisplayType.HIDDEN }); printRecordIdField.defaultValue = String(recordIdForPrint);
 
-            const ACTION_LABELS = {'back_to_stock':'Back to Stock','defective':'Defective','likenew':'Change to Like New','likenew_stock':'Change to Like New & Back to Stock','move_refurbishing':'Move to Refurbishing','move_testing':'Move to Testing','return_to_vendor':'Return to Vendor','trash':'Trash','inventory_found':'Inventory Found','bin_putaway':'Bin Putaway','transfer_upcharge':'Transfer to A & Upcharge'};
+            const ACTION_LABELS = {'back_to_stock':'Back to Stock','defective':'Defective','likenew':'Change to Like New','likenew_stock':'Change to Like New & Back to Stock','move_refurbishing':'Move to Refurbishing','move_testing':'Move to Testing','move_not_counted':'Move to Not Counted','part_number_change':'Part Number Change','part_number_change_stock':'Part Number Change & Back to Stock','return_to_vendor':'Return to Vendor','trash':'Trash','inventory_found':'Inventory Found','bin_putaway':'Bin Putaway','transfer_upcharge':'Transfer to A & Upcharge'};
 
             let transactionInfoHtml = '';
             if (adjustmentTranId) transactionInfoHtml += '<p style="font-size:15px;margin:6px 0;color:#1a4971;"><strong>Inv. Adjustment:</strong> ' + escapeXml(String(adjustmentTranId)) + '</p>';
             if (binTransferTranId) transactionInfoHtml += '<p style="font-size:15px;margin:6px 0;color:#1a4971;"><strong>Bin Transfer:</strong> ' + escapeXml(String(binTransferTranId)) + '</p>';
             if (inventoryFoundTranId) transactionInfoHtml += '<p style="font-size:15px;margin:6px 0;color:#1a4971;"><strong>Inv. Found:</strong> ' + escapeXml(String(inventoryFoundTranId)) + '</p>';
             if (transferOrderTranId) transactionInfoHtml += '<p style="font-size:15px;margin:6px 0;color:#1a4971;"><strong>Transfer Order:</strong> ' + escapeXml(String(transferOrderTranId)) + '</p>';
+            if (partNumberChangeTranId) transactionInfoHtml += '<p style="font-size:15px;margin:6px 0;color:#1a4971;"><strong>Part # Change:</strong> ' + escapeXml(String(partNumberChangeTranId)) + '</p>';
 
             let itemRows = '', totalQty = 0;
             processedItems.forEach(function(item) {
@@ -3425,9 +4216,10 @@ define([
             if (Object.keys(actionMap).length === 0) { createResultsPage(context, serialData, 'Select an action for at least one serial number.', 'warning'); return; }
 
             const ADJUSTMENT_ACTIONS = ['likenew', 'likenew_stock'];
-            const BIN_TRANSFER_ACTIONS = ['move_testing', 'move_refurbishing', 'back_to_stock', 'defective', 'trash', 'return_to_vendor'];
+            const BIN_TRANSFER_ACTIONS = ['move_testing', 'move_refurbishing', 'move_not_counted', 'back_to_stock', 'defective', 'trash', 'return_to_vendor'];
             const SERIAL_CHANGE_ACTIONS = ['serial_change', 'serial_change_stock'];
             const PART_NUMBER_CHANGE_ACTIONS = ['part_number_change', 'part_number_change_stock'];
+            const PART_SERIAL_CHANGE_ACTIONS = ['part_serial_change', 'part_serial_change_stock'];
             const INVENTORY_FOUND_ACTIONS = ['inventory_found'];
             const TRANSFER_UPCHARGE_ACTIONS = ['transfer_upcharge'];
 
@@ -3439,6 +4231,7 @@ define([
             const binTransferGroupMap = {};
             const serialChangeList = [];
             const partNumberChangeList = [];
+            const partSerialChangeList = [];
             const inventoryFoundGroupMap = {};
             const transferUpchargeGroupMap = {};
 
@@ -3487,13 +4280,23 @@ define([
                     if (!partNumberTargetCache[newItemName].found) continue;
                     const pnc = partNumberTargetCache[newItemName];
                     partNumberChangeList.push({ oldItemId: itemId, oldItemText: itemDetails.displayname || itemDetails.itemid, newItemId: pnc.targetItem.id, newItemName: pnc.targetItem.itemid, newItemText: pnc.targetItem.displayname || pnc.targetItem.itemid, newItemDescription: pnc.targetItem.description, locationId: serial.locationId, serialNumber: serial.serialNumber, serialId: serial.serialId, binId: serial.binId, statusId: serial.statusId, action: action });
+                } else if (PART_SERIAL_CHANGE_ACTIONS.includes(action)) {
+                    if (!newSerial) { errors.push('New serial required for: ' + serial.serialNumber); continue; }
+                    if (!newItemName) { errors.push('New item name required for: ' + serial.serialNumber); continue; }
+                    if (!partNumberTargetCache[newItemName]) {
+                        const ti = findItemByName(newItemName);
+                        partNumberTargetCache[newItemName] = ti ? { found: true, targetItem: ti } : { found: false };
+                        if (!ti) errors.push('Item not found: ' + newItemName);
+                    }
+                    if (!partNumberTargetCache[newItemName].found) continue;
+                    const psc = partNumberTargetCache[newItemName];
+                    partSerialChangeList.push({ oldItemId: itemId, oldItemText: itemDetails.displayname || itemDetails.itemid, newItemId: psc.targetItem.id, newItemName: psc.targetItem.itemid, newItemText: psc.targetItem.displayname || psc.targetItem.itemid, newItemDescription: psc.targetItem.description, locationId: serial.locationId, oldSerialNumber: serial.serialNumber, oldSerialId: serial.serialId, newSerialNumber: newSerial, binId: serial.binId, statusId: serial.statusId, action: action });
                 } else if (INVENTORY_FOUND_ACTIONS.includes(action)) {
                     const key = itemId + '_' + serial.locationId + '_' + action;
                     if (!inventoryFoundGroupMap[key]) inventoryFoundGroupMap[key] = { itemId: itemId, itemText: itemDetails.displayname || itemDetails.itemid, itemDescription: itemDetails.description, locationId: serial.locationId, action: action, serials: [] };
                     inventoryFoundGroupMap[key].serials.push({ serialNumber: serial.serialNumber, serialId: serial.serialId, binId: serial.binId });
                 } else if (TRANSFER_UPCHARGE_ACTIONS.includes(action)) {
                     const upchargeAmount = actionData.upcharge || 0;
-                    if (upchargeAmount <= 0) { errors.push('Upcharge amount required for: ' + serial.serialNumber); continue; }
                     const key = itemId + '_' + upchargeAmount;
                     if (!transferUpchargeGroupMap[key]) transferUpchargeGroupMap[key] = { itemId: itemId, itemText: itemDetails.displayname || itemDetails.itemid, itemDescription: itemDetails.description, upchargePerUnit: upchargeAmount, action: action, serials: [] };
                     transferUpchargeGroupMap[key].serials.push({ serialNumber: serial.serialNumber, serialId: serial.serialId, binId: serial.binId });
@@ -3505,11 +4308,11 @@ define([
             const inventoryFoundGroups = Object.values(inventoryFoundGroupMap);
             const transferUpchargeGroups = Object.values(transferUpchargeGroupMap);
 
-            if (adjustmentGroups.length === 0 && binTransferGroups.length === 0 && serialChangeList.length === 0 && partNumberChangeList.length === 0 && inventoryFoundGroups.length === 0 && transferUpchargeGroups.length === 0) {
+            if (adjustmentGroups.length === 0 && binTransferGroups.length === 0 && serialChangeList.length === 0 && partNumberChangeList.length === 0 && partSerialChangeList.length === 0 && inventoryFoundGroups.length === 0 && transferUpchargeGroups.length === 0) {
                 createResultsPage(context, serialData, errors.length > 0 ? 'Could not process: ' + errors.join('; ') : 'No valid serials to process.', 'error'); return;
             }
 
-            let adjustmentTranId = null, binTransferTranId = null, serialChangeTranId = null, partNumberChangeTranId = null, inventoryFoundTranId = null, transferOrderTranId = null;
+            let adjustmentTranId = null, binTransferTranId = null, serialChangeTranId = null, partNumberChangeTranId = null, partSerialChangeTranId = null, inventoryFoundTranId = null, transferOrderTranId = null;
             const labelGroups = [];
 
             const failedGroups = [];
@@ -3566,6 +4369,19 @@ define([
                 });
                 if (result.failed.length > 0) errors.push(result.failed.length + ' part # change(s) failed');
             }
+            if (partSerialChangeList.length > 0) {
+                const result = tryBatchThenIndividual(partSerialChangeList, createPartAndSerialChangeAdjustment, 'Part & Serial Change via WH Assistant');
+                if (result.tranIds.length > 0) partSerialChangeTranId = result.tranIds.join(', ');
+                result.succeeded.forEach(c => {
+                    let ex = labelGroups.find(lg => lg.itemId === c.newItemId && lg.action === c.action);
+                    if (!ex) { ex = { itemId: c.newItemId, itemText: c.newItemText, description: c.newItemDescription, action: c.action, serialNumbers: [] }; labelGroups.push(ex); }
+                    ex.serialNumbers.push(c.newSerialNumber);
+                });
+                result.failed.forEach(c => {
+                    failedGroups.push({ serialNumber: c.oldSerialNumber, itemText: c.oldItemText || c.newItemText, action: c.action, error: c._error || 'Part & serial change failed' });
+                });
+                if (result.failed.length > 0) errors.push(result.failed.length + ' part & serial change(s) failed');
+            }
             if (inventoryFoundGroups.length > 0) {
                 const result = tryBatchThenIndividual(inventoryFoundGroups, createInventoryFoundAdjustment, 'Inv Found via WH Assistant');
                 if (result.tranIds.length > 0) inventoryFoundTranId = result.tranIds.join(', ');
@@ -3601,7 +4417,7 @@ define([
                 createResultsPage(context, serialData, 'All operations failed: ' + errors.join('; '), 'error'); return;
             }
 
-            createSuccessPage(context, adjustmentTranId, binTransferTranId, labelGroups, serialChangeTranId, inventoryFoundTranId, partNumberChangeTranId, transferOrderTranId, errors, failedGroups);
+            createSuccessPage(context, adjustmentTranId, binTransferTranId, labelGroups, serialChangeTranId, inventoryFoundTranId, partNumberChangeTranId, transferOrderTranId, errors, failedGroups, null, partSerialChangeTranId);
         }
 
         function handleProcessInventoryFound(context) {
@@ -3636,7 +4452,7 @@ define([
             if (!itemDetails) { createEntryForm(context, 'Could not find item details.', 'error'); return; }
 
             const ADJUSTMENT_ACTIONS = ['likenew', 'likenew_stock'];
-            const BIN_TRANSFER_ACTIONS = ['move_testing', 'move_refurbishing', 'back_to_stock', 'defective', 'trash', 'return_to_vendor'];
+            const BIN_TRANSFER_ACTIONS = ['move_testing', 'move_refurbishing', 'move_not_counted', 'back_to_stock', 'defective', 'trash', 'return_to_vendor'];
             const INVENTORY_FOUND_ACTIONS = ['inventory_found'];
             let adjustmentTranId = null, binTransferTranId = null, inventoryFoundTranId = null;
             let labelItemDetails = itemDetails;
@@ -3657,6 +4473,7 @@ define([
                 let toBinId, toStatusId;
                 if (action === 'move_testing') { toBinId = TESTING_BIN_ID; toStatusId = TESTING_STATUS_ID; }
                 else if (action === 'move_refurbishing') { toBinId = REFURBISHING_BIN_ID; toStatusId = REFURBISHING_STATUS_ID; }
+                else if (action === 'move_not_counted') { toBinId = NOT_COUNTED_BIN_ID; toStatusId = NOT_COUNTED_STATUS_ID; }
                 else if (action === 'back_to_stock') { toBinId = BACK_TO_STOCK_BIN_ID; toStatusId = BACK_TO_STOCK_STATUS_ID; }
                 else if (action === 'defective') { toBinId = DEFECTIVE_BIN_ID; toStatusId = DEFECTIVE_STATUS_ID; }
                 else if (action === 'trash') { toBinId = TRASH_BIN_ID; toStatusId = TRASH_STATUS_ID; }
@@ -3682,11 +4499,12 @@ define([
             if (!cartRows || cartRows.length === 0) { createEntryForm(context, 'No items in the grid.', 'warning'); return; }
 
             const ADJUSTMENT_ACTIONS = ['likenew', 'likenew_stock'];
-            const BIN_TRANSFER_ACTIONS = ['move_testing', 'move_refurbishing', 'back_to_stock', 'defective', 'trash', 'return_to_vendor'];
+            const BIN_TRANSFER_ACTIONS = ['move_testing', 'move_refurbishing', 'move_not_counted', 'back_to_stock', 'defective', 'trash', 'return_to_vendor'];
             const INVENTORY_FOUND_ACTIONS = ['inventory_found'];
             const TRANSFER_UPCHARGE_ACTIONS = ['transfer_upcharge'];
+            const PART_NUMBER_CHANGE_ACTIONS = ['part_number_change', 'part_number_change_stock'];
             const locationId = '1'; const errors = [];
-            const adjustmentRows = [], binTransferRows = [], inventoryFoundRows = [], transferUpchargeRows = [];
+            const adjustmentRows = [], binTransferRows = [], inventoryFoundRows = [], transferUpchargeRows = [], partNumberChangeRows = [];
             const itemCache = {}, binCache = {}, targetItemCache = {};
 
             cartRows.forEach(function(row, idx) {
@@ -3710,6 +4528,7 @@ define([
                     let toBinId, toStatusId;
                     if (action === 'move_testing') { toBinId = TESTING_BIN_ID; toStatusId = TESTING_STATUS_ID; }
                     else if (action === 'move_refurbishing') { toBinId = REFURBISHING_BIN_ID; toStatusId = REFURBISHING_STATUS_ID; }
+                    else if (action === 'move_not_counted') { toBinId = NOT_COUNTED_BIN_ID; toStatusId = NOT_COUNTED_STATUS_ID; }
                     else if (action === 'back_to_stock') { toBinId = BACK_TO_STOCK_BIN_ID; toStatusId = BACK_TO_STOCK_STATUS_ID; }
                     else if (action === 'defective') { toBinId = DEFECTIVE_BIN_ID; toStatusId = DEFECTIVE_STATUS_ID; }
                     else if (action === 'trash') { toBinId = TRASH_BIN_ID; toStatusId = TRASH_STATUS_ID; }
@@ -3717,17 +4536,25 @@ define([
                     binTransferRows.push({ itemId: itemData.id, itemText: itemData.displayname || itemData.itemid, description: itemData.description, locationId: locationId, quantity: quantity, fromBinId: fromBinId, toBinId: toBinId, toStatusId: toStatusId, action: action });
                 } else if (INVENTORY_FOUND_ACTIONS.indexOf(action) !== -1) {
                     inventoryFoundRows.push({ itemId: itemData.id, itemText: itemData.displayname || itemData.itemid, description: itemData.description, locationId: locationId, quantity: quantity, action: action });
+                } else if (PART_NUMBER_CHANGE_ACTIONS.indexOf(action) !== -1) {
+                    const newItemName = (row.newItemName || '').trim();
+                    if (!newItemName) { errors.push(rowLabel + ': new item name required for Part Number Change'); return; }
+                    if (!targetItemCache['pnc_' + newItemName]) { const ti = findItemByName(newItemName); if (!ti) { errors.push(rowLabel + ': new item not found "' + newItemName + '"'); targetItemCache['pnc_' + newItemName] = { found: false }; } else targetItemCache['pnc_' + newItemName] = { found: true, targetItem: ti }; }
+                    if (!targetItemCache['pnc_' + newItemName].found) return;
+                    const pnc = targetItemCache['pnc_' + newItemName];
+                    let toBinId = fromBinId, toStatusId = null;
+                    if (action === 'part_number_change_stock') { toBinId = BACK_TO_STOCK_BIN_ID; toStatusId = BACK_TO_STOCK_STATUS_ID; }
+                    partNumberChangeRows.push({ sourceItemId: itemData.id, sourceItemName: itemData.itemid, targetItemId: pnc.targetItem.id, targetItemName: pnc.targetItem.itemid, targetDisplayName: pnc.targetItem.displayname, targetDescription: pnc.targetItem.description, locationId: locationId, quantity: quantity, fromBinId: fromBinId, toBinId: toBinId, toStatusId: toStatusId, action: action });
                 } else if (TRANSFER_UPCHARGE_ACTIONS.indexOf(action) !== -1) {
-                    if (upcharge <= 0) { errors.push(rowLabel + ': upcharge required'); return; }
                     transferUpchargeRows.push({ itemId: itemData.id, itemText: itemData.displayname || itemData.itemid, description: itemData.description, locationId: locationId, quantity: quantity, upcharge: upcharge, action: action });
                 }
             });
 
-            if (adjustmentRows.length === 0 && binTransferRows.length === 0 && inventoryFoundRows.length === 0 && transferUpchargeRows.length === 0) {
+            if (adjustmentRows.length === 0 && binTransferRows.length === 0 && inventoryFoundRows.length === 0 && transferUpchargeRows.length === 0 && partNumberChangeRows.length === 0) {
                 createEntryForm(context, errors.length > 0 ? 'Errors: ' + errors.join('; ') : 'No valid items to process.', 'error'); return;
             }
 
-            let adjustmentTranId = null, binTransferTranId = null, inventoryFoundTranId = null, transferOrderTranId = null;
+            let adjustmentTranId = null, binTransferTranId = null, inventoryFoundTranId = null, transferOrderTranId = null, partNumberChangeTranId = null;
             const processedItems = [];
             const failedItems = [];
 
@@ -3767,9 +4594,16 @@ define([
                 });
                 if (toTranIds.length > 0) transferOrderTranId = toTranIds.join(', ');
             }
+            if (partNumberChangeRows.length > 0) {
+                const result = tryBatchThenIndividual(partNumberChangeRows, createNonSerializedAdjustmentMulti, 'Part # Change via WH Assistant');
+                if (result.tranIds.length > 0) partNumberChangeTranId = result.tranIds.join(', ');
+                result.succeeded.forEach(function(row) { processedItems.push({ itemText: row.targetDisplayName || row.targetItemName, description: row.targetDescription, quantity: row.quantity, action: row.action }); });
+                result.failed.forEach(function(row) { failedItems.push({ itemText: row.targetDisplayName || row.targetItemName || row.sourceItemName, description: row.targetDescription, quantity: row.quantity, action: row.action, error: row._error || 'Part # change failed' }); });
+                if (result.failed.length > 0) errors.push(result.failed.length + ' part # change row(s) failed');
+            }
 
             if (processedItems.length === 0 && failedItems.length > 0) { createEntryForm(context, 'All operations failed: ' + errors.join('; '), 'error'); return; }
-            createNonSerializedMultiSuccessPage(context, adjustmentTranId, binTransferTranId, inventoryFoundTranId, processedItems, errors, transferOrderTranId, failedItems);
+            createNonSerializedMultiSuccessPage(context, adjustmentTranId, binTransferTranId, inventoryFoundTranId, processedItems, errors, transferOrderTranId, failedItems, null, partNumberChangeTranId);
         }
 
         // ====================================================================
@@ -3778,14 +4612,10 @@ define([
         function createBinPutawayForm(context, message, messageType, prefill) {
             const form = serverWidget.createForm({ title: 'Bin Putaway' });
 
-            const binList = getBinsForLocation('1');
-            let bpBinDatalistHtml = '';
-            binList.forEach(function(b) {
-                bpBinDatalistHtml += '<option value="' + escapeXml(b.name) + '">';
-            });
+            const bpSuiteletUrl = url.resolveScript({ scriptId: runtime.getCurrentScript().id, deploymentId: runtime.getCurrentScript().deploymentId });
 
             const styleField = form.addField({ id: 'custpage_styles', type: serverWidget.FieldType.INLINEHTML, label: ' ' });
-            styleField.defaultValue = getStyles() + getBinPutawayFormScript();
+            styleField.defaultValue = getStyles() + getBinPutawayFormScript(bpSuiteletUrl);
 
             let msgHtml = '';
             if (message) {
@@ -3807,7 +4637,7 @@ define([
                                 <button type="button" id="bp-mode-serialized" class="mode-btn active" onclick="switchBpMode('serialized')">Serialized</button>
                                 <button type="button" id="bp-mode-nonserialized" class="mode-btn" onclick="switchBpMode('nonserialized')">Non-Serialized</button>
                             </div>
-                            <datalist id="bp-bin-datalist">${bpBinDatalistHtml}</datalist>
+                            <datalist id="bp-bin-datalist"></datalist>
                             <div id="bp-serialized-section" class="form-section active">
                                 <div class="input-group">
                                     <label class="custom-label">Destination Bin</label>
@@ -3868,11 +4698,12 @@ define([
             const containerEnd = form.addField({ id: 'custpage_container_end', type: serverWidget.FieldType.INLINEHTML, label: ' ' });
             containerEnd.defaultValue = `</div>
             <script>
-                document.addEventListener('DOMContentLoaded', function() {
+                document.addEventListener('DOMContentLoaded', async function() {
                     var bw = document.getElementById('bp-serial-field-wrap');
                     var bl = document.getElementById('custpage_bp_serials_fs_lbl_uir_label');
                     if (bw && bl) bw.appendChild(bl.parentNode);
                     updateBpCount();
+                    await loadBpBins();
                     addBpNsGridRow();
                     var bf = document.getElementById('custpage_bp_serials');
                     if (bf) { bf.addEventListener('input', updateBpCount); bf.addEventListener('paste', function() { setTimeout(updateBpCount, 50); }); }
@@ -3883,14 +4714,43 @@ define([
             context.response.writePage(form);
         }
 
-        function getBinPutawayFormScript() {
+        function getBinPutawayFormScript(bpSuiteletUrl) {
             return `
                 <script>
                     window.onbeforeunload = null;
                     if (typeof setWindowChanged === 'function') setWindowChanged(window, false);
 
+                    function _disableAllBtns() {
+                        var btns = document.querySelectorAll('.custom-btn');
+                        for (var i = 0; i < btns.length; i++) {
+                            btns[i].disabled = true;
+                            btns[i].style.opacity = '0.7';
+                            btns[i].style.cursor = 'not-allowed';
+                            btns[i].textContent = 'Please wait...';
+                        }
+                    }
+
                     var bpCurrentMode = 'serialized';
                     var bpNsGridRowId = 0;
+                    var bpBinsApiUrl = '${(bpSuiteletUrl || '').replace(/'/g, "\\'")}';
+
+                    async function loadBpBins() {
+                        try {
+                            var resp = await fetch(bpBinsApiUrl + '&action=getBins&location=1');
+                            var data = await resp.json();
+                            if (data.results && data.results.length) {
+                                var dl = document.getElementById('bp-bin-datalist');
+                                if (dl) {
+                                    dl.innerHTML = '';
+                                    data.results.forEach(function(b) {
+                                        var opt = document.createElement('option');
+                                        opt.value = b.name;
+                                        dl.appendChild(opt);
+                                    });
+                                }
+                            }
+                        } catch(e) { console.error('Failed to load bins for putaway:', e); }
+                    }
 
                     function switchBpMode(mode) {
                         bpCurrentMode = mode;
@@ -3957,7 +4817,7 @@ define([
                             var h1 = document.getElementById('custpage_bp_to_bin'); if (h1) h1.value = toBinValue;
                             var h2 = document.getElementById('custpage_bp_mode'); if (h2) h2.value = 'serialized';
                             var ai = document.createElement('input'); ai.type='hidden'; ai.name='custpage_action'; ai.value='process_bin_putaway';
-                            form.appendChild(ai); form.submit();
+                            form.appendChild(ai); _disableAllBtns(); form.submit();
                         } else {
                             var rows = document.querySelectorAll('#bp-ns-grid-body tr');
                             var gridData = []; var hasError = false;
@@ -3980,7 +4840,7 @@ define([
                             var cf = document.getElementById('custpage_bp_cart_json'); if (cf) cf.value = JSON.stringify(gridData);
                             var h2 = document.getElementById('custpage_bp_mode'); if (h2) h2.value = 'nonserialized';
                             var ai = document.createElement('input'); ai.type='hidden'; ai.name='custpage_action'; ai.value='process_bin_putaway';
-                            form.appendChild(ai); form.submit();
+                            form.appendChild(ai); _disableAllBtns(); form.submit();
                         }
                     }
 
@@ -4119,7 +4979,7 @@ define([
     //  PRINT LABEL DASHBOARD — Server-side code (embedded, pl-prefixed)
     // ═══════════════════════════════════════════════════════════════════
 
-        function plValidateSerialNumbers(serialNumbers) {
+        function plValidateSerialNumbers(serialNumbers, itemId) {
             if (!serialNumbers) return { valid: [], invalid: [], details: {} };
 
             const cleanedSerials = serialNumbers
@@ -4132,11 +4992,16 @@ define([
 
             if (cleanedSerials.length === 0) return { valid: [], invalid: [], details: {} };
 
-            const filterExpression = [];
+            const serialFilters = [];
             cleanedSerials.forEach((serial, index) => {
-                if (index > 0) filterExpression.push('OR');
-                filterExpression.push(['inventorynumber', 'is', serial]);
+                if (index > 0) serialFilters.push('OR');
+                serialFilters.push(['inventorynumber', 'is', serial]);
             });
+
+            // When an item is specified, require the serial to belong to that item
+            const filterExpression = itemId
+                ? [serialFilters, 'AND', ['item', 'anyof', itemId]]
+                : serialFilters;
 
             const foundSerials = {};
 
@@ -4705,6 +5570,16 @@ define([
                     window.onbeforeunload = null;
                     if (typeof setWindowChanged === 'function') setWindowChanged(window, false);
 
+                    function _disableAllBtns() {
+                        var btns = document.querySelectorAll('.custom-btn');
+                        for (var i = 0; i < btns.length; i++) {
+                            btns[i].disabled = true;
+                            btns[i].style.opacity = '0.7';
+                            btns[i].style.cursor = 'not-allowed';
+                            btns[i].textContent = 'Please wait...';
+                        }
+                    }
+
                     function updateCount() {
                         var field = document.getElementById('custpage_serial_numbers');
                         var display = document.getElementById('serial_count');
@@ -4721,6 +5596,7 @@ define([
                         var action = document.createElement('input');
                         action.type = 'hidden'; action.name = 'custpage_action'; action.value = 'search_po';
                         form.appendChild(action);
+                        _disableAllBtns();
                         form.submit();
                     }
 
@@ -4730,6 +5606,7 @@ define([
                         var action = document.createElement('input');
                         action.type = 'hidden'; action.name = 'custpage_action'; action.value = 'create_labels';
                         form.appendChild(action);
+                        _disableAllBtns();
                         form.submit();
                     }
 
@@ -4741,6 +5618,7 @@ define([
                         var action = document.createElement('input');
                         action.type = 'hidden'; action.name = 'custpage_action'; action.value = 'reprint';
                         form.appendChild(action);
+                        _disableAllBtns();
                         form.submit();
                     }
 
@@ -4787,6 +5665,16 @@ define([
                         if (display) display.textContent = boxes.length;
                     }
 
+                    function _disableAllBtns() {
+                        var btns = document.querySelectorAll('.custom-btn');
+                        for (var i = 0; i < btns.length; i++) {
+                            btns[i].disabled = true;
+                            btns[i].style.opacity = '0.7';
+                            btns[i].style.cursor = 'not-allowed';
+                            btns[i].textContent = 'Please wait...';
+                        }
+                    }
+
                     function printSelected() {
                         var boxes = document.querySelectorAll('input[name="custpage_select_item"]:checked');
                         if (boxes.length === 0) { alert('Select at least one item'); return; }
@@ -4794,10 +5682,11 @@ define([
                         var action = document.createElement('input');
                         action.type = 'hidden'; action.name = 'custpage_action'; action.value = 'print_selected';
                         form.appendChild(action);
+                        _disableAllBtns();
                         form.submit();
                     }
 
-                    function goBack() { window.location.href = '${suiteletUrl}'; }
+                    function goBack() { _disableAllBtns(); window.location.href = '${suiteletUrl}'; }
 
                     document.addEventListener('DOMContentLoaded', function() {
                         var boxes = document.querySelectorAll('input[name="custpage_select_item"]');
@@ -4811,8 +5700,17 @@ define([
         function plGetSuccessPageScript(suiteletUrl, pdfUrl) {
             return `
                 <script>
-                    function printLabels() { window.open('${escapeForJs(pdfUrl)}', '_blank'); }
-                    function createAnother() { window.location.href = '${escapeForJs(suiteletUrl)}'; }
+                    function _disableAllBtns() {
+                        var btns = document.querySelectorAll('.custom-btn');
+                        for (var i = 0; i < btns.length; i++) {
+                            btns[i].disabled = true;
+                            btns[i].style.opacity = '0.7';
+                            btns[i].style.cursor = 'not-allowed';
+                            btns[i].textContent = 'Please wait...';
+                        }
+                    }
+                    function printLabels() { _disableAllBtns(); window.open('${escapeForJs(pdfUrl)}', '_blank'); }
+                    function createAnother() { _disableAllBtns(); window.location.href = '${escapeForJs(suiteletUrl)}'; }
                 </script>
             `;
         }
@@ -5023,7 +5921,7 @@ define([
             const suiteletUrl = url.resolveScript({
                 scriptId: runtime.getCurrentScript().id,
                 deploymentId: runtime.getCurrentScript().deploymentId,
-                returnExternalUrl: true,
+                returnExternalUrl: false,
                 params: { action: 'printlabel' }
             });
 
@@ -5102,7 +6000,7 @@ define([
             const pdfUrl = url.resolveScript({
                 scriptId: runtime.getCurrentScript().id,
                 deploymentId: runtime.getCurrentScript().deploymentId,
-                returnExternalUrl: true,
+                returnExternalUrl: false,
                 params: { ajax_action: 'printpdf', record_id: recordId, item_text: itemText, description: description, serials: serials }
             });
 
@@ -5242,9 +6140,9 @@ setTimeout(doPrint, 2000);
 
             let validSerials = [];
             if (serialNumbers.trim()) {
-                const result = plValidateSerialNumbers(serialNumbers);
+                const result = plValidateSerialNumbers(serialNumbers, item);
                 if (result.invalid.length > 0) {
-                    plCreateEntryForm(context, 'Invalid serials: ' + result.invalid.join(', '), 'error', { item, serialNumbers, poNumber });
+                    plCreateEntryForm(context, 'Invalid serials (not found or do not belong to selected item): ' + result.invalid.join(', '), 'error', { item, serialNumbers, poNumber });
                     return;
                 }
                 validSerials = result.valid;
@@ -5597,11 +6495,10 @@ tr:hover td { background:var(--surface-hover); }
 .porcv-line-input textarea { font-family:var(--mono); font-size:13px; width:100%; }
 .porcv-line-input input[type="number"] { max-width:140px; }
 .porcv-serial-count { font-size:11px; color:var(--text-dim); margin-top:4px; }
-@media (max-width:768px) {
-    .porcv-line-meta { grid-template-columns:repeat(3,1fr); gap:4px; padding-left:0; }
-    .porcv-line-desc, .porcv-line-input { padding-left:0; }
-    .porcv-line-input input[type="number"] { max-width:100%; }
-}
+.porcv-serial-count.has-dupe { color:#dc2626; font-weight:600; }
+.porcv-line-input textarea.has-dupe { border-color:#dc2626 !important; box-shadow:0 0 0 3px rgba(220,38,38,.35); }
+@keyframes porcvShake { 0%,100%{transform:translateX(0)} 15%{transform:translateX(-6px)} 30%{transform:translateX(6px)} 45%{transform:translateX(-5px)} 60%{transform:translateX(5px)} 75%{transform:translateX(-3px)} 90%{transform:translateX(3px)} }
+.porcv-line-input textarea.dupe-shake { animation:porcvShake .45s ease; }
 
 /* ─── SO PICKING LINE CARDS ─── */
 .sopick-line {
@@ -5626,15 +6523,65 @@ tr:hover td { background:var(--surface-hover); }
 .sopick-line-input input[type="number"] { max-width:140px; }
 .sopick-line-input select { max-width:280px; }
 .sopick-serial-count { font-size:11px; color:var(--text-dim); margin-top:4px; }
+.sopick-serial-count.has-dupe { color:#dc2626; font-weight:600; }
+.sopick-line-input textarea.has-dupe, .sopick-kit-component textarea.has-dupe { border-color:#dc2626 !important; box-shadow:0 0 0 3px rgba(220,38,38,.35); }
+.sopick-line-input textarea.dupe-shake, .sopick-kit-component textarea.dupe-shake { animation:porcvShake .45s ease; }
 .sopick-bin-row { display:flex; gap:10px; align-items:end; flex-wrap:wrap; margin-top:8px; }
 .sopick-bin-row .form-group { margin:0; flex:1; min-width:120px; }
-@media (max-width:768px) {
-    .sopick-line-meta { grid-template-columns:repeat(3,1fr); gap:4px; padding-left:0; }
-    .sopick-line-desc, .sopick-line-input { padding-left:0; }
-    .sopick-line-input input[type="number"] { max-width:100%; }
-    .sopick-line-input select { max-width:100%; }
-    .sopick-bin-row { flex-direction:column; }
+.sopick-kit-components { display:flex; flex-direction:column; gap:12px; margin-top:4px; }
+.sopick-kit-component {
+    background:var(--background); border:1.5px solid var(--border);
+    border-radius:8px; padding:12px 14px;
 }
+.sopick-comp-name { font-size:13px; font-weight:600; color:var(--text); margin-bottom:6px; }
+
+/* ─── STOCK LOOKUP BUTTON ─── */
+.stock-lookup-btn {
+    display:inline-flex; align-items:center; justify-content:center;
+    width:28px; height:28px; padding:0; border:1px solid var(--border);
+    background:var(--bg); color:var(--text-dim); cursor:pointer;
+    border-radius:6px; flex-shrink:0; touch-action:manipulation;
+    transition:color .1s, background .1s, border-color .1s;
+    -webkit-tap-highlight-color:transparent;
+}
+.stock-lookup-btn:hover, .stock-lookup-btn:active {
+    color:var(--accent); background:var(--accent-glow); border-color:var(--accent);
+}
+.stock-lookup-btn svg { width:14px; height:14px; }
+
+/* ─── STOCK LOOKUP BOTTOM SHEET ─── */
+.stock-sheet-overlay {
+    display:none; position:fixed; inset:0; z-index:399;
+    background:rgba(0,0,0,.45);
+}
+.stock-sheet-overlay.open { display:block; }
+.stock-sheet {
+    position:fixed; bottom:0; left:0; right:0; z-index:400;
+    background:var(--surface); border-radius:14px 14px 0 0;
+    box-shadow:0 -4px 24px rgba(0,0,0,.18);
+    max-height:70vh; display:flex; flex-direction:column;
+    transform:translateY(110%); transition:transform .25s cubic-bezier(.4,0,.2,1);
+}
+.stock-sheet.open { transform:translateY(0); }
+.stock-sheet-head {
+    padding:10px 16px 12px; border-bottom:1px solid var(--border); flex-shrink:0;
+}
+.stock-sheet-title { font-size:14px; font-weight:700; color:var(--text); margin-bottom:1px; }
+.stock-sheet-sub { font-size:11px; color:var(--text-muted); }
+.stock-sheet-body { overflow-y:auto; flex:1; }
+.stock-sheet-row {
+    display:flex; align-items:center; justify-content:space-between;
+    padding:11px 16px; border-bottom:1px solid var(--border);
+    gap:12px;
+}
+.stock-sheet-row:last-child { border-bottom:none; }
+.stock-sheet-bin { font-size:14px; font-weight:600; color:var(--text); flex:1; min-width:0; }
+.stock-sheet-qty { font-size:13px; color:var(--text-muted); white-space:nowrap; display:flex; flex-direction:column; align-items:flex-end; gap:2px; }
+.stock-sheet-qty strong { color:var(--text); font-weight:700; }
+.stock-sheet-oh { color:var(--text); font-weight:700; }
+.stock-sheet-avail { color:var(--text-muted); font-size:11px; }
+.stock-sheet-empty { padding:24px 16px; text-align:center; color:var(--text-dim); font-size:13px; }
+.stock-sheet-foot { padding:12px 16px 20px; flex-shrink:0; border-top:1px solid var(--border); }
 
 /* ─── PROCESSING OVERLAY ─── */
 .processing-overlay {
@@ -5692,36 +6639,178 @@ tr:hover td { background:var(--surface-hover); }
 .spinner { display:inline-block; width:18px; height:18px; border:2px solid var(--border); border-top-color:var(--accent); border-radius:50%; animation:spin .6s linear infinite; }
 @keyframes spin { to { transform:rotate(360deg); } }
 
-/* ─── HAMBURGER BUTTON ─── */
-.hamburger {
-    display:none; background:none; border:none; cursor:pointer;
-    padding:6px; color:var(--text); border-radius:var(--radius-sm);
-}
-.hamburger:hover { background:var(--surface-hover); }
-.hamburger svg { display:block; }
+/* ─── HAMBURGER (unused with bottom nav) ─── */
+.hamburger { display:none !important; }
 
-/* ─── MOBILE OVERLAY ─── */
+/* ─── SIDEBAR OVERLAY (desktop only) ─── */
 .sidebar-overlay {
     display:none; position:fixed; inset:0; z-index:199;
     background:rgba(0,0,0,.3); backdrop-filter:blur(2px);
 }
 .sidebar-overlay.open { display:block; }
 
-/* ─── RESPONSIVE ─── */
+/* ─── MOBILE BOTTOM NAV (hidden on desktop) ─── */
+.mob-nav { display:none; }
+
+/* ─── MOBILE MORE DRAWER ─── */
+.mob-more-overlay {
+    display:none; position:fixed; inset:0; z-index:299;
+    background:rgba(0,0,0,.45);
+}
+.mob-more-overlay.open { display:block; }
+.mob-more-drawer {
+    position:fixed; bottom:58px; left:0; right:0; z-index:300;
+    background:var(--surface); border-radius:14px 14px 0 0;
+    box-shadow:0 -4px 24px rgba(0,0,0,.18);
+    max-height:72vh; overflow-y:auto;
+    transform:translateY(110%); transition:transform .25s cubic-bezier(.4,0,.2,1);
+}
+.mob-more-drawer.open { transform:translateY(0); }
+.mob-more-handle {
+    width:36px; height:4px; background:var(--border-light);
+    border-radius:2px; margin:10px auto 4px;
+}
+.mob-more-section {
+    padding:6px 16px 2px; font-size:10px; font-weight:700;
+    text-transform:uppercase; letter-spacing:.08em; color:var(--text-dim);
+}
+.mob-more-item {
+    display:flex; align-items:center; gap:14px; padding:13px 20px;
+    color:var(--text); font-size:15px; font-weight:500; cursor:pointer;
+    touch-action:manipulation; -webkit-tap-highlight-color:transparent;
+    min-height:52px; transition:background .1s;
+}
+.mob-more-item:active { background:var(--surface-active); }
+.mob-more-item svg { width:20px; height:20px; flex-shrink:0; color:var(--text-muted); }
+.mob-more-item.active { color:var(--accent); }
+.mob-more-item.active svg { color:var(--accent); }
+
+/* ═══════════════════════════════════════════════════════════
+   RESPONSIVE — Scanner / Mobile (≤768px)
+   Optimised for Honeywell CT60 and similar handheld devices
+   ═══════════════════════════════════════════════════════════ */
 @media (max-width:768px) {
-    .hamburger { display:block; }
-    .sidebar {
-        display:none; position:fixed; top:56px; left:0; bottom:0;
-        z-index:200; width:240px;
-        box-shadow: 4px 0 24px rgba(0,0,0,.15);
+    /* ── Topbar ── */
+    .topbar { height:48px; padding:0 14px; }
+    .topbar-user { display:none; }
+
+    /* ── Sidebar → hidden; bottom nav takes over ── */
+    .sidebar, .sidebar-overlay { display:none !important; }
+
+    /* ── Bottom nav ── */
+    .mob-nav {
+        display:flex; position:fixed; bottom:0; left:0; right:0; height:58px;
+        z-index:200; background:var(--surface); border-top:1px solid var(--border);
+        box-shadow:0 -2px 10px rgba(0,0,0,.08);
     }
-    .sidebar.open { display:flex; }
-    .main { padding:16px; }
-    .main:has(#view-warehouse.active), .main:has(#view-printlabel.active), .main:has(#view-binputaway.active) { padding:0; }
-    .form-grid { grid-template-columns:1fr; }
+    .mob-nav-btn {
+        flex:1; display:flex; flex-direction:column; align-items:center;
+        justify-content:center; gap:2px; border:none; background:none;
+        cursor:pointer; color:var(--text-dim); font-size:10px; font-weight:600;
+        padding:5px 2px; touch-action:manipulation;
+        -webkit-tap-highlight-color:transparent; min-width:0; transition:color .12s;
+    }
+    .mob-nav-btn svg { width:22px; height:22px; flex-shrink:0; }
+    .mob-nav-btn span { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:100%; }
+    .mob-nav-btn.active { color:var(--accent); }
+    .mob-nav-btn:active { opacity:.6; }
+
+    /* ── Main content ── */
+    .main { padding:10px; padding-bottom:70px; max-height:none; }
+    .main:has(#view-warehouse.active),
+    .main:has(#view-printlabel.active),
+    .main:has(#view-binputaway.active) { padding:0 0 58px 0; }
+    #view-warehouse iframe, #view-printlabel iframe, #view-binputaway iframe {
+        height:calc(100vh - 48px - 58px);
+    }
+
+    /* ── Cards ── */
+    .card { padding:12px; margin-bottom:8px; border-radius:8px; }
+    .card-title { font-size:13px; margin-bottom:10px; }
+
+    /* ── Page headers ── */
+    .page-header { margin-bottom:10px; }
+    .page-title { font-size:17px; }
+    .page-subtitle { font-size:11px; }
+
+    /* ── Stat cards ── */
+    .stats-row { grid-template-columns:1fr 1fr; gap:8px; margin-bottom:10px; }
+    .stat-card { padding:10px 12px; }
+    .stat-card .value { font-size:22px; }
+    .stat-card .label { font-size:10px; }
+
+    /* ── Forms ── */
+    .form-grid { grid-template-columns:1fr; gap:10px; }
+    .form-group { margin-bottom:0; }
+    .form-label { font-size:11px; margin-bottom:3px; }
+    input[type="text"], input[type="number"], select {
+        min-height:44px; font-size:16px; padding:10px 12px;
+    }
+    textarea { font-size:15px; min-height:72px; }
+
+    /* ── Buttons ── */
+    .btn { min-height:44px; font-size:14px; padding:0 16px; border-radius:8px; }
+    .btn-group { gap:8px; }
+
+    /* ── Layout helpers ── */
     .plate-detail { grid-template-columns:1fr; }
-    .stats-row { grid-template-columns:1fr 1fr; }
-    #view-warehouse iframe, #view-printlabel iframe, #view-binputaway iframe { height: calc(100vh - 56px); }
+
+    /* ── Tables ── */
+    .results-table th { font-size:10px; padding:6px 8px; }
+    .results-table td { font-size:12px; padding:8px; }
+
+    /* ── Modal ── */
+    .modal {
+        border-radius:12px 12px 0 0; position:fixed; bottom:0;
+        left:0; right:0; max-width:none; margin:0; max-height:85vh;
+    }
+
+    /* ── PO Receiving line cards — compact ── */
+    .porcv-line { padding:10px 12px; margin-bottom:6px; }
+    .porcv-line-header { gap:8px; margin-bottom:4px; }
+    .porcv-line-item { font-size:13px; }
+    .porcv-line-desc { padding-left:0; font-size:11px; margin-bottom:4px; }
+    .porcv-line-meta {
+        display:flex; flex-direction:row; padding-left:0; margin-bottom:8px;
+        border:1px solid var(--border); border-radius:6px; overflow:hidden;
+    }
+    .porcv-line-meta > div {
+        flex:1; display:flex; flex-direction:column; align-items:center;
+        padding:5px 4px; border-right:1px solid var(--border); gap:1px;
+    }
+    .porcv-line-meta > div:last-child { border-right:none; }
+    .porcv-line-meta > div > div:first-child {
+        font-size:9px; text-transform:uppercase; letter-spacing:.04em;
+        color:var(--text-dim); font-weight:600;
+    }
+    .porcv-line-meta .value { font-size:15px; }
+    .porcv-line-input { padding-left:0; }
+    .porcv-line-input input[type="number"] { max-width:90px; min-width:72px; }
+
+    /* ── SO Picking line cards — compact ── */
+    .sopick-line { padding:10px 12px; margin-bottom:6px; }
+    .sopick-line-header { gap:8px; margin-bottom:4px; }
+    .sopick-line-item { font-size:13px; }
+    .sopick-line-desc { padding-left:0; font-size:11px; margin-bottom:4px; }
+    .sopick-line-meta {
+        display:flex; flex-direction:row; padding-left:0; margin-bottom:8px;
+        border:1px solid var(--border); border-radius:6px; overflow:hidden;
+    }
+    .sopick-line-meta > div {
+        flex:1; display:flex; flex-direction:column; align-items:center;
+        padding:5px 4px; border-right:1px solid var(--border); gap:1px;
+    }
+    .sopick-line-meta > div:last-child { border-right:none; }
+    .sopick-line-meta > div > div:first-child {
+        font-size:9px; text-transform:uppercase; letter-spacing:.04em;
+        color:var(--text-dim); font-weight:600;
+    }
+    .sopick-line-meta .value { font-size:15px; }
+    .sopick-line-input { padding-left:0; }
+    .sopick-bin-row { flex-direction:row; gap:8px; flex-wrap:nowrap; }
+    .sopick-bin-row .form-group { min-width:0; }
+    .sopick-line-input input[type="number"] { max-width:90px; min-width:72px; }
+    .sopick-kit-component { padding:8px 10px; }
 }
 </style>
 </head>
@@ -5739,6 +6828,86 @@ tr:hover td { background:var(--surface-hover); }
         </div>
     </div>
     <div class="topbar-user">Warehouse Management</div>
+</div>
+
+<!-- ═══ MOBILE BOTTOM NAV ═══ -->
+<nav class="mob-nav" id="mob-nav">
+    <button class="mob-nav-btn active" data-view="warehouse" onclick="mobNavTo('warehouse')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7V5a2 2 0 0 1 2-2h2"/><path d="M17 3h2a2 2 0 0 1 2 2v2"/><path d="M21 17v2a2 2 0 0 1-2 2h-2"/><path d="M7 21H5a2 2 0 0 1-2-2v-2"/><line x1="7" y1="12" x2="17" y2="12"/></svg>
+        <span>Assistant</span>
+    </button>
+    <button class="mob-nav-btn" data-view="poreceive" onclick="mobNavTo('poreceive')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg>
+        <span>Receive</span>
+    </button>
+    <button class="mob-nav-btn" data-view="sopick" onclick="mobNavTo('sopick')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 5H7a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-2"/><rect x="9" y="3" width="6" height="4" rx="1"/><path d="M9 14l2 2 4-4"/></svg>
+        <span>Pick</span>
+    </button>
+    <button class="mob-nav-btn" data-view="binputaway" onclick="mobNavTo('binputaway')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12"/><path d="M8 11l4 4 4-4"/><rect x="3" y="17" width="18" height="4" rx="1"/></svg>
+        <span>Putaway</span>
+    </button>
+    <button class="mob-nav-btn" id="mob-more-btn" onclick="toggleMobMore()">
+        <svg viewBox="0 0 24 24" fill="none" stroke="none"><circle cx="5" cy="12" r="1.8" fill="currentColor"/><circle cx="12" cy="12" r="1.8" fill="currentColor"/><circle cx="19" cy="12" r="1.8" fill="currentColor"/></svg>
+        <span>More</span>
+    </button>
+</nav>
+
+<!-- ═══ MOBILE MORE OVERLAY + DRAWER ═══ -->
+<div class="mob-more-overlay" id="mob-more-overlay" onclick="closeMobMore()"></div>
+<div class="mob-more-drawer" id="mob-more-drawer">
+    <div class="mob-more-handle"></div>
+    <div class="mob-more-item" data-view="printlabel" onclick="mobNavTo('printlabel')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 6 2 18 2 18 9"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8"/></svg>
+        Print Label
+    </div>
+    <div class="mob-more-section">TQ License Plates</div>
+    <div class="mob-more-item" data-view="dashboard" onclick="mobNavTo('dashboard')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+        Dashboard
+    </div>
+    <div class="mob-more-item" data-view="scan" onclick="mobNavTo('scan')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7V5a2 2 0 0 1 2-2h2"/><path d="M17 3h2a2 2 0 0 1 2 2v2"/><path d="M21 17v2a2 2 0 0 1-2 2h-2"/><path d="M7 21H5a2 2 0 0 1-2-2v-2"/><rect x="9" y="9" width="6" height="6" rx="1"/></svg>
+        Scan &amp; Lookup
+    </div>
+    <div class="mob-more-item" data-view="create" onclick="mobNavTo('create')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="16"/><line x1="8" y1="12" x2="16" y2="12"/></svg>
+        Create Plate
+    </div>
+    <div class="mob-more-item" data-view="search" onclick="mobNavTo('search')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+        Search &amp; List
+    </div>
+    <div class="mob-more-item" data-view="transfer" onclick="mobNavTo('transfer')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg>
+        Bin Transfer
+    </div>
+    <div class="mob-more-item" data-view="fulfill" onclick="mobNavTo('fulfill')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+        Fulfill SO
+    </div>
+    <div class="mob-more-item" data-view="poimport" onclick="mobNavTo('poimport')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><line x1="9" y1="15" x2="15" y2="15"/></svg>
+        Create from PO
+    </div>
+    <div class="mob-more-item" data-view="irimport" onclick="mobNavTo('irimport')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
+        Create from IR
+    </div>
+    <div class="mob-more-section">Stock Counts</div>
+    <div class="mob-more-item" data-view="sc-dashboard" onclick="mobNavTo('sc-dashboard')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="9" y1="21" x2="9" y2="9"/></svg>
+        Dashboard
+    </div>
+    <div class="mob-more-item" data-view="sc-pending-review" onclick="mobNavTo('sc-pending-review')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
+        Pending Review
+    </div>
+    <div class="mob-more-item" data-view="sc-create" onclick="mobNavTo('sc-create')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 5H7a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-2"/><rect x="9" y="3" width="6" height="4" rx="1"/><line x1="9" y1="12" x2="15" y2="12"/><line x1="9" y1="16" x2="12" y2="16"/></svg>
+        Create Stock Count
+    </div>
 </div>
 
 <!-- ═══ LAYOUT ═══ -->
@@ -5812,6 +6981,29 @@ tr:hover td { background:var(--surface-hover); }
             </div>
         </div>
     </div>
+    <div class="nav-group">
+        <div class="nav-group-toggle" onclick="toggleNavGroup(this)">
+            <div style="display:flex;align-items:center;gap:10px;">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:18px;height:18px;flex-shrink:0;"><path d="M9 5H7a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-2"/><rect x="9" y="3" width="6" height="4" rx="1"/><line x1="9" y1="12" x2="15" y2="12"/><line x1="9" y1="16" x2="12" y2="16"/></svg>
+                Stock Counts
+            </div>
+            <svg class="nav-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:14px;height:14px;flex-shrink:0;transition:transform .2s;"><polyline points="6 9 12 15 18 9"/></svg>
+        </div>
+        <div class="nav-group-items">
+            <div class="nav-item nav-sub" data-view="sc-dashboard">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="9" y1="21" x2="9" y2="9"/></svg>
+                Dashboard
+            </div>
+            <div class="nav-item nav-sub" data-view="sc-pending-review">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
+                Pending Review
+            </div>
+            <div class="nav-item nav-sub" data-view="sc-create">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="16"/><line x1="8" y1="12" x2="16" y2="12"/></svg>
+                Create Stock Count
+            </div>
+        </div>
+    </div>
 </nav>
 
 <!-- ═══ MAIN CONTENT ═══ -->
@@ -5842,12 +7034,41 @@ tr:hover td { background:var(--surface-hover); }
         <div class="stat-card"><div class="label">Total Serials</div><div class="value" id="stat-serials">—</div></div>
         <div class="stat-card"><div class="label">Active</div><div class="value" id="stat-active" style="color:var(--success)">—</div></div>
     </div>
+    <div class="card" style="margin-bottom:16px;">
+        <div class="form-grid" style="grid-template-columns:repeat(5, 1fr) auto auto; align-items:end; gap:12px;">
+            <div class="form-group">
+                <label class="form-label">Status</label>
+                <select id="db-filter-status"><option value="">All</option></select>
+            </div>
+            <div class="form-group" style="position:relative;">
+                <label class="form-label">Item</label>
+                <input type="text" id="db-filter-item-search" placeholder="Type to search items…" autocomplete="off">
+                <input type="hidden" id="db-filter-item-id">
+                <div id="db-filter-item-dropdown" style="position:relative;"></div>
+            </div>
+            <div class="form-group">
+                <label class="form-label">Bin</label>
+                <select id="db-filter-bin"><option value="">All</option></select>
+            </div>
+            <div class="form-group">
+                <label class="form-label">Created From</label>
+                <input type="date" id="db-filter-from">
+            </div>
+            <div class="form-group">
+                <label class="form-label">Created To</label>
+                <input type="date" id="db-filter-to">
+            </div>
+            <button class="btn btn-primary" onclick="dbApplyFilters()" style="height:38px;">Apply</button>
+            <button class="btn" onclick="dbClearFilters()" style="height:38px;">Clear</button>
+        </div>
+    </div>
     <div class="card">
-        <div class="card-title">Recent License Plates</div>
+        <div class="card-title">All License Plates</div>
         <div class="table-wrap"><table>
             <thead><tr><th>Plate ID</th><th>Item</th><th>Bin</th><th>Serials</th><th>Status</th><th>Created</th></tr></thead>
             <tbody id="dashboard-table"><tr><td colspan="6" style="text-align:center;color:var(--text-dim)">Loading…</td></tr></tbody>
         </table></div>
+        <div id="dashboard-pagination" style="margin-top:12px; display:flex; gap:8px; justify-content:center; flex-wrap:wrap;"></div>
     </div>
 </div>
 
@@ -5897,7 +7118,9 @@ tr:hover td { background:var(--surface-hover); }
                 </div>
                 <div class="form-group">
                     <label class="form-label">Bin</label>
-                    <select id="form-bin"></select>
+                    <input type="text" id="form-bin" list="lp-bin-datalist" autocomplete="off" placeholder="Type to search bins…">
+                    <datalist id="lp-bin-datalist"></datalist>
+                    <input type="hidden" id="form-bin-id">
                 </div>
                 <div class="form-group">
                     <label class="form-label">Status</label>
@@ -5910,8 +7133,11 @@ tr:hover td { background:var(--surface-hover); }
                     </select>
                 </div>
                 <div class="form-group full">
-                    <label class="form-label">Serial Numbers (one per line)</label>
-                    <textarea id="form-serials" rows="6" placeholder="Enter serial numbers, one per line"></textarea>
+                    <label class="form-label" style="display:flex; justify-content:space-between; align-items:center;">
+                        <span>Serial Numbers (one per line)</span>
+                        <span id="form-serials-count" style="font-weight:600; color:var(--text-dim);">0 serials</span>
+                    </label>
+                    <textarea id="form-serials" rows="6" placeholder="Enter serial numbers, one per line" oninput="updateSerialsCount()"></textarea>
                 </div>
                 <div class="form-group full">
                     <label class="form-label">Notes</label>
@@ -5985,7 +7211,9 @@ tr:hover td { background:var(--surface-hover); }
             <div class="form-grid">
                 <div class="form-group">
                     <label class="form-label">Destination Bin *</label>
-                    <select id="transfer-dest-bin" required></select>
+                    <input type="text" id="transfer-dest-bin" list="transfer-bin-datalist" autocomplete="off" placeholder="Type to search bins…" required>
+                    <datalist id="transfer-bin-datalist"></datalist>
+                    <input type="hidden" id="transfer-dest-bin-id">
                 </div>
                 <div class="form-group">
                     <label class="form-label">Inventory Status *</label>
@@ -6227,6 +7455,7 @@ tr:hover td { background:var(--surface-hover); }
     </div>
 
     <div id="sopick-lines-section" style="display:none;">
+        <datalist id="sopick-bin-datalist"></datalist>
         <div class="card">
             <div class="card-title" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
                 SO: <span id="sopick-so-tranid" style="font-weight:700;"></span>
@@ -6269,6 +7498,311 @@ tr:hover td { background:var(--surface-hover); }
     </div>
 </div>
 
+<!-- ═══════ STOCK COUNT — CREATE VIEW ═══════ -->
+<div class="view" id="view-sc-create">
+    <div class="page-header">
+        <div><div class="page-title">Stock Counts</div><div class="page-subtitle">Create a new stock count</div></div>
+    </div>
+
+    <!-- Phase 1: setup -->
+    <div class="card" style="max-width:620px;">
+        <div class="card-title">Setup</div>
+        <div class="form-grid">
+            <div class="form-group">
+                <label class="form-label">Location *</label>
+                <select id="sc-location" onchange="scOnLocationChange()"></select>
+            </div>
+            <div class="form-group">
+                <label class="form-label">Bin *</label>
+                <select id="sc-bin">
+                    <option value="">— select a location first —</option>
+                </select>
+            </div>
+            <div class="form-group" style="grid-column:1/-1;">
+                <label class="form-label">Assigned To *</label>
+                <select id="sc-assigned-to"></select>
+            </div>
+        </div>
+        <div style="margin-top:20px;">
+            <button class="btn btn-primary" id="sc-load-btn" onclick="scLoadItems()">Load Items</button>
+        </div>
+    </div>
+
+    <!-- Phase 2: items table (hidden until Load Items is clicked) -->
+    <div class="card" id="sc-items-card" style="max-width:900px; display:none; margin-top:16px;">
+        <div class="card-title" id="sc-items-title">Items in Bin</div>
+        <div id="sc-items-msg" style="display:none; margin-bottom:12px;"></div>
+        <div class="table-wrap">
+            <table>
+                <thead>
+                    <tr>
+                        <th style="width:40px;"><input type="checkbox" id="sc-select-all" onchange="scToggleAll(this)" title="Select all"></th>
+                        <th>Item</th>
+                        <th style="width:130px;">Type</th>
+                    </tr>
+                </thead>
+                <tbody id="sc-items-body">
+                </tbody>
+            </table>
+        </div>
+        <div id="sc-save-msg" style="display:none; margin-top:12px;"></div>
+        <div style="margin-top:16px; display:flex; gap:10px; align-items:center;">
+            <button class="btn btn-primary" id="sc-submit-btn" onclick="submitStockCount()">Create Stock Count</button>
+            <button class="btn" onclick="scResetToSetup()">Back</button>
+        </div>
+    </div>
+</div>
+
+<!-- ═══════ STOCK COUNT — DASHBOARD VIEW ═══════ -->
+<div class="view" id="view-sc-dashboard">
+    <div class="page-header">
+        <div><div class="page-title">Stock Count Dashboard</div><div class="page-subtitle">View and manage all stock counts</div></div>
+    </div>
+
+    <!-- Filters -->
+    <div class="card" style="max-width:900px;">
+        <div class="card-title">Filters</div>
+        <div class="form-grid" style="grid-template-columns:repeat(auto-fit, minmax(200px, 1fr));">
+            <div class="form-group">
+                <label class="form-label">Status</label>
+                <select id="scd-status-filter" onchange="scdLoadStockCounts()">
+                    <option value="">All Statuses</option>
+                    <option value="pending">Pending</option>
+                    <option value="in_progress">In Progress</option>
+                    <option value="completed">Completed</option>
+                    <option value="approved">Approved</option>
+                </select>
+            </div>
+            <div class="form-group" style="display:flex;align-items:flex-end;">
+                <button class="btn" onclick="scdLoadStockCounts()">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:16px;height:16px;margin-right:6px;"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+                    Refresh
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Stock Counts Table -->
+    <div class="card" style="max-width:1100px; margin-top:16px;">
+        <div class="card-title">Stock Counts</div>
+        <div class="table-wrap">
+            <table>
+                <thead>
+                    <tr>
+                        <th style="width:70px;">ID</th>
+                        <th>Location</th>
+                        <th>Bin</th>
+                        <th>Assigned To</th>
+                        <th style="width:80px;">Items</th>
+                        <th style="width:120px;">Status</th>
+                        <th style="width:140px;">Created</th>
+                        <th style="width:140px;">Actions</th>
+                    </tr>
+                </thead>
+                <tbody id="scd-table-body">
+                    <tr><td colspan="8" style="text-align:center;color:var(--text-dim)">Loading...</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<!-- ═══════ STOCK COUNT — PENDING REVIEW VIEW ═══════ -->
+<div class="view" id="view-sc-pending-review">
+    <div class="page-header">
+        <div><div class="page-title">Pending Review</div><div class="page-subtitle">Stock counts awaiting approval</div></div>
+    </div>
+
+    <!-- Pending Review Table -->
+    <div class="card" style="max-width:1100px;">
+        <div class="card-title">Counts Pending Review</div>
+        <div class="table-wrap">
+            <table>
+                <thead>
+                    <tr>
+                        <th style="width:70px;">ID</th>
+                        <th>Location</th>
+                        <th>Bin</th>
+                        <th>Assigned To</th>
+                        <th style="width:80px;">Items</th>
+                        <th style="width:140px;">Created</th>
+                        <th style="width:140px;">Actions</th>
+                    </tr>
+                </thead>
+                <tbody id="scpr-table-body">
+                    <tr><td colspan="7" style="text-align:center;color:var(--text-dim)">Loading...</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<!-- ═══════ STOCK COUNT — EXECUTE VIEW ═══════ -->
+<div class="view" id="view-sc-execute">
+    <div class="page-header">
+        <div>
+            <div class="page-title">Count Stock</div>
+            <div class="page-subtitle" id="sce-subtitle">Stock Count #<span id="sce-count-id">—</span> | <span id="sce-bin-name">—</span></div>
+        </div>
+        <button class="btn" onclick="navigateTo('sc-dashboard')">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:16px;height:16px;margin-right:6px;"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></svg>
+            Back to Dashboard
+        </button>
+    </div>
+
+    <!-- Progress Summary -->
+    <div class="stats-row" id="sce-stats" style="max-width:600px;">
+        <div class="stat-card"><div class="label">Total Items</div><div class="value" id="sce-stat-total">—</div></div>
+        <div class="stat-card"><div class="label">Counted</div><div class="value" id="sce-stat-counted" style="color:var(--success)">—</div></div>
+        <div class="stat-card"><div class="label">Remaining</div><div class="value" id="sce-stat-remaining" style="color:var(--warning)">—</div></div>
+    </div>
+
+    <!-- Current Item Card -->
+    <div class="card" style="max-width:700px; margin-top:16px;" id="sce-current-item-card">
+        <div class="card-title">Current Item</div>
+        <div id="sce-no-items" style="display:none; text-align:center; padding:30px; color:var(--text-dim);">
+            All items have been counted!
+        </div>
+        <div id="sce-item-details">
+            <div style="margin-bottom:16px;">
+                <div style="font-size:12px; color:var(--text-dim); margin-bottom:4px;">Item Name</div>
+                <div style="font-size:16px; font-weight:600;" id="sce-item-name">—</div>
+            </div>
+
+            <!-- Serialized Item: Scan serials -->
+            <div id="sce-serial-section" style="display:none;">
+                <div class="form-group">
+                    <label class="form-label">Scan Serial Number</label>
+                    <div style="display:flex; gap:10px;">
+                        <input type="text" id="sce-serial-input" placeholder="Scan or enter serial number" onkeydown="if(event.key==='Enter')sceAddSerial()" style="flex:1;">
+                        <button class="btn btn-primary" onclick="sceAddSerial()">Add</button>
+                    </div>
+                </div>
+
+                <div style="font-size:12px; color:var(--text-dim); margin-bottom:8px; margin-top:16px;">Scanned Serials (<span id="sce-scanned-count">0</span>)</div>
+                <div id="sce-scanned-serials" style="background:var(--surface); border:1px solid var(--border); padding:10px; border-radius:6px; min-height:60px; max-height:150px; overflow-y:auto;">
+                    <span style="color:var(--text-dim)">No serials scanned yet</span>
+                </div>
+            </div>
+
+            <!-- Non-Serialized Item: Enter quantity -->
+            <div id="sce-qty-section" style="display:none;">
+                <div class="form-group">
+                    <label class="form-label">Enter Counted Quantity</label>
+                    <input type="number" id="sce-qty-input" min="0" placeholder="0" style="max-width:200px;">
+                </div>
+            </div>
+
+            <div style="margin-top:20px; display:flex; gap:10px; flex-wrap:wrap;">
+                <button class="btn btn-primary" id="sce-confirm-btn" onclick="sceConfirmItem()">Confirm & Next</button>
+                <button class="btn" onclick="sceSkipItem()">Skip</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Counted Items Summary -->
+    <div class="card" style="max-width:900px; margin-top:16px;">
+        <div class="card-title">Counted Items</div>
+        <div class="table-wrap">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Item</th>
+                        <th style="width:80px;">Qty</th>
+                        <th style="width:80px;">Action</th>
+                    </tr>
+                </thead>
+                <tbody id="sce-counted-body">
+                    <tr><td colspan="3" style="text-align:center;color:var(--text-dim)">No items counted yet</td></tr>
+                </tbody>
+            </table>
+        </div>
+        <div style="margin-top:16px; display:flex; gap:10px; flex-wrap:wrap;">
+            <button class="btn btn-primary" id="sce-save-btn" onclick="sceSaveProgress()">Save Progress</button>
+            <button class="btn" id="sce-complete-btn" onclick="sceCompleteCount()" style="background:var(--success);color:white;">Complete Count</button>
+        </div>
+    </div>
+</div>
+
+<!-- ═══════ STOCK COUNT — REVIEW/APPROVE VIEW ═══════ -->
+<div class="view" id="view-sc-review">
+    <div class="page-header">
+        <div><div class="page-title">Review Stock Count</div><div class="page-subtitle">Compare expected vs counted and approve adjustments</div></div>
+        <button class="btn" onclick="navigateTo('sc-dashboard')">Back to Dashboard</button>
+    </div>
+
+    <!-- Count Info Card -->
+    <div class="card" style="max-width:1200px;">
+        <div class="card-title">Count Details</div>
+        <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(150px, 1fr)); gap:16px;">
+            <div><div style="font-size:12px; color:var(--text-dim);">Count ID</div><div style="font-weight:600;" id="scr-count-id">—</div></div>
+            <div><div style="font-size:12px; color:var(--text-dim);">Location</div><div style="font-weight:600;" id="scr-location">—</div></div>
+            <div><div style="font-size:12px; color:var(--text-dim);">Bin</div><div style="font-weight:600;" id="scr-bin">—</div></div>
+            <div><div style="font-size:12px; color:var(--text-dim);">Status</div><div style="font-weight:600;" id="scr-status">—</div></div>
+        </div>
+    </div>
+
+    <!-- Summary Stats -->
+    <div class="card" style="max-width:1200px; margin-top:16px;">
+        <div class="card-title">Discrepancy Summary</div>
+        <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(120px, 1fr)); gap:16px; text-align:center;">
+            <div style="padding:12px; background:var(--surface-hover); border-radius:8px;">
+                <div style="font-size:24px; font-weight:700;" id="scr-total-items">0</div>
+                <div style="font-size:12px; color:var(--text-dim);">Total Items</div>
+            </div>
+            <div style="padding:12px; background:var(--surface-hover); border-radius:8px;">
+                <div style="font-size:24px; font-weight:700; color:var(--success);" id="scr-matched">0</div>
+                <div style="font-size:12px; color:var(--text-dim);">Matched</div>
+            </div>
+            <div style="padding:12px; background:var(--surface-hover); border-radius:8px;">
+                <div style="font-size:24px; font-weight:700; color:var(--error);" id="scr-discrepancies">0</div>
+                <div style="font-size:12px; color:var(--text-dim);">Discrepancies</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Discrepancy Table -->
+    <div class="card" style="max-width:1200px; margin-top:16px;">
+        <div class="card-title">Item Comparison</div>
+        <div class="table-wrap">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Item</th>
+                        <th style="width:100px;">Type</th>
+                        <th>Expected</th>
+                        <th>Counted</th>
+                        <th style="width:180px;">Discrepancy</th>
+                        <th style="width:180px;">Action</th>
+                    </tr>
+                </thead>
+                <tbody id="scr-review-body">
+                    <tr><td colspan="6" style="text-align:center; color:var(--text-dim);">Loading...</td></tr>
+                </tbody>
+            </table>
+        </div>
+        <div id="scr-action-msg" style="display:none; margin-top:12px;"></div>
+        <div id="scr-pending-msg" style="margin-top:12px; padding:12px; background:rgba(255,193,7,0.15); border-radius:8px; color:var(--warning); display:none;">
+            <strong>Note:</strong> You must approve or reject all items before the count can be finalized.
+        </div>
+        <div style="margin-top:16px; display:flex; gap:10px; flex-wrap:wrap;">
+            <button class="btn btn-primary" id="scr-finalize-btn" onclick="scrFinalizeCount()" disabled>Finalize Count</button>
+            <button class="btn" onclick="navigateTo('sc-dashboard')">Cancel</button>
+        </div>
+    </div>
+</div>
+
+<!-- ═══ SERIAL DISCREPANCY POPUP ═══ -->
+<div class="modal-overlay" id="scr-serial-modal">
+    <div class="modal" style="max-width:500px;">
+        <div class="modal-title">
+            <span id="scr-serial-modal-title">Serial Discrepancies</span>
+            <button class="modal-close" onclick="scrCloseSerialModal()">&times;</button>
+        </div>
+        <div id="scr-serial-modal-body" style="max-height:400px; overflow-y:auto;"></div>
+    </div>
+</div>
+
 </div><!-- /main -->
 </div><!-- /layout -->
 
@@ -6281,6 +7815,44 @@ tr:hover td { background:var(--surface-hover); }
         <div class="processing-spinner"></div>
         <div class="processing-text" id="processing-text">Processing...</div>
         <div class="processing-sub" id="processing-sub">Please wait</div>
+    </div>
+</div>
+
+<!-- ═══ STOCK LOOKUP SHEET ═══ -->
+<div class="stock-sheet-overlay" id="stock-sheet-overlay" onclick="closeStockLookup()"></div>
+<div class="stock-sheet" id="stock-sheet">
+    <div class="mob-more-handle"></div>
+    <div class="stock-sheet-head">
+        <div class="stock-sheet-title" id="stock-sheet-title"></div>
+        <div class="stock-sheet-sub" id="stock-sheet-sub">Bin inventory at selected warehouse</div>
+    </div>
+    <div class="stock-sheet-body" id="stock-sheet-body"></div>
+    <div class="stock-sheet-foot">
+        <button class="btn" onclick="closeStockLookup()" style="width:100%;justify-content:center;">Close</button>
+    </div>
+</div>
+
+<!-- ═══ SO PICK: LOAD FROM LP SHEET ═══ -->
+<div class="stock-sheet-overlay" id="sopick-lp-overlay" onclick="closeSopickLPSheet()"></div>
+<div class="stock-sheet" id="sopick-lp-sheet">
+    <div class="mob-more-handle"></div>
+    <div class="stock-sheet-head">
+        <div class="stock-sheet-title">Load Serials from License Plate</div>
+        <div class="stock-sheet-sub">Type a plate ID or scan its QR code</div>
+    </div>
+    <div class="stock-sheet-body" style="padding:12px 16px 4px;">
+        <div style="display:flex;gap:8px;margin-bottom:10px;">
+            <input type="text" id="sopick-lp-name" placeholder="Plate ID\u2026" autocomplete="off" autocorrect="off" autocapitalize="characters" spellcheck="false" style="flex:1;" onkeydown="if(event.key==='Enter'){event.preventDefault();sopickLoadLP();}">
+            <button class="btn" id="sopick-lp-cam-btn" onclick="sopickToggleLPCamera()" title="Scan QR code"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg></button>
+            <button class="btn btn-primary" onclick="sopickLoadLP()">Load</button>
+        </div>
+        <div id="sopick-lp-qr-area" style="display:none;margin-bottom:10px;border-radius:8px;overflow:hidden;">
+            <div id="sopick-lp-qr-reader"></div>
+        </div>
+        <div id="sopick-lp-status" style="font-size:13px;min-height:18px;"></div>
+    </div>
+    <div class="stock-sheet-foot">
+        <button class="btn" onclick="closeSopickLPSheet()" style="width:100%;justify-content:center;">Cancel</button>
     </div>
 </div>
 
@@ -6328,25 +7900,222 @@ function toggleNavGroup(toggleEl) {
 }
 
 // ═══════════════════════════════════════════════════════════
+//  MOBILE BOTTOM NAV & MORE DRAWER
+// ═══════════════════════════════════════════════════════════
+function toggleMobMore() {
+    const isOpen = document.getElementById('mob-more-drawer').classList.contains('open');
+    if (isOpen) { closeMobMore(); } else {
+        document.getElementById('mob-more-overlay').classList.add('open');
+        document.getElementById('mob-more-drawer').classList.add('open');
+    }
+}
+function closeMobMore() {
+    document.getElementById('mob-more-overlay').classList.remove('open');
+    document.getElementById('mob-more-drawer').classList.remove('open');
+}
+function mobNavTo(view) {
+    const navItem = document.querySelector('.nav-item[data-view="' + view + '"]');
+    if (navItem) navItem.click();
+    closeMobMore();
+}
+function syncMobNav(view) {
+    document.querySelectorAll('.mob-nav-btn[data-view]').forEach(b => b.classList.remove('active'));
+    const moreBtn = document.getElementById('mob-more-btn');
+    if (moreBtn) moreBtn.classList.remove('active');
+    const btn = document.querySelector('.mob-nav-btn[data-view="' + view + '"]');
+    if (btn) btn.classList.add('active');
+    else if (moreBtn) moreBtn.classList.add('active');
+    document.querySelectorAll('.mob-more-item[data-view]').forEach(b => {
+        b.classList.toggle('active', b.dataset.view === view);
+    });
+}
+
+// ═══════════════════════════════════════════════════════════
+//  STOCK LOOKUP
+// ═══════════════════════════════════════════════════════════
+function stockLookupBtn(btn) {
+    const itemId = btn.dataset.iid;
+    const itemName = btn.dataset.iname;
+    const locEl = document.getElementById(btn.dataset.locfn);
+    const locationId = locEl ? locEl.value : '';
+    if (!locationId) { toast('Please select a warehouse first.', 'warning'); return; }
+    openStockLookup(itemId, itemName, locationId);
+}
+
+async function openStockLookup(itemId, itemName, locationId) {
+    const overlay = document.getElementById('stock-sheet-overlay');
+    const sheet = document.getElementById('stock-sheet');
+    const title = document.getElementById('stock-sheet-title');
+    const body = document.getElementById('stock-sheet-body');
+
+    title.textContent = itemName || 'Bin Inventory';
+    body.innerHTML = '<div style="text-align:center;padding:20px;color:var(--text-muted);">Loading\u2026</div>';
+    overlay.classList.add('open');
+    sheet.classList.add('open');
+
+    const data = await apiGet('getBinInventory', { itemId, locationId });
+    if (!data.success) {
+        body.innerHTML = '<div style="text-align:center;padding:20px;color:var(--danger);">' + escHtml(data.message || 'Error loading inventory.') + '</div>';
+        return;
+    }
+    if (!data.results || !data.results.length) {
+        body.innerHTML = '<div style="text-align:center;padding:20px;color:var(--text-muted);">No inventory found at this warehouse.</div>';
+        return;
+    }
+    body.innerHTML = data.results.map(r =>
+        '<div class="stock-sheet-row">' +
+        '<div class="stock-sheet-bin">' + escHtml(r.bin) + '</div>' +
+        '<div class="stock-sheet-qty"><span class="stock-sheet-oh">' + r.qtyOH + ' on hand</span>' +
+        '<span class="stock-sheet-avail">' + r.qtyAvail + ' avail</span></div>' +
+        '</div>'
+    ).join('');
+}
+
+function closeStockLookup() {
+    document.getElementById('stock-sheet-overlay').classList.remove('open');
+    document.getElementById('stock-sheet').classList.remove('open');
+}
+
+// ═══════════════════════════════════════════════════════════
+//  SO PICK — LOAD SERIALS FROM LICENSE PLATE
+// ═══════════════════════════════════════════════════════════
+let _sopickLPTarget = null;
+let _sopickLPScanner = null;
+
+function sopickOpenLPSheet(btn) {
+    _sopickLPTarget = { id: btn.dataset.target, max: parseInt(btn.dataset.max) || 0 };
+    document.getElementById('sopick-lp-name').value = '';
+    const statusEl = document.getElementById('sopick-lp-status');
+    statusEl.textContent = '';
+    statusEl.style.color = '';
+    document.getElementById('sopick-lp-qr-area').style.display = 'none';
+    document.getElementById('sopick-lp-overlay').classList.add('open');
+    document.getElementById('sopick-lp-sheet').classList.add('open');
+    setTimeout(() => document.getElementById('sopick-lp-name').focus(), 200);
+}
+
+function closeSopickLPSheet() {
+    document.getElementById('sopick-lp-overlay').classList.remove('open');
+    document.getElementById('sopick-lp-sheet').classList.remove('open');
+    if (_sopickLPScanner) {
+        _sopickLPScanner.stop().catch(() => {});
+        _sopickLPScanner = null;
+        document.getElementById('sopick-lp-qr-area').style.display = 'none';
+    }
+    _sopickLPTarget = null;
+}
+
+function sopickToggleLPCamera() {
+    const area = document.getElementById('sopick-lp-qr-area');
+    if (_sopickLPScanner) {
+        _sopickLPScanner.stop().catch(() => {});
+        _sopickLPScanner = null;
+        area.style.display = 'none';
+        return;
+    }
+    area.style.display = 'block';
+    _sopickLPScanner = new Html5Qrcode('sopick-lp-qr-reader');
+    _sopickLPScanner.start(
+        { facingMode: 'environment' },
+        { fps: 10, qrbox: { width: 220, height: 220 } },
+        (decodedText) => {
+            document.getElementById('sopick-lp-name').value = decodedText;
+            if (_sopickLPScanner) { _sopickLPScanner.stop().catch(() => {}); _sopickLPScanner = null; }
+            area.style.display = 'none';
+            sopickLoadLP();
+        },
+        () => {}
+    ).catch(err => toast('Camera error: ' + err, 'error'));
+}
+
+async function sopickLoadLP() {
+    const name = document.getElementById('sopick-lp-name').value.trim();
+    if (!name) { toast('Enter a plate ID.', 'warning'); return; }
+    const statusEl = document.getElementById('sopick-lp-status');
+    statusEl.textContent = 'Loading\u2026';
+    statusEl.style.color = 'var(--text-muted)';
+
+    const data = await apiGet('getPlateByName', { name });
+    if (!data.success) {
+        statusEl.textContent = data.message || 'Plate not found.';
+        statusEl.style.color = 'var(--danger)';
+        return;
+    }
+    const serials = data.plate.serialList || [];
+    if (!serials.length) {
+        statusEl.textContent = 'No serials on this plate.';
+        statusEl.style.color = 'var(--danger)';
+        return;
+    }
+    const target = _sopickLPTarget;
+    if (!target) return;
+    const ta = document.getElementById(target.id);
+    if (!ta) return;
+
+    const existing = ta.value.split('\\n').map(s => s.trim()).filter(s => s);
+    const toAdd = serials.filter(s => !existing.includes(s.trim()));
+    ta.value = [...existing, ...toAdd].join('\\n');
+    ta.dispatchEvent(new Event('input'));
+
+    statusEl.textContent = toAdd.length + ' serial(s) loaded from ' + escHtml(data.plate.name) + '.';
+    statusEl.style.color = 'var(--success)';
+    setTimeout(() => closeSopickLPSheet(), 1200);
+}
+
+// ═══════════════════════════════════════════════════════════
 //  NAVIGATION
 // ═══════════════════════════════════════════════════════════
 let dashboardLoaded = false;
+let _scdLoaded = false;
+let _scprLoaded = false;
+
+function navigateTo(view) {
+    const navItem = document.querySelector('.nav-item[data-view="' + view + '"]');
+    if (navItem) {
+        navItem.click();
+    } else {
+        // For programmatic views without nav items (like sc-execute)
+        document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+        document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
+        const viewEl = document.getElementById('view-' + view);
+        if (viewEl) viewEl.classList.add('active');
+        // Reset main padding for regular views
+        document.querySelector('.main').style.padding = '';
+    }
+}
 document.querySelectorAll('.nav-item[data-view]').forEach(el => {
     el.addEventListener('click', () => {
         document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
         document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
         el.classList.add('active');
         document.getElementById('view-' + el.dataset.view).classList.add('active');
+        syncMobNav(el.dataset.view);
 
         // Adjust main padding for iframe vs regular views
         const main = document.querySelector('.main');
-        if (el.dataset.view === 'warehouse' || el.dataset.view === 'printlabel' || el.dataset.view === 'binputaway') { main.style.padding = '0'; }
-        else { main.style.padding = ''; }
+        const isMobile = window.innerWidth <= 768;
+        if (el.dataset.view === 'warehouse' || el.dataset.view === 'printlabel' || el.dataset.view === 'binputaway') {
+            main.style.padding = isMobile ? '0 0 58px 0' : '0';
+        } else {
+            main.style.padding = '';
+        }
 
         // Lazy-load dashboard on first visit
         if (el.dataset.view === 'dashboard' && !dashboardLoaded) {
             dashboardLoaded = true;
             loadDashboard();
+        }
+
+        // Lazy-load stock count dashboard on first visit
+        if (el.dataset.view === 'sc-dashboard' && !_scdLoaded) {
+            _scdLoaded = true;
+            scdLoadStockCounts();
+        }
+
+        // Lazy-load pending review on first visit
+        if (el.dataset.view === 'sc-pending-review' && !_scprLoaded) {
+            _scprLoaded = true;
+            scprLoadPendingReview();
         }
 
         // Close mobile menu on nav
@@ -6368,7 +8137,8 @@ document.querySelectorAll('.nav-item[data-view]').forEach(el => {
 async function apiGet(action, params = {}) {
     const qs = new URLSearchParams({ action, ...params }).toString();
     const res = await fetch(API + '&' + qs);
-    return res.json();
+    const text = await res.text();
+    try { return JSON.parse(text); } catch (e) { throw new Error('Server returned unexpected response (HTTP ' + res.status + '). Check NetSuite logs.'); }
 }
 
 async function apiPost(action, body) {
@@ -6377,7 +8147,27 @@ async function apiPost(action, body) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body)
     });
-    return res.json();
+    const text = await res.text();
+    try { return JSON.parse(text); } catch (e) { throw new Error('Server returned unexpected response (HTTP ' + res.status + '). Check NetSuite logs.'); }
+}
+
+// ═══════════════════════════════════════════════════════════
+//  BUTTON DISABLE HELPERS (prevent double-click)
+// ═══════════════════════════════════════════════════════════
+function _btnWait(btn) {
+    if (!btn) return;
+    btn.disabled = true;
+    btn._origHTML = btn.innerHTML;
+    btn.innerHTML = 'Please wait...';
+    btn.style.opacity = '0.7';
+    btn.style.cursor = 'not-allowed';
+}
+function _btnReset(btn) {
+    if (!btn) return;
+    btn.disabled = false;
+    btn.innerHTML = btn._origHTML || '';
+    btn.style.opacity = '';
+    btn.style.cursor = '';
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -6442,6 +8232,30 @@ function populateSelect(selectEl, items, includeEmpty = true) {
     selectEl.value = val;
 }
 
+function populateBinDatalist(bins) {
+    const dl = document.getElementById('lp-bin-datalist');
+    if (!dl) return;
+    dl.innerHTML = '';
+    bins.forEach(b => {
+        const opt = document.createElement('option');
+        opt.value = b.name;
+        opt.setAttribute('data-id', b.id);
+        dl.appendChild(opt);
+    });
+}
+
+function syncBinHiddenId() {
+    const input = document.getElementById('form-bin');
+    const hidden = document.getElementById('form-bin-id');
+    if (!input || !hidden) return;
+    const name = input.value.trim();
+    if (!name) { hidden.value = ''; return; }
+    const locId = document.getElementById('form-location').value;
+    const bins = _bins[locId] || [];
+    const match = bins.find(b => b.name === name);
+    hidden.value = match ? match.id : '';
+}
+
 // ═══════════════════════════════════════════════════════════
 //  ITEM SEARCH AUTOCOMPLETE
 // ═══════════════════════════════════════════════════════════
@@ -6475,22 +8289,109 @@ function hideItemDropdown() {
 // ═══════════════════════════════════════════════════════════
 //  DASHBOARD
 // ═══════════════════════════════════════════════════════════
-async function loadDashboard() {
-    const data = await apiGet('searchPlates', {});
+let _dbFiltersInited = false;
+let _dbItemSearchTimeout;
+
+async function initDashboardFilters() {
+    if (_dbFiltersInited) return;
+    _dbFiltersInited = true;
+    try {
+        const stats = await loadStatuses();
+        populateSelect(document.getElementById('db-filter-status'), stats, false);
+        document.getElementById('db-filter-status').insertAdjacentHTML('afterbegin', '<option value="">All</option>');
+        document.getElementById('db-filter-status').value = '';
+
+        const locs = await loadLocations();
+        if (locs.length) {
+            const bins = await loadBins(locs[0].id);
+            populateSelect(document.getElementById('db-filter-bin'), bins, false);
+            document.getElementById('db-filter-bin').insertAdjacentHTML('afterbegin', '<option value="">All</option>');
+            document.getElementById('db-filter-bin').value = '';
+        }
+    } catch (e) {}
+
+    // Item typeahead
+    document.getElementById('db-filter-item-search').addEventListener('input', function() {
+        clearTimeout(_dbItemSearchTimeout);
+        const q = this.value.trim();
+        // Clear selected item when text changes
+        document.getElementById('db-filter-item-id').value = '';
+        if (q.length < 2) { document.getElementById('db-filter-item-dropdown').innerHTML = ''; return; }
+        _dbItemSearchTimeout = setTimeout(() => dbItemSearch(q), 300);
+    });
+
+    // Enter on filter inputs applies filters
+    ['db-filter-item-search', 'db-filter-from', 'db-filter-to'].forEach(function(id) {
+        document.getElementById(id).addEventListener('keydown', function(e) {
+            if (e.key === 'Enter') { e.preventDefault(); dbApplyFilters(); }
+        });
+    });
+}
+
+async function dbItemSearch(q) {
+    const data = await apiGet('getItems', { q });
+    const dd = document.getElementById('db-filter-item-dropdown');
+    if (!data.results || !data.results.length) { dd.innerHTML = ''; return; }
+    dd.innerHTML = '<div style="position:absolute;top:0;left:0;right:0;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-sm);z-index:50;max-height:200px;overflow-y:auto;box-shadow:var(--shadow);">' +
+        data.results.map(r => '<div style="padding:8px 12px;cursor:pointer;font-size:13px;border-bottom:1px solid var(--border);" onmouseover="this.style.background=\\'var(--surface-hover)\\'" onmouseout="this.style.background=\\'transparent\\'" onclick="dbSelectItem(' + r.id + ',\\'' + escHtml(r.name) + '\\')">' + escHtml(r.name) + (r.display ? ' — ' + escHtml(r.display) : '') + '</div>').join('') +
+        '</div>';
+}
+
+function dbSelectItem(id, name) {
+    document.getElementById('db-filter-item-id').value = id;
+    document.getElementById('db-filter-item-search').value = name;
+    document.getElementById('db-filter-item-dropdown').innerHTML = '';
+}
+
+function dbFormatDate(yyyymmdd) {
+    if (!yyyymmdd) return '';
+    const parts = yyyymmdd.split('-');
+    if (parts.length !== 3) return '';
+    return parts[1] + '/' + parts[2] + '/' + parts[0];
+}
+
+function dbGetFilters() {
+    return {
+        status:      document.getElementById('db-filter-status') ? document.getElementById('db-filter-status').value : '',
+        item:        document.getElementById('db-filter-item-id') ? document.getElementById('db-filter-item-id').value : '',
+        bin:         document.getElementById('db-filter-bin') ? document.getElementById('db-filter-bin').value : '',
+        createdFrom: document.getElementById('db-filter-from') ? dbFormatDate(document.getElementById('db-filter-from').value) : '',
+        createdTo:   document.getElementById('db-filter-to') ? dbFormatDate(document.getElementById('db-filter-to').value) : ''
+    };
+}
+
+function dbApplyFilters() { loadDashboard(0); }
+
+function dbClearFilters() {
+    const ids = ['db-filter-status', 'db-filter-item-search', 'db-filter-item-id', 'db-filter-bin', 'db-filter-from', 'db-filter-to'];
+    ids.forEach(function(id) { const el = document.getElementById(id); if (el) el.value = ''; });
+    loadDashboard(0);
+}
+
+async function loadDashboard(page = 0) {
+    await initDashboardFilters();
+    const params = Object.assign({ page: page }, dbGetFilters());
+    const data = await apiGet('searchPlates', params);
     if (!data.success) return;
 
     document.getElementById('stat-total').textContent = data.total;
+    // Fetch accurate active count in background (doesn't block table render)
+    apiGet('getPlateStats').then(stats => {
+        if (stats && stats.success) {
+            document.getElementById('stat-active').textContent = stats.active;
+        }
+    }).catch(() => {});
     let totalSerials = 0;
     data.results.forEach(p => totalSerials += p.serialCount);
     document.getElementById('stat-serials').textContent = totalSerials;
-    document.getElementById('stat-active').textContent = data.results.filter(p => p.statusId !== '3').length; // rough
 
     const tbody = document.getElementById('dashboard-table');
     if (!data.results.length) {
         tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--text-dim)">No plates found</td></tr>';
+        document.getElementById('dashboard-pagination').innerHTML = '';
         return;
     }
-    tbody.innerHTML = data.results.slice(0, 15).map(p => 
+    tbody.innerHTML = data.results.map(p =>
         '<tr class="clickable-row" onclick="viewPlateModal(' + p.id + ')">' +
         '<td style="font-family:var(--mono);font-weight:600;">' + escHtml(p.name) + '</td>' +
         '<td>' + escHtml(p.item || '—') + '</td>' +
@@ -6500,6 +8401,17 @@ async function loadDashboard() {
         '<td style="color:var(--text-muted);font-size:12px;">' + escHtml(p.created || '') + '</td>' +
         '</tr>'
     ).join('');
+
+    const pagDiv = document.getElementById('dashboard-pagination');
+    if (data.pageCount > 1) {
+        let html = '';
+        for (let i = 0; i < data.pageCount; i++) {
+            html += '<button class="btn btn-sm ' + (i === page ? 'btn-primary' : '') + '" onclick="loadDashboard(' + i + ')">' + (i + 1) + '</button>';
+        }
+        pagDiv.innerHTML = html;
+    } else {
+        pagDiv.innerHTML = '';
+    }
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -6512,18 +8424,22 @@ document.getElementById('scan-input').addEventListener('keydown', e => {
 async function scanLookup() {
     const name = document.getElementById('scan-input').value.trim();
     if (!name) return;
-    const data = await apiGet('getPlateByName', { name });
-    const container = document.getElementById('scan-result');
-    container.style.display = 'block';
-    if (!data.success) {
-        container.innerHTML = '<div class="card" style="border-color:var(--danger);"><p style="color:var(--danger);">' + escHtml(data.message) + '</p></div>';
-        return;
-    }
-    container.innerHTML = '<div class="card">' + renderPlateDetail(data.plate) +
-        '<div class="btn-group" style="margin-top:16px;">' +
-        '<button class="btn" onclick="printPlateQR(' + data.plate.id + ')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 6 2 18 2 18 9"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8"/></svg> Print QR</button>' +
-        '<button class="btn btn-primary" onclick="editPlate(' + data.plate.id + ')">Edit</button>' +
-        '</div></div>';
+    const btn = document.querySelector('#view-scan .btn-primary');
+    _btnWait(btn);
+    try {
+        const data = await apiGet('getPlateByName', { name });
+        const container = document.getElementById('scan-result');
+        container.style.display = 'block';
+        if (!data.success) {
+            container.innerHTML = '<div class="card" style="border-color:var(--danger);"><p style="color:var(--danger);">' + escHtml(data.message) + '</p></div>';
+            return;
+        }
+        container.innerHTML = '<div class="card">' + renderPlateDetail(data.plate) +
+            '<div class="btn-group" style="margin-top:16px;">' +
+            '<button class="btn" onclick="printPlateQR(' + data.plate.id + ')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 6 2 18 2 18 9"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8"/></svg> Print QR</button>' +
+            '<button class="btn btn-primary" onclick="editPlate(' + data.plate.id + ')">Edit</button>' +
+            '</div></div>';
+    } finally { _btnReset(btn); }
 }
 
 function toggleCamera() {
@@ -6569,13 +8485,18 @@ async function initCreateForm() {
 
     // Bin refresh on location change
     document.getElementById('form-location').addEventListener('change', async function() {
+        document.getElementById('form-bin').value = '';
+        document.getElementById('form-bin-id').value = '';
         const bins = await loadBins(this.value);
-        populateSelect(document.getElementById('form-bin'), bins);
+        populateBinDatalist(bins);
     });
+    // Sync hidden bin ID when user picks from datalist
+    document.getElementById('form-bin').addEventListener('change', syncBinHiddenId);
+    document.getElementById('form-bin').addEventListener('blur', syncBinHiddenId);
     // Pre-load bins for the first location
     if (locs.length) {
         const bins = await loadBins(locs[0].id);
-        populateSelect(document.getElementById('form-bin'), bins);
+        populateBinDatalist(bins);
     }
 
     // Auto-generate plate ID on first load
@@ -6591,7 +8512,7 @@ async function savePlateForm(e) {
         name: document.getElementById('form-name').value,
         locationId: document.getElementById('form-location').value,
         itemId: document.getElementById('form-item-id').value,
-        binId: document.getElementById('form-bin').value,
+        binId: document.getElementById('form-bin-id').value,
         statusId: document.getElementById('form-status').value,
         statusCodeId: document.getElementById('form-sc').value,
         serials: document.getElementById('form-serials').value,
@@ -6617,10 +8538,20 @@ function resetPlateForm() {
     document.getElementById('plate-form').reset();
     document.getElementById('form-item-id').value = '';
     document.getElementById('form-item-search').value = '';
+    document.getElementById('form-bin-id').value = '';
     document.getElementById('create-title').textContent = 'Create License Plate';
     document.getElementById('create-subtitle').textContent = 'Fill in the details below';
     // Auto-generate a random 9-digit plate ID
     document.getElementById('form-name').value = generatePlateId();
+    updateSerialsCount();
+}
+
+function updateSerialsCount() {
+    const ta = document.getElementById('form-serials');
+    const el = document.getElementById('form-serials-count');
+    if (!ta || !el) return;
+    const count = ta.value.split(/[\\r\\n]+/).filter(function(s){ return s.trim().length > 0; }).length;
+    el.textContent = count + (count === 1 ? ' serial' : ' serials');
 }
 
 function generatePlateId() {
@@ -6650,9 +8581,10 @@ async function editPlate(id) {
     // Load bins for this location then set bin
     if (p.locationId) {
         const bins = await loadBins(p.locationId);
-        populateSelect(document.getElementById('form-bin'), bins);
+        populateBinDatalist(bins);
     }
-    document.getElementById('form-bin').value = p.binId || '';
+    document.getElementById('form-bin').value = p.bin || '';
+    document.getElementById('form-bin-id').value = p.binId || '';
 
     document.getElementById('form-item-search').value = p.item || '';
     document.getElementById('form-item-id').value = p.itemId || '';
@@ -6660,6 +8592,7 @@ async function editPlate(id) {
     document.getElementById('form-sc').value = p.statusCodeId || '';
     document.getElementById('form-serials').value = p.serials || '';
     document.getElementById('form-notes').value = p.notes || '';
+    updateSerialsCount();
 
     closeModal();
 }
@@ -6679,6 +8612,9 @@ document.getElementById('search-keyword').addEventListener('keydown', e => {
 });
 
 async function doSearch(page = 0) {
+    const searchBtn = document.querySelector('#view-search .btn-primary[onclick*="doSearch"]');
+    _btnWait(searchBtn);
+    try {
     const params = {
         keyword: document.getElementById('search-keyword').value,
         location: document.getElementById('search-location').value,
@@ -6719,6 +8655,7 @@ async function doSearch(page = 0) {
     } else {
         pagDiv.innerHTML = '';
     }
+    } finally { _btnReset(searchBtn); }
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -6740,9 +8677,19 @@ async function loadTransferPlate() {
         document.getElementById('transfer-plate-info').innerHTML = renderPlateInfoCompact(data.plate);
         document.getElementById('transfer-detail').style.display = 'block';
 
+        document.getElementById('transfer-dest-bin').value = '';
+        document.getElementById('transfer-dest-bin-id').value = '';
         if (data.plate.locationId) {
             const bins = await loadBins(data.plate.locationId);
-            populateSelect(document.getElementById('transfer-dest-bin'), bins);
+            const dl = document.getElementById('transfer-bin-datalist');
+            if (dl) {
+                dl.innerHTML = '';
+                bins.forEach(b => {
+                    const opt = document.createElement('option');
+                    opt.value = b.name;
+                    dl.appendChild(opt);
+                });
+            }
         }
 
         const scData = await apiGet('getStatusCodes');
@@ -6752,17 +8699,23 @@ async function loadTransferPlate() {
 
 async function executeBinTransfer() {
     if (!currentTransferPlate) { toast('No plate loaded.', 'error'); return; }
-    const destBin = document.getElementById('transfer-dest-bin').value;
+    const destBinName = document.getElementById('transfer-dest-bin').value.trim();
     const destStatus = document.getElementById('transfer-dest-status').value;
-    if (!destBin) { toast('Please select a destination bin.', 'error'); return; }
+    if (!destBinName) { toast('Please select a destination bin.', 'error'); return; }
     if (!destStatus) { toast('Please select an inventory status.', 'error'); return; }
-    if (destBin === currentTransferPlate.binId) { toast('Destination bin is the same as current bin.', 'error'); return; }
+    // Resolve bin ID from name
+    const locId = currentTransferPlate.locationId;
+    const bins = _bins[locId] || [];
+    const match = bins.find(b => b.name === destBinName);
+    const destBinId = match ? match.id : document.getElementById('transfer-dest-bin-id').value;
+    if (!destBinId) { toast('Invalid bin. Please select a bin from the list.', 'error'); return; }
+    if (destBinId === currentTransferPlate.binId) { toast('Destination bin is the same as current bin.', 'error'); return; }
 
     showProcessing('Processing Bin Transfer...', 'Creating transfer record');
     try {
         const data = await apiPost('binTransfer', {
             plateId: currentTransferPlate.id,
-            destinationBinId: destBin,
+            destinationBinId: destBinId,
             statusId: destStatus
         });
         if (data.success) {
@@ -7104,10 +9057,11 @@ function porcvRenderLine(line, idx) {
         }
     }
 
+    const porcvLookupBtn = '<button class="stock-lookup-btn" data-iid="' + escHtml(String(line.itemId)) + '" data-iname="' + escHtml(line.itemText) + '" data-locfn="porcv-location" onclick="stockLookupBtn(this)" title="Check bin stock"><svg viewBox=\\"0 0 24 24\\" fill=\\"none\\" stroke=\\"currentColor\\" stroke-width=\\"2\\"><line x1=\\"18\\" y1=\\"20\\" x2=\\"18\\" y2=\\"10\\"/><line x1=\\"12\\" y1=\\"20\\" x2=\\"12\\" y2=\\"4\\"/><line x1=\\"6\\" y1=\\"20\\" x2=\\"6\\" y2=\\"14\\"/></svg></button>';
     return '<div class="porcv-line' + pendingClass + (line.quantityRemaining > 0 ? ' selected' : '') + '" id="porcv-line-' + idx + '">' +
         '<div class="porcv-line-header">' +
         '<input type="checkbox" id="porcv-check-' + idx + '" ' + checkedAttr + ' ' + disabledAttr + ' onchange="porcvToggleLine(' + idx + ')">' +
-        '<div class="porcv-line-item">' + escHtml(line.itemText) + '</div>' + statusBadge + '</div>' +
+        '<div class="porcv-line-item">' + escHtml(line.itemText) + '</div>' + porcvLookupBtn + statusBadge + '</div>' +
         (line.description ? '<div class="porcv-line-desc">' + escHtml(line.description) + '</div>' : '') +
         '<div class="porcv-line-meta">' +
         '<div><div>Ordered</div><div class="value">' + line.quantity + '</div></div>' +
@@ -7122,10 +9076,52 @@ function porcvToggleLine(idx) {
     if (checked) el.classList.add('selected'); else el.classList.remove('selected');
 }
 
+function porcvDing() {
+    try {
+        const ctx = new (window.AudioContext || window.webkitAudioContext)();
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(880, ctx.currentTime);
+        osc.frequency.exponentialRampToValueAtTime(220, ctx.currentTime + 0.25);
+        gain.gain.setValueAtTime(0.6, ctx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.35);
+        osc.start(ctx.currentTime);
+        osc.stop(ctx.currentTime + 0.35);
+    } catch(e) {}
+}
+
 function porcvUpdateSerialCount(idx, max) {
     const ta = document.getElementById('porcv-serials-' + idx);
-    const count = ta.value.split('\\n').map(s => s.trim()).filter(s => s !== '').length;
-    document.getElementById('porcv-serial-count-' + idx).textContent = count + ' of ' + max + ' serials entered';
+    const countEl = document.getElementById('porcv-serial-count-' + idx);
+    const serials = ta.value.split('\\n').map(s => s.trim()).filter(s => s !== '');
+
+    const seen = new Set();
+    const dupes = [];
+    const deduped = serials.filter(s => { if (seen.has(s)) { dupes.push(s); return false; } seen.add(s); return true; });
+
+    if (dupes.length > 0) {
+        // Rewrite textarea without the duplicates, preserving cursor at end
+        ta.value = deduped.join('\\n') + (ta.value.endsWith('\\n') ? '\\n' : '');
+        porcvDing();
+        ta.classList.remove('dupe-shake');
+        void ta.offsetWidth;
+        ta.classList.add('dupe-shake');
+        countEl.textContent = '\u26A0 Duplicate rejected: ' + [...new Set(dupes)].join(', ');
+        countEl.classList.add('has-dupe');
+        ta.classList.add('has-dupe');
+        setTimeout(() => {
+            countEl.textContent = deduped.length + ' of ' + max + ' serials entered';
+            countEl.classList.remove('has-dupe');
+            ta.classList.remove('has-dupe');
+        }, 2500);
+    } else {
+        countEl.textContent = deduped.length + ' of ' + max + ' serials entered';
+        countEl.classList.remove('has-dupe');
+        ta.classList.remove('has-dupe');
+    }
 }
 
 async function porcvSubmit() {
@@ -7149,6 +9145,9 @@ async function porcvSubmit() {
             const ta = document.getElementById('porcv-serials-' + idx);
             const serialNumbers = ta.value.split('\\n').map(s => s.trim()).filter(s => s !== '');
             if (!serialNumbers.length) { toast('Enter serial numbers for ' + line.itemText + '.', 'error'); validationFailed = true; return; }
+            const dupeCheck = new Set();
+            const dupeFound = serialNumbers.find(s => { if (dupeCheck.has(s)) return true; dupeCheck.add(s); return false; });
+            if (dupeFound) { toast('Duplicate serial number "' + dupeFound + '" in ' + line.itemText + '. Remove duplicates before submitting.', 'error'); validationFailed = true; return; }
             if (serialNumbers.length > line.quantityRemaining) { toast('Serial count (' + serialNumbers.length + ') for ' + line.itemText + ' exceeds remaining (' + line.quantityRemaining + ').', 'error'); validationFailed = true; return; }
             selectedLines.push({ lineNum: line.lineNum, itemId: line.itemId, itemText: line.itemText, description: line.description, isSerialized: true, serialNumbers, quantity: serialNumbers.length });
         } else {
@@ -7277,6 +9276,30 @@ async function sopickLoadSO() {
     } finally { hideProcessing(); }
 }
 
+function sopickRenderComponentInput(comp, idx, cidx) {
+    const totalQty = comp.totalQuantity;
+    const compLookupBtn = '<button class="stock-lookup-btn" data-iid="' + escHtml(String(comp.itemId)) + '" data-iname="' + escHtml(comp.itemText) + '" data-locfn="sopick-location" onclick="stockLookupBtn(this)" title="Check bin stock"><svg viewBox=\\"0 0 24 24\\" fill=\\"none\\" stroke=\\"currentColor\\" stroke-width=\\"2\\"><line x1=\\"18\\" y1=\\"20\\" x2=\\"18\\" y2=\\"10\\"/><line x1=\\"12\\" y1=\\"20\\" x2=\\"12\\" y2=\\"4\\"/><line x1=\\"6\\" y1=\\"20\\" x2=\\"6\\" y2=\\"14\\"/></svg></button>';
+    if (comp.isSerialized) {
+        return '<div class="sopick-kit-component" id="sopick-comp-' + idx + '-' + cidx + '">' +
+            '<div class="sopick-comp-name" style="display:flex;align-items:center;gap:6px;">' + escHtml(comp.itemText) + ' <span style="color:var(--text-muted);font-size:12px;">&times;' + totalQty + '</span>' + compLookupBtn + '</div>' +
+            '<label class="form-label" style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;">Serial Numbers (one per line)' +
+            '<button class="btn" style="font-size:11px;padding:2px 10px;height:26px;gap:4px;" data-target="sopick-comp-serials-' + idx + '-' + cidx + '" data-max="' + totalQty + '" onclick="sopickOpenLPSheet(this)"><svg width="12" height="12" viewBox=\\"0 0 24 24\\" fill=\\"none\\" stroke=\\"currentColor\\" stroke-width=\\"2\\"><rect x=\\"3\\" y=\\"3\\" width=\\"7\\" height=\\"7\\"/><rect x=\\"14\\" y=\\"3\\" width=\\"7\\" height=\\"7\\"/><rect x=\\"3\\" y=\\"14\\" width=\\"7\\" height=\\"7\\"/><path d=\\"M14 14h3v3m0 4h4m-4-4v4m-4 0h4\\"/></svg> Scan LP QR</button>' +
+            '</label>' +
+            '<textarea id="sopick-comp-serials-' + idx + '-' + cidx + '" rows="3" placeholder="Scan serial numbers, one per line..." oninput="sopickUpdateCompSerialCount(' + idx + ',' + cidx + ',' + totalQty + ')"></textarea>' +
+            '<div class="sopick-serial-count" id="sopick-comp-serial-count-' + idx + '-' + cidx + '">0 of ' + totalQty + ' serials entered</div>' +
+            '</div>';
+    } else {
+        return '<div class="sopick-kit-component" id="sopick-comp-' + idx + '-' + cidx + '">' +
+            '<div class="sopick-comp-name" style="display:flex;align-items:center;gap:6px;">' + escHtml(comp.itemText) + compLookupBtn + '</div>' +
+            '<div class="sopick-bin-row">' +
+            '<div class="form-group"><label class="form-label">Quantity</label>' +
+            '<input type="number" id="sopick-comp-qty-' + idx + '-' + cidx + '" value="' + totalQty + '" min="1" max="' + totalQty + '"></div>' +
+            '<div class="form-group"><label class="form-label">Bin *</label>' +
+            '<input type="text" id="sopick-comp-bin-' + idx + '-' + cidx + '" class="sopick-bin-input" list="sopick-bin-datalist" autocomplete="off" placeholder="Type to search bins\u2026">' +
+            '</div></div></div>';
+    }
+}
+
 function sopickRenderLine(line, idx) {
     const stateClass = line.isFullyFulfilled ? ' fulfilled' : ' needs-pick';
     const checkedAttr = line.quantityRemaining > 0 ? 'checked' : '';
@@ -7291,9 +9314,19 @@ function sopickRenderLine(line, idx) {
 
     let inputHtml = '';
     if (line.quantityRemaining > 0) {
-        if (line.isSerialized) {
+        if (line.isKit && line.components && line.components.length) {
+            // Kit: render each component with its own bin/serial input
+            let compHtml = '<div class="sopick-kit-components">';
+            line.components.forEach((comp, cidx) => {
+                compHtml += sopickRenderComponentInput(comp, idx, cidx);
+            });
+            compHtml += '</div>';
+            inputHtml = '<div class="sopick-line-input">' + compHtml + '</div>';
+        } else if (line.isSerialized) {
             inputHtml = '<div class="sopick-line-input">' +
-                '<label class="form-label">Serial Numbers (one per line)</label>' +
+                '<label class="form-label" style="display:flex;align-items:center;justify-content:space-between;">Serial Numbers (one per line)' +
+                '<button class="btn" style="font-size:11px;padding:2px 10px;height:26px;gap:4px;" data-target="sopick-serials-' + idx + '" data-max="' + line.quantityRemaining + '" onclick="sopickOpenLPSheet(this)"><svg width="12" height="12" viewBox=\\"0 0 24 24\\" fill=\\"none\\" stroke=\\"currentColor\\" stroke-width=\\"2\\"><rect x=\\"3\\" y=\\"3\\" width=\\"7\\" height=\\"7\\"/><rect x=\\"14\\" y=\\"3\\" width=\\"7\\" height=\\"7\\"/><rect x=\\"3\\" y=\\"14\\" width=\\"7\\" height=\\"7\\"/><path d=\\"M14 14h3v3m0 4h4m-4-4v4m-4 0h4\\"/></svg> Scan LP QR</button>' +
+                '</label>' +
                 '<textarea id="sopick-serials-' + idx + '" rows="4" placeholder="Scan serial numbers, one per line..." oninput="sopickUpdateSerialCount(' + idx + ',' + line.quantityRemaining + ')"></textarea>' +
                 '<div class="sopick-serial-count" id="sopick-serial-count-' + idx + '">0 of ' + line.quantityRemaining + ' serials entered</div></div>';
         } else {
@@ -7302,21 +9335,54 @@ function sopickRenderLine(line, idx) {
                 '<div class="form-group"><label class="form-label">Quantity</label>' +
                 '<input type="number" id="sopick-qty-' + idx + '" value="' + line.quantityRemaining + '" min="1" max="' + line.quantityRemaining + '"></div>' +
                 '<div class="form-group"><label class="form-label">Bin *</label>' +
-                '<select id="sopick-bin-' + idx + '" class="sopick-bin-select"><option value="">-- Select Bin --</option></select></div>' +
+                '<input type="text" id="sopick-bin-' + idx + '" class="sopick-bin-input" list="sopick-bin-datalist" autocomplete="off" placeholder="Type to search bins\u2026">' +
+                '<input type="hidden" id="sopick-bin-id-' + idx + '"></div>' +
                 '</div></div>';
         }
     }
 
+    const kitBadge = line.isKit ? ' <span class="badge badge-info" style="font-size:10px;">Kit</span>' : '';
+    const sopickLookupBtn = '<button class="stock-lookup-btn" data-iid="' + escHtml(String(line.itemId)) + '" data-iname="' + escHtml(line.itemText) + '" data-locfn="sopick-location" onclick="stockLookupBtn(this)" title="Check bin stock"><svg viewBox=\\"0 0 24 24\\" fill=\\"none\\" stroke=\\"currentColor\\" stroke-width=\\"2\\"><line x1=\\"18\\" y1=\\"20\\" x2=\\"18\\" y2=\\"10\\"/><line x1=\\"12\\" y1=\\"20\\" x2=\\"12\\" y2=\\"4\\"/><line x1=\\"6\\" y1=\\"20\\" x2=\\"6\\" y2=\\"14\\"/></svg></button>';
     return '<div class="sopick-line' + stateClass + (line.quantityRemaining > 0 ? ' selected' : '') + '" id="sopick-line-' + idx + '">' +
         '<div class="sopick-line-header">' +
         '<input type="checkbox" id="sopick-check-' + idx + '" ' + checkedAttr + ' ' + disabledAttr + ' onchange="sopickToggleLine(' + idx + ')">' +
-        '<div class="sopick-line-item">' + escHtml(line.itemText) + '</div>' + statusBadge + '</div>' +
+        '<div class="sopick-line-item">' + escHtml(line.itemText) + kitBadge + '</div>' + sopickLookupBtn + statusBadge + '</div>' +
         (line.description ? '<div class="sopick-line-desc">' + escHtml(line.description) + '</div>' : '') +
         '<div class="sopick-line-meta">' +
         '<div><div>Ordered</div><div class="value">' + line.quantity + '</div></div>' +
         '<div><div>Fulfilled</div><div class="value">' + line.quantityFulfilled + '</div></div>' +
         '<div><div>Remaining</div><div class="value">' + line.quantityRemaining + '</div></div></div>' +
         inputHtml + '</div>';
+}
+
+function sopickUpdateCompSerialCount(idx, cidx, max) {
+    const ta = document.getElementById('sopick-comp-serials-' + idx + '-' + cidx);
+    const countEl = document.getElementById('sopick-comp-serial-count-' + idx + '-' + cidx);
+    const serials = ta.value.split('\\n').map(s => s.trim()).filter(s => s !== '');
+
+    const seen = new Set();
+    const dupes = [];
+    const deduped = serials.filter(s => { if (seen.has(s)) { dupes.push(s); return false; } seen.add(s); return true; });
+
+    if (dupes.length > 0) {
+        ta.value = deduped.join('\\n') + (ta.value.endsWith('\\n') ? '\\n' : '');
+        porcvDing();
+        ta.classList.remove('dupe-shake');
+        void ta.offsetWidth;
+        ta.classList.add('dupe-shake');
+        countEl.textContent = '\u26A0 Duplicate rejected: ' + [...new Set(dupes)].join(', ');
+        countEl.classList.add('has-dupe');
+        ta.classList.add('has-dupe');
+        setTimeout(() => {
+            countEl.textContent = deduped.length + ' of ' + max + ' serials entered';
+            countEl.classList.remove('has-dupe');
+            ta.classList.remove('has-dupe');
+        }, 2500);
+    } else {
+        countEl.textContent = deduped.length + ' of ' + max + ' serials entered';
+        countEl.classList.remove('has-dupe');
+        ta.classList.remove('has-dupe');
+    }
 }
 
 function sopickToggleLine(idx) {
@@ -7327,21 +9393,46 @@ function sopickToggleLine(idx) {
 
 function sopickUpdateSerialCount(idx, max) {
     const ta = document.getElementById('sopick-serials-' + idx);
-    const count = ta.value.split('\\n').map(s => s.trim()).filter(s => s !== '').length;
-    document.getElementById('sopick-serial-count-' + idx).textContent = count + ' of ' + max + ' serials entered';
+    const countEl = document.getElementById('sopick-serial-count-' + idx);
+    const serials = ta.value.split('\\n').map(s => s.trim()).filter(s => s !== '');
+
+    const seen = new Set();
+    const dupes = [];
+    const deduped = serials.filter(s => { if (seen.has(s)) { dupes.push(s); return false; } seen.add(s); return true; });
+
+    if (dupes.length > 0) {
+        ta.value = deduped.join('\\n') + (ta.value.endsWith('\\n') ? '\\n' : '');
+        porcvDing();
+        ta.classList.remove('dupe-shake');
+        void ta.offsetWidth;
+        ta.classList.add('dupe-shake');
+        countEl.textContent = '\u26A0 Duplicate rejected: ' + [...new Set(dupes)].join(', ');
+        countEl.classList.add('has-dupe');
+        ta.classList.add('has-dupe');
+        setTimeout(() => {
+            countEl.textContent = deduped.length + ' of ' + max + ' serials entered';
+            countEl.classList.remove('has-dupe');
+            ta.classList.remove('has-dupe');
+        }, 2500);
+    } else {
+        countEl.textContent = deduped.length + ' of ' + max + ' serials entered';
+        countEl.classList.remove('has-dupe');
+        ta.classList.remove('has-dupe');
+    }
 }
 
 async function sopickRefreshBins(locationId) {
     if (!locationId) return;
     const bins = await loadBins(locationId);
-    document.querySelectorAll('.sopick-bin-select').forEach(sel => {
-        const val = sel.value;
-        populateSelect(sel, bins);
-        if (sel.options.length && sel.options[0].value === '') {
-            sel.options[0].textContent = '-- Select Bin --';
-        }
-        sel.value = val;
-    });
+    const dl = document.getElementById('sopick-bin-datalist');
+    if (dl) {
+        dl.innerHTML = '';
+        bins.forEach(b => {
+            const opt = document.createElement('option');
+            opt.value = b.name;
+            dl.appendChild(opt);
+        });
+    }
 }
 
 async function sopickSubmit() {
@@ -7350,12 +9441,47 @@ async function sopickSubmit() {
     const selectedLines = [];
     let validationFailed = false;
 
+    const sopickLocId = document.getElementById('sopick-location').value;
+    const sopickBins = _bins[sopickLocId] || [];
+
+    function resolveBinId(binName, label) {
+        if (!binName) { toast('Please select a bin for ' + label + '.', 'error'); validationFailed = true; return null; }
+        const match = sopickBins.find(b => b.name === binName);
+        if (!match) { toast('Invalid bin for ' + label + '. Please select a bin from the list.', 'error'); validationFailed = true; return null; }
+        return match.id;
+    }
+
     currentSOPickData.lines.forEach((line, idx) => {
         if (validationFailed) return;
         const cb = document.getElementById('sopick-check-' + idx);
         if (!cb || !cb.checked || line.quantityRemaining <= 0) return;
 
-        if (line.isSerialized) {
+        if (line.isKit && line.components && line.components.length) {
+            // Collect component picks
+            const components = [];
+            line.components.forEach((comp, cidx) => {
+                if (validationFailed) return;
+                if (comp.isSerialized) {
+                    const ta = document.getElementById('sopick-comp-serials-' + idx + '-' + cidx);
+                    const serialNumbers = ta ? ta.value.split('\\n').map(s => s.trim()).filter(s => s !== '') : [];
+                    if (!serialNumbers.length) { toast('Enter serial numbers for ' + comp.itemText + ' (kit component).', 'error'); validationFailed = true; return; }
+                    if (serialNumbers.length > comp.totalQuantity) { toast('Serial count for ' + comp.itemText + ' exceeds required (' + comp.totalQuantity + ').', 'error'); validationFailed = true; return; }
+                    const uniqueSerials = [...new Set(serialNumbers)];
+                    if (uniqueSerials.length !== serialNumbers.length) { toast('Duplicate serials detected for ' + comp.itemText + '.', 'error'); validationFailed = true; return; }
+                    components.push({ itemId: comp.itemId, isSerialized: true, serialNumbers, quantity: serialNumbers.length });
+                } else {
+                    const qtyInput = document.getElementById('sopick-comp-qty-' + idx + '-' + cidx);
+                    const qty = parseFloat(qtyInput ? qtyInput.value : 0) || 0;
+                    if (qty <= 0) { toast('Enter a quantity for ' + comp.itemText + ' (kit component).', 'error'); validationFailed = true; return; }
+                    if (qty > comp.totalQuantity) { toast('Quantity for ' + comp.itemText + ' exceeds required (' + comp.totalQuantity + ').', 'error'); validationFailed = true; return; }
+                    const binInput = document.getElementById('sopick-comp-bin-' + idx + '-' + cidx);
+                    const binId = resolveBinId(binInput ? binInput.value.trim() : '', comp.itemText);
+                    if (!binId) return;
+                    components.push({ itemId: comp.itemId, isSerialized: false, serialNumbers: [], quantity: qty, binId });
+                }
+            });
+            if (!validationFailed) selectedLines.push({ lineNum: line.lineNum, itemId: line.itemId, isKit: true, components });
+        } else if (line.isSerialized) {
             const ta = document.getElementById('sopick-serials-' + idx);
             const serialNumbers = ta.value.split('\\n').map(s => s.trim()).filter(s => s !== '');
             if (!serialNumbers.length) { toast('Enter serial numbers for ' + line.itemText + '.', 'error'); validationFailed = true; return; }
@@ -7368,9 +9494,9 @@ async function sopickSubmit() {
             const qty = parseFloat(qtyInput.value) || 0;
             if (qty <= 0) { toast('Enter a quantity for ' + line.itemText + '.', 'error'); validationFailed = true; return; }
             if (qty > line.quantityRemaining) { toast('Quantity for ' + line.itemText + ' exceeds remaining (' + line.quantityRemaining + ').', 'error'); validationFailed = true; return; }
-            const binSelect = document.getElementById('sopick-bin-' + idx);
-            const binId = binSelect ? binSelect.value : '';
-            if (!binId) { toast('Please select a bin for ' + line.itemText + '.', 'error'); validationFailed = true; return; }
+            const binInput = document.getElementById('sopick-bin-' + idx);
+            const binId = resolveBinId(binInput ? binInput.value.trim() : '', line.itemText);
+            if (!binId) return;
             selectedLines.push({ lineNum: line.lineNum, itemId: line.itemId, isSerialized: false, serialNumbers: [], quantity: qty, binId });
         }
     });
@@ -7461,15 +9587,19 @@ async function lookupPOSerials() {
     if (!itemId) { toast('Please select an item.', 'error'); return; }
     if (!poNumber) { toast('Please enter a PO number.', 'error'); return; }
 
-    toast('Looking up serials…', 'info');
-    const data = await apiGet('lookupPOSerials', { itemId, poNumber });
-    if (!data.success) { toast(data.message, 'error'); return; }
+    const btn = document.querySelector('#view-poimport .btn-primary[onclick*="lookupPOSerials"]');
+    _btnWait(btn);
+    try {
+        toast('Looking up serials…', 'info');
+        const data = await apiGet('lookupPOSerials', { itemId, poNumber });
+        if (!data.success) { toast(data.message, 'error'); return; }
 
-    document.getElementById('po-serial-count').textContent = data.serialCount;
-    document.getElementById('po-serial-list').innerHTML = data.serialNumbers.map(s => '<div class="serial-item">' + escHtml(s) + '</div>').join('');
-    document.getElementById('po-serials-preview').style.display = 'block';
+        document.getElementById('po-serial-count').textContent = data.serialCount;
+        document.getElementById('po-serial-list').innerHTML = data.serialNumbers.map(s => '<div class="serial-item">' + escHtml(s) + '</div>').join('');
+        document.getElementById('po-serials-preview').style.display = 'block';
 
-    toast(data.serialCount + ' serial(s) found on PO ' + data.poTranId + '.', 'success');
+        toast(data.serialCount + ' serial(s) found on PO ' + data.poTranId + '.', 'success');
+    } finally { _btnReset(btn); }
 }
 
 async function initPOForm() {
@@ -7549,15 +9679,19 @@ async function lookupIRSerials() {
     if (!itemId) { toast('Please select an item.', 'error'); return; }
     if (!irNumber) { toast('Please enter an Item Receipt number.', 'error'); return; }
 
-    toast('Looking up serials…', 'info');
-    const data = await apiGet('lookupIRSerials', { itemId, irNumber });
-    if (!data.success) { toast(data.message, 'error'); return; }
+    const btn = document.querySelector('#view-irimport .btn-primary[onclick*="lookupIRSerials"]');
+    _btnWait(btn);
+    try {
+        toast('Looking up serials…', 'info');
+        const data = await apiGet('lookupIRSerials', { itemId, irNumber });
+        if (!data.success) { toast(data.message, 'error'); return; }
 
-    document.getElementById('ir-serial-count').textContent = data.serialCount;
-    document.getElementById('ir-serial-list').innerHTML = data.serialNumbers.map(s => '<div class="serial-item">' + escHtml(s) + '</div>').join('');
-    document.getElementById('ir-serials-preview').style.display = 'block';
+        document.getElementById('ir-serial-count').textContent = data.serialCount;
+        document.getElementById('ir-serial-list').innerHTML = data.serialNumbers.map(s => '<div class="serial-item">' + escHtml(s) + '</div>').join('');
+        document.getElementById('ir-serials-preview').style.display = 'block';
 
-    toast(data.serialCount + ' serial(s) found on IR ' + data.irTranId + '.', 'success');
+        toast(data.serialCount + ' serial(s) found on IR ' + data.irTranId + '.', 'success');
+    } finally { _btnReset(btn); }
 }
 
 async function initIRForm() {
@@ -7601,13 +9735,910 @@ async function createPlateFromIR() {
 }
 
 // ═══════════════════════════════════════════════════════════
+//  STOCK COUNTS
+// ═══════════════════════════════════════════════════════════
+let _scItems = [];
+
+async function initStockCountForm() {
+    const [locs, emps] = await Promise.all([loadLocations(), apiGet('getEmployees')]);
+    populateSelect(document.getElementById('sc-location'), locs);
+    if (emps && emps.results) populateSelect(document.getElementById('sc-assigned-to'), emps.results);
+    if (locs.length) await scLoadBins(locs[0].id);
+}
+
+async function scLoadBins(locationId) {
+    const binSel = document.getElementById('sc-bin');
+    binSel.innerHTML = '<option value="">Loading…</option>';
+    try {
+        const data = await apiGet('getBins', { location: locationId });
+        binSel.innerHTML = '<option value="">— select a bin —</option>';
+        (data.results || []).forEach(b => {
+            const opt = document.createElement('option');
+            opt.value = b.id;
+            opt.textContent = b.name;
+            opt.dataset.name = b.name;
+            binSel.appendChild(opt);
+        });
+    } catch (e) {
+        binSel.innerHTML = '<option value="">Failed to load bins</option>';
+    }
+}
+
+async function scOnLocationChange() {
+    const locationId = document.getElementById('sc-location').value;
+    scResetToSetup();
+    if (locationId) await scLoadBins(locationId);
+}
+
+function scResetToSetup() {
+    document.getElementById('sc-items-card').style.display = 'none';
+    document.getElementById('sc-save-msg').style.display = 'none';
+    document.getElementById('sc-items-body').innerHTML = '';
+    _scItems = [];
+}
+
+async function scLoadItems() {
+    const locationId = document.getElementById('sc-location').value;
+    const binSel     = document.getElementById('sc-bin');
+    const binId      = binSel.value;
+    const binName    = binSel.options[binSel.selectedIndex]?.dataset.name || binSel.options[binSel.selectedIndex]?.text || '';
+    const assignedTo = document.getElementById('sc-assigned-to').value;
+
+    if (!locationId) { toast('Please select a location.', 'error'); return; }
+    if (!binId)      { toast('Please select a bin.', 'error'); return; }
+    if (!assignedTo) { toast('Please select who this is assigned to.', 'error'); return; }
+
+    const btn = document.getElementById('sc-load-btn');
+    _btnWait(btn);
+    showProcessing('Loading bin inventory…', 'Fetching items');
+    try {
+        const data = await apiGet('getStockCountItems', { binId, locationId });
+        if (!data.success) { toast(data.message || 'Failed to load items.', 'error'); return; }
+        _scItems = data.results || [];
+        const title = document.getElementById('sc-items-title');
+        title.textContent = 'Items in ' + binName + ' (' + _scItems.length + ' item' + (_scItems.length !== 1 ? 's' : '') + ')';
+        const tbody = document.getElementById('sc-items-body');
+        if (_scItems.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--text-dim)">No inventory found in this bin.</td></tr>';
+            document.getElementById('sc-select-all').style.display = 'none';
+        } else {
+            document.getElementById('sc-select-all').style.display = '';
+            document.getElementById('sc-select-all').checked = true;
+            tbody.innerHTML = _scItems.map((item, idx) => {
+                const typeBadge = item.serialized
+                    ? '<span class="badge badge-info">Serialized</span>'
+                    : '<span class="badge" style="background:var(--surface-hover)">Non-Serialized</span>';
+                return '<tr>' +
+                    '<td><input type="checkbox" class="sc-item-cb" data-idx="' + idx + '" checked onchange="scUpdateSelectAll()"></td>' +
+                    '<td style="font-weight:500;">' + escHtml(item.itemName) + '</td>' +
+                    '<td>' + typeBadge + '</td>' +
+                    '</tr>';
+            }).join('');
+        }
+        document.getElementById('sc-items-card').style.display = '';
+        document.getElementById('sc-save-msg').style.display = 'none';
+    } catch (err) {
+        toast('Error loading items: ' + err.message, 'error');
+    } finally {
+        _btnReset(btn);
+        hideProcessing();
+    }
+}
+
+function scToggleAll(cb) {
+    document.querySelectorAll('.sc-item-cb').forEach(el => { el.checked = cb.checked; });
+}
+
+function scUpdateSelectAll() {
+    const all  = document.querySelectorAll('.sc-item-cb');
+    const checked = document.querySelectorAll('.sc-item-cb:checked');
+    const selectAll = document.getElementById('sc-select-all');
+    selectAll.indeterminate = checked.length > 0 && checked.length < all.length;
+    selectAll.checked = checked.length === all.length;
+}
+
+async function submitStockCount() {
+    const locationId = document.getElementById('sc-location').value;
+    const binSel     = document.getElementById('sc-bin');
+    const binId      = binSel.value;
+    const binName    = binSel.options[binSel.selectedIndex]?.dataset.name || binSel.options[binSel.selectedIndex]?.text || '';
+    const assignedTo = document.getElementById('sc-assigned-to').value;
+    const msgDiv     = document.getElementById('sc-save-msg');
+    const btn        = document.getElementById('sc-submit-btn');
+
+    const selected = [];
+    document.querySelectorAll('.sc-item-cb:checked').forEach(cb => {
+        selected.push(_scItems[parseInt(cb.dataset.idx)]);
+    });
+    if (selected.length === 0) { toast('Select at least one item.', 'error'); return; }
+
+    _btnWait(btn);
+    msgDiv.style.display = 'none';
+    try {
+        const data = await apiPost('createStockCount', { locationId, binId, binName, assignedTo, itemsJson: JSON.stringify(selected) });
+        if (data.success) {
+            toast('Stock count #' + data.id + ' created successfully with ' + selected.length + ' item(s).', 'success');
+            scResetToSetup();
+        } else {
+            msgDiv.style.display = 'block';
+            msgDiv.className = 'alert alert-error';
+            msgDiv.textContent = data.message || 'Failed to create stock count.';
+        }
+    } catch (err) {
+        msgDiv.style.display = 'block';
+        msgDiv.className = 'alert alert-error';
+        msgDiv.textContent = 'Error: ' + err.message;
+    } finally {
+        _btnReset(btn);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
+//  STOCK COUNT DASHBOARD
+// ═══════════════════════════════════════════════════════════
+
+async function scdLoadStockCounts() {
+    const status = document.getElementById('scd-status-filter').value;
+    const tbody = document.getElementById('scd-table-body');
+    tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--text-dim)">Loading...</td></tr>';
+
+    try {
+        const params = status ? { status } : {};
+        const data = await apiGet('getStockCounts', params);
+        if (!data.success) {
+            tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--danger)">' + escHtml(data.message || 'Failed to load') + '</td></tr>';
+            return;
+        }
+        const results = data.results || [];
+        if (results.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--text-dim)">No stock counts found</td></tr>';
+            return;
+        }
+        tbody.innerHTML = results.map(sc => {
+            const statusBadge = scdGetStatusBadge(sc.status);
+            const actionBtn = scdGetActionButton(sc);
+            return '<tr>' +
+                '<td style="font-weight:500;">#' + escHtml(sc.id) + '</td>' +
+                '<td>' + escHtml(sc.location || '—') + '</td>' +
+                '<td>' + escHtml(sc.binName || '—') + '</td>' +
+                '<td>' + escHtml(sc.assignedTo || '—') + '</td>' +
+                '<td style="text-align:center;">' + sc.itemCount + '</td>' +
+                '<td>' + statusBadge + '</td>' +
+                '<td style="font-size:12px;">' + escHtml(sc.created || '—') + '</td>' +
+                '<td>' + actionBtn + '</td>' +
+                '</tr>';
+        }).join('');
+    } catch (err) {
+        tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--danger)">Error: ' + escHtml(err.message) + '</td></tr>';
+    }
+}
+
+async function scprLoadPendingReview() {
+    const tbody = document.getElementById('scpr-table-body');
+    tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--text-dim)">Loading...</td></tr>';
+
+    try {
+        const data = await apiGet('getStockCounts', { status: 'completed' });
+        if (!data.success) {
+            tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--danger)">' + escHtml(data.message || 'Failed to load') + '</td></tr>';
+            return;
+        }
+        // Filter only completed counts without adjustment ID (pending review)
+        const results = (data.results || []).filter(sc => !sc.adjustmentId);
+        if (results.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--text-dim)">No counts pending review</td></tr>';
+            return;
+        }
+        tbody.innerHTML = results.map(sc => {
+            return '<tr>' +
+                '<td style="font-weight:500;">#' + escHtml(sc.id) + '</td>' +
+                '<td>' + escHtml(sc.location || '—') + '</td>' +
+                '<td>' + escHtml(sc.binName || '—') + '</td>' +
+                '<td>' + escHtml(sc.assignedTo || '—') + '</td>' +
+                '<td style="text-align:center;">' + sc.itemCount + '</td>' +
+                '<td style="font-size:12px;">' + escHtml(sc.created || '—') + '</td>' +
+                '<td><button class="btn" style="padding:6px 12px;font-size:12px;background:var(--warning);color:#000;" onclick="scrStartReview(' + sc.id + ')">Review</button></td>' +
+                '</tr>';
+        }).join('');
+    } catch (err) {
+        tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--danger)">Error: ' + escHtml(err.message) + '</td></tr>';
+    }
+}
+
+function scdGetStatusBadge(status) {
+    switch(status) {
+        case 'pending':
+            return '<span class="badge" style="background:var(--surface-hover);color:var(--text);">Pending</span>';
+        case 'in_progress':
+            return '<span class="badge badge-info">In Progress</span>';
+        case 'completed':
+            return '<span class="badge" style="background:var(--warning);color:#000;">Pending Review</span>';
+        case 'approved':
+            return '<span class="badge" style="background:var(--success);color:#fff;">Approved</span>';
+        case 'rejected':
+            return '<span class="badge badge-error">Rejected</span>';
+        default:
+            return '<span class="badge">' + escHtml(status || 'Unknown') + '</span>';
+    }
+}
+
+function scdGetActionButton(sc) {
+    if (sc.status === 'pending') {
+        return '<button class="btn btn-primary" style="padding:6px 12px;font-size:12px;" onclick="sceStartCount(' + sc.id + ')">Start Count</button>';
+    } else if (sc.status === 'in_progress') {
+        return '<button class="btn" style="padding:6px 12px;font-size:12px;" onclick="sceStartCount(' + sc.id + ')">Continue</button>';
+    } else if (sc.status === 'completed' && !sc.adjustmentId) {
+        return '<button class="btn" style="padding:6px 12px;font-size:12px;background:var(--warning);color:#000;" onclick="scrStartReview(' + sc.id + ')">Review</button>';
+    } else {
+        return '<button class="btn" style="padding:6px 12px;font-size:12px;" onclick="scrViewApproved(' + sc.id + ')">View</button>';
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
+//  STOCK COUNT EXECUTION
+// ═══════════════════════════════════════════════════════════
+let _sceData = null;
+let _sceItems = [];
+let _sceCounted = [];
+let _sceCurrentIdx = 0;
+let _sceScannedSerials = [];
+
+async function sceStartCount(id) {
+    showProcessing('Loading Stock Count...', 'Fetching details');
+    try {
+        const data = await apiGet('getStockCountById', { id });
+        if (!data.success) {
+            toast(data.message || 'Failed to load stock count.', 'error');
+            return;
+        }
+        _sceData = data.data;
+        _sceItems = _sceData.items || [];
+        _sceCounted = _sceData.counted || [];
+        _sceCurrentIdx = 0;
+        _sceScannedSerials = [];
+
+        // Update status to in_progress if pending
+        if (_sceData.status === 'pending') {
+            await apiPost('updateStockCount', { id: _sceData.id, status: 'in_progress' });
+        }
+
+        // Find first uncounted item
+        _sceCurrentIdx = _sceItems.findIndex(item => !_sceCounted.find(c => c.itemId === item.itemId));
+        if (_sceCurrentIdx < 0) _sceCurrentIdx = 0;
+
+        navigateTo('sc-execute');
+        sceRenderUI();
+    } catch (err) {
+        toast('Error: ' + err.message, 'error');
+    } finally {
+        hideProcessing();
+    }
+}
+
+async function sceViewCount(id) {
+    await sceStartCount(id);
+}
+
+function sceRenderUI() {
+    if (!_sceData) return;
+
+    document.getElementById('sce-count-id').textContent = _sceData.id;
+    document.getElementById('sce-bin-name').textContent = _sceData.binName || '—';
+
+    // Stats
+    const totalItems = _sceItems.length;
+    const countedItems = _sceCounted.length;
+    const remaining = totalItems - countedItems;
+    document.getElementById('sce-stat-total').textContent = totalItems;
+    document.getElementById('sce-stat-counted').textContent = countedItems;
+    document.getElementById('sce-stat-remaining').textContent = remaining;
+
+    // Current item
+    const uncountedItems = _sceItems.filter(item => !_sceCounted.find(c => c.itemId === item.itemId));
+    if (uncountedItems.length === 0) {
+        document.getElementById('sce-no-items').style.display = 'block';
+        document.getElementById('sce-item-details').style.display = 'none';
+    } else {
+        document.getElementById('sce-no-items').style.display = 'none';
+        document.getElementById('sce-item-details').style.display = 'block';
+        const currentItem = uncountedItems[0];
+        sceRenderCurrentItem(currentItem);
+    }
+
+    // Counted table
+    sceRenderCountedTable();
+}
+
+function sceRenderCurrentItem(item) {
+    document.getElementById('sce-item-name').textContent = item.itemName || '—';
+
+    if (item.serialized) {
+        document.getElementById('sce-serial-section').style.display = 'block';
+        document.getElementById('sce-qty-section').style.display = 'none';
+
+        _sceScannedSerials = [];
+        sceRenderScannedSerials();
+        document.getElementById('sce-serial-input').value = '';
+        document.getElementById('sce-serial-input').focus();
+    } else {
+        document.getElementById('sce-serial-section').style.display = 'none';
+        document.getElementById('sce-qty-section').style.display = 'block';
+        document.getElementById('sce-qty-input').value = '';
+        document.getElementById('sce-qty-input').focus();
+    }
+}
+
+function sceRenderScannedSerials() {
+    const container = document.getElementById('sce-scanned-serials');
+    document.getElementById('sce-scanned-count').textContent = _sceScannedSerials.length;
+    if (_sceScannedSerials.length === 0) {
+        container.innerHTML = '<span style="color:var(--text-dim)">No serials scanned yet</span>';
+    } else {
+        container.innerHTML = _sceScannedSerials.map((sn, idx) =>
+            '<span style="display:inline-flex;align-items:center;gap:4px;background:var(--primary);color:#fff;padding:2px 8px;border-radius:4px;margin:2px;font-size:12px;">' +
+            escHtml(sn) +
+            '<span style="cursor:pointer;opacity:0.7;" onclick="sceRemoveSerial(' + idx + ')">&times;</span>' +
+            '</span>'
+        ).join('');
+    }
+}
+
+function sceAddSerial() {
+    const input = document.getElementById('sce-serial-input');
+    const sn = input.value.trim();
+    if (!sn) return;
+
+    if (_sceScannedSerials.includes(sn)) {
+        toast('Serial already scanned.', 'error');
+        return;
+    }
+
+    _sceScannedSerials.push(sn);
+    sceRenderScannedSerials();
+    input.value = '';
+    input.focus();
+    toast('Serial added: ' + sn, 'success');
+}
+
+function sceRemoveSerial(idx) {
+    _sceScannedSerials.splice(idx, 1);
+    sceRenderScannedSerials();
+}
+
+function sceConfirmItem() {
+    const uncountedItems = _sceItems.filter(item => !_sceCounted.find(c => c.itemId === item.itemId));
+    if (uncountedItems.length === 0) {
+        toast('No items to count.', 'info');
+        return;
+    }
+
+    const currentItem = uncountedItems[0];
+    let countedValue;
+
+    if (currentItem.serialized) {
+        if (_sceScannedSerials.length === 0) {
+            toast('Please scan at least one serial number.', 'error');
+            return;
+        }
+        countedValue = { serials: [..._sceScannedSerials] };
+    } else {
+        const qty = parseInt(document.getElementById('sce-qty-input').value) || 0;
+        if (qty < 0) {
+            toast('Quantity must be 0 or greater.', 'error');
+            return;
+        }
+        countedValue = { quantity: qty };
+    }
+
+    _sceCounted.push({
+        itemId: currentItem.itemId,
+        itemName: currentItem.itemName,
+        serialized: currentItem.serialized,
+        expected: currentItem.serialized ? (currentItem.serialNumbers || []) : null,
+        counted: countedValue
+    });
+
+    toast('Item counted: ' + currentItem.itemName, 'success');
+    sceRenderUI();
+}
+
+function sceSkipItem() {
+    const uncountedItems = _sceItems.filter(item => !_sceCounted.find(c => c.itemId === item.itemId));
+    if (uncountedItems.length <= 1) {
+        toast('No more items to skip to.', 'info');
+        return;
+    }
+    // Move current item to end of uncounted list by adding a skipped marker
+    const skipped = uncountedItems[0];
+    _sceItems = _sceItems.filter(i => i.itemId !== skipped.itemId);
+    _sceItems.push(skipped);
+    sceRenderUI();
+}
+
+function sceRenderCountedTable() {
+    const tbody = document.getElementById('sce-counted-body');
+    if (_sceCounted.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="3" style="text-align:center;color:var(--text-dim)">No items counted yet</td></tr>';
+        return;
+    }
+    tbody.innerHTML = _sceCounted.map((c, idx) => {
+        let countedVal;
+        if (c.serialized) {
+            const serials = c.counted.serials || [];
+            countedVal = serials.length;
+        } else {
+            countedVal = c.counted.quantity || 0;
+        }
+        const recountBtn = '<button class="btn" style="padding:2px 8px;font-size:11px;" onclick="sceRecountItem(' + idx + ')" title="Recount this item">↩ Redo</button>';
+        return '<tr>' +
+            '<td style="font-weight:500;">' + escHtml(c.itemName) + '</td>' +
+            '<td>' + countedVal + '</td>' +
+            '<td style="text-align:center;">' + recountBtn + '</td>' +
+            '</tr>';
+    }).join('');
+}
+
+function sceRecountItem(idx) {
+    if (idx < 0 || idx >= _sceCounted.length) return;
+
+    const item = _sceCounted[idx];
+    // Remove from counted
+    _sceCounted.splice(idx, 1);
+
+    // Move this item to the front of _sceItems so it becomes the current item
+    const itemIdx = _sceItems.findIndex(i => i.itemId === item.itemId);
+    if (itemIdx > -1) {
+        const [removed] = _sceItems.splice(itemIdx, 1);
+        _sceItems.unshift(removed);
+    }
+
+    // Re-render UI
+    sceRenderUI();
+    toast('Item ready for recount: ' + item.itemName, 'info');
+}
+
+async function sceSaveProgress() {
+    if (!_sceData) {
+        toast('No stock count loaded.', 'error');
+        return;
+    }
+
+    const btn = document.getElementById('sce-save-btn');
+    _btnWait(btn);
+    try {
+        const data = await apiPost('updateStockCount', {
+            id: _sceData.id,
+            countedJson: JSON.stringify(_sceCounted)
+        });
+        if (data.success) {
+            toast('Progress saved successfully.', 'success');
+        } else {
+            toast(data.message || 'Failed to save progress.', 'error');
+        }
+    } catch (err) {
+        toast('Error: ' + err.message, 'error');
+    } finally {
+        _btnReset(btn);
+    }
+}
+
+async function sceCompleteCount() {
+    if (!_sceData) {
+        toast('No stock count loaded.', 'error');
+        return;
+    }
+
+    const uncountedItems = _sceItems.filter(item => !_sceCounted.find(c => c.itemId === item.itemId));
+    if (uncountedItems.length > 0) {
+        if (!confirm('There are still ' + uncountedItems.length + ' uncounted item(s). Are you sure you want to complete this count?')) {
+            return;
+        }
+    }
+
+    const btn = document.getElementById('sce-complete-btn');
+    _btnWait(btn);
+    try {
+        const data = await apiPost('updateStockCount', {
+            id: _sceData.id,
+            status: 'completed',
+            countedJson: JSON.stringify(_sceCounted)
+        });
+        if (data.success) {
+            toast('Stock count completed successfully!', 'success');
+            navigateTo('sc-dashboard');
+            scdLoadStockCounts();
+        } else {
+            toast(data.message || 'Failed to complete count.', 'error');
+        }
+    } catch (err) {
+        toast('Error: ' + err.message, 'error');
+    } finally {
+        _btnReset(btn);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
+//  STOCK COUNT REVIEW / APPROVAL
+// ═══════════════════════════════════════════════════════════
+let _scrData = null;
+let _scrDiscrepancies = [];
+
+async function scrStartReview(id) {
+    showProcessing('Loading stock count...');
+    try {
+        const data = await apiGet('getStockCountById', { id });
+        if (!data.success) {
+            toast(data.message || 'Failed to load stock count.', 'error');
+            return;
+        }
+        _scrData = data.data;
+
+        // Calculate discrepancies
+        _scrDiscrepancies = scrCalculateDiscrepancies(_scrData.items, _scrData.counted);
+
+        // Populate UI
+        scrRenderReviewUI();
+        navigateTo('sc-review');
+    } catch (err) {
+        toast('Error: ' + err.message, 'error');
+    } finally {
+        hideProcessing();
+    }
+}
+
+function scrCalculateDiscrepancies(items, counted) {
+    const discrepancies = [];
+
+    // Create a map of counted items by itemId
+    const countedMap = {};
+    (counted || []).forEach(c => {
+        countedMap[c.itemId] = c;
+    });
+
+    // Compare each expected item
+    (items || []).forEach(item => {
+        const countedItem = countedMap[item.itemId];
+        const disc = {
+            itemId: item.itemId,
+            itemName: item.itemName,
+            serialized: item.serialized,
+            expectedSerials: item.serialNumbers || [],
+            expectedQty: item.serialized ? (item.serialNumbers || []).length : (item.expectedQty || 0),
+            countedSerials: [],
+            countedQty: null,
+            missingSerials: [],
+            extraSerials: [],
+            qtyDifference: 0,
+            hasDiscrepancy: false
+        };
+
+        if (countedItem) {
+            if (item.serialized) {
+                disc.countedSerials = countedItem.counted?.serials || [];
+                // Find missing serials (expected but not counted - need to remove from NetSuite)
+                disc.missingSerials = disc.expectedSerials.filter(sn => !disc.countedSerials.includes(sn));
+                // Find extra serials (counted but not expected - need to add to NetSuite)
+                disc.extraSerials = disc.countedSerials.filter(sn => !disc.expectedSerials.includes(sn));
+                disc.hasDiscrepancy = disc.missingSerials.length > 0 || disc.extraSerials.length > 0;
+            } else {
+                disc.countedQty = countedItem.counted?.quantity || 0;
+                // expectedQty already set from item.expectedQty above
+                disc.qtyDifference = disc.countedQty - disc.expectedQty;
+                disc.hasDiscrepancy = disc.qtyDifference !== 0;
+            }
+        } else {
+            // Item was not counted at all
+            if (item.serialized) {
+                disc.missingSerials = [...disc.expectedSerials];
+                disc.hasDiscrepancy = disc.expectedSerials.length > 0;
+            } else {
+                disc.countedQty = 0;
+                // expectedQty already set from item.expectedQty above
+                disc.qtyDifference = 0 - disc.expectedQty;
+                disc.hasDiscrepancy = disc.expectedQty > 0;
+            }
+        }
+
+        discrepancies.push(disc);
+    });
+
+    return discrepancies;
+}
+
+// Track per-item approval state: 'pending' | 'approved' | 'rejected'
+let _scrItemStates = [];
+
+function scrRenderReviewUI() {
+    // Header info
+    document.getElementById('scr-count-id').textContent = '#' + _scrData.id;
+    document.getElementById('scr-location').textContent = _scrData.location || '—';
+    document.getElementById('scr-bin').textContent = _scrData.binName || '—';
+    document.getElementById('scr-status').textContent = _scrData.status || '—';
+
+    // Initialize item states - items with no discrepancy are auto-approved
+    _scrItemStates = _scrDiscrepancies.map(d => d.hasDiscrepancy ? 'pending' : 'approved');
+
+    // Summary stats
+    const totalItems = _scrDiscrepancies.length;
+    const discrepancyCount = _scrDiscrepancies.filter(d => d.hasDiscrepancy).length;
+    const matchedCount = totalItems - discrepancyCount;
+
+    document.getElementById('scr-total-items').textContent = totalItems;
+    document.getElementById('scr-matched').textContent = matchedCount;
+    document.getElementById('scr-discrepancies').textContent = discrepancyCount;
+
+    // Render table
+    scrRenderReviewTable();
+    scrUpdateFinalizeButton();
+}
+
+function scrRenderReviewTable() {
+    const tbody = document.getElementById('scr-review-body');
+
+    if (_scrDiscrepancies.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--text-dim);">No items to review</td></tr>';
+        return;
+    }
+
+    tbody.innerHTML = _scrDiscrepancies.map((d, idx) => {
+        const typeBadge = d.serialized
+            ? '<span class="badge badge-info">Serialized</span>'
+            : '<span class="badge" style="background:var(--surface-hover)">Non-Serialized</span>';
+
+        let expectedCell, countedCell, discrepancyCell;
+        const state = _scrItemStates[idx];
+
+        if (d.serialized) {
+            expectedCell = d.expectedSerials.length > 0
+                ? '<span style="font-size:11px;">' + d.expectedSerials.length + ' serial(s)</span>'
+                : '<span style="color:var(--text-dim);">None</span>';
+            countedCell = d.countedSerials.length > 0
+                ? '<span style="font-size:11px;">' + d.countedSerials.length + ' serial(s)</span>'
+                : '<span style="color:var(--text-dim);">None</span>';
+
+            if (d.hasDiscrepancy) {
+                const parts = [];
+                if (d.missingSerials.length > 0) {
+                    parts.push('<span style="color:var(--danger);">-' + d.missingSerials.length + ' missing</span>');
+                }
+                if (d.extraSerials.length > 0) {
+                    parts.push('<span style="color:var(--success);">+' + d.extraSerials.length + ' extra</span>');
+                }
+                // Make discrepancy clickable to show popup
+                discrepancyCell = '<a href="#" onclick="scrShowSerialModal(' + idx + '); return false;" style="text-decoration:underline; cursor:pointer;">' + parts.join('<br>') + '</a>';
+            } else {
+                discrepancyCell = '<span style="color:var(--success);">Match</span>';
+            }
+        } else {
+            expectedCell = '<span style="font-size:11px;">Qty: ' + (d.expectedQty || 0) + '</span>';
+            countedCell = '<span style="font-size:11px;">Qty: ' + (d.countedQty || 0) + '</span>';
+
+            if (d.hasDiscrepancy) {
+                const sign = d.qtyDifference > 0 ? '+' : '';
+                const color = d.qtyDifference > 0 ? 'var(--success)' : 'var(--danger)';
+                discrepancyCell = '<span style="color:' + color + ';">' + sign + d.qtyDifference + '</span>';
+            } else {
+                discrepancyCell = '<span style="color:var(--success);">Match</span>';
+            }
+        }
+
+        // Action column based on state
+        let actionCell;
+        if (!d.hasDiscrepancy) {
+            actionCell = '<span style="color:var(--success); font-size:12px;">No action needed</span>';
+        } else if (state === 'approved') {
+            actionCell = '<span class="badge" style="background:var(--success);color:white;">Approved</span>' +
+                '<button class="btn" onclick="scrUndoItem(' + idx + ')" style="margin-left:8px;padding:4px 8px;font-size:11px;">Undo</button>';
+        } else if (state === 'rejected') {
+            actionCell = '<span class="badge badge-error">Rejected</span>' +
+                '<button class="btn" onclick="scrUndoItem(' + idx + ')" style="margin-left:8px;padding:4px 8px;font-size:11px;">Undo</button>';
+        } else {
+            actionCell = '<button class="btn" onclick="scrApproveItem(' + idx + ')" style="padding:4px 10px;font-size:11px;background:var(--success);color:white;">Approve</button>' +
+                '<button class="btn btn-danger" onclick="scrRejectItem(' + idx + ')" style="margin-left:6px;padding:4px 10px;font-size:11px;">Reject</button>';
+        }
+
+        // Row styling based on state
+        let rowStyle = '';
+        if (d.hasDiscrepancy) {
+            if (state === 'approved') {
+                rowStyle = 'background:rgba(34,197,94,0.15);';
+            } else if (state === 'rejected') {
+                rowStyle = 'background:rgba(220,38,38,0.15);';
+            } else {
+                rowStyle = 'background:rgba(255,193,7,0.15);';
+            }
+        }
+
+        return '<tr style="' + rowStyle + '">' +
+            '<td style="font-weight:500;">' + escHtml(d.itemName) + '</td>' +
+            '<td>' + typeBadge + '</td>' +
+            '<td>' + expectedCell + '</td>' +
+            '<td>' + countedCell + '</td>' +
+            '<td>' + discrepancyCell + '</td>' +
+            '<td style="white-space:nowrap;">' + actionCell + '</td>' +
+            '</tr>';
+    }).join('');
+}
+
+function scrApproveItem(idx) {
+    _scrItemStates[idx] = 'approved';
+    scrRenderReviewTable();
+    scrUpdateFinalizeButton();
+}
+
+function scrRejectItem(idx) {
+    _scrItemStates[idx] = 'rejected';
+    scrRenderReviewTable();
+    scrUpdateFinalizeButton();
+}
+
+function scrUndoItem(idx) {
+    _scrItemStates[idx] = 'pending';
+    scrRenderReviewTable();
+    scrUpdateFinalizeButton();
+}
+
+function scrUpdateFinalizeButton() {
+    const pendingCount = _scrItemStates.filter(s => s === 'pending').length;
+    const btn = document.getElementById('scr-finalize-btn');
+    const msg = document.getElementById('scr-pending-msg');
+
+    if (pendingCount === 0) {
+        btn.disabled = false;
+        msg.style.display = 'none';
+    } else {
+        btn.disabled = true;
+        msg.style.display = 'block';
+        msg.innerHTML = '<strong>Note:</strong> ' + pendingCount + ' item(s) still pending. You must approve or reject all items before finalizing.';
+    }
+}
+
+function scrShowSerialModal(idx) {
+    const d = _scrDiscrepancies[idx];
+    if (!d || !d.serialized) return;
+
+    document.getElementById('scr-serial-modal-title').textContent = escHtml(d.itemName) + ' - Serial Discrepancies';
+
+    let html = '<div style="padding:16px;">';
+
+    // Serials in NetSuite (Expected)
+    html += '<div style="margin-bottom:16px;">';
+    html += '<div style="font-weight:600; margin-bottom:8px; color:var(--primary);">Serials in NetSuite (' + d.expectedSerials.length + ')</div>';
+    if (d.expectedSerials.length > 0) {
+        html += '<div style="max-height:120px; overflow-y:auto; background:var(--surface); padding:8px; border-radius:6px; font-size:12px;">';
+        d.expectedSerials.forEach(sn => {
+            const isMissing = d.missingSerials.includes(sn);
+            const style = isMissing ? 'color:var(--danger); font-weight:500;' : 'color:var(--success);';
+            const icon = isMissing ? '✗' : '✓';
+            html += '<div style="padding:2px 0;' + style + '">' + icon + ' ' + escHtml(sn) + (isMissing ? ' <em>(not scanned)</em>' : '') + '</div>';
+        });
+        html += '</div>';
+    } else {
+        html += '<div style="color:var(--text-dim); font-size:12px;">None</div>';
+    }
+    html += '</div>';
+
+    // Serials Scanned
+    html += '<div style="margin-bottom:16px;">';
+    html += '<div style="font-weight:600; margin-bottom:8px; color:var(--primary);">Serials Scanned (' + d.countedSerials.length + ')</div>';
+    if (d.countedSerials.length > 0) {
+        html += '<div style="max-height:120px; overflow-y:auto; background:var(--surface); padding:8px; border-radius:6px; font-size:12px;">';
+        d.countedSerials.forEach(sn => {
+            const isExtra = d.extraSerials.includes(sn);
+            const style = isExtra ? 'color:var(--warning); font-weight:500;' : 'color:var(--success);';
+            const icon = isExtra ? '+' : '✓';
+            html += '<div style="padding:2px 0;' + style + '">' + icon + ' ' + escHtml(sn) + (isExtra ? ' <em>(not in NetSuite)</em>' : '') + '</div>';
+        });
+        html += '</div>';
+    } else {
+        html += '<div style="color:var(--text-dim); font-size:12px;">None scanned</div>';
+    }
+    html += '</div>';
+
+    // Summary
+    html += '<div style="padding:12px; background:var(--surface-hover); border-radius:8px;">';
+    html += '<div style="font-weight:600; margin-bottom:8px;">Summary</div>';
+    if (d.missingSerials.length > 0) {
+        html += '<div style="color:var(--danger); font-size:12px;">• ' + d.missingSerials.length + ' serial(s) in NetSuite but NOT scanned (will be removed if approved)</div>';
+    }
+    if (d.extraSerials.length > 0) {
+        html += '<div style="color:var(--warning); font-size:12px;">• ' + d.extraSerials.length + ' serial(s) scanned but NOT in NetSuite (will be added if approved)</div>';
+    }
+    html += '</div>';
+
+    html += '</div>';
+
+    document.getElementById('scr-serial-modal-body').innerHTML = html;
+    document.getElementById('scr-serial-modal').classList.add('open');
+}
+
+function scrCloseSerialModal() {
+    document.getElementById('scr-serial-modal').classList.remove('open');
+}
+
+async function scrFinalizeCount() {
+    // Get approved items that have discrepancies
+    const approvedDiscrepancies = [];
+    _scrDiscrepancies.forEach((d, idx) => {
+        if (d.hasDiscrepancy && _scrItemStates[idx] === 'approved') {
+            approvedDiscrepancies.push(d);
+        }
+    });
+
+    // Check if all items are handled
+    const pendingCount = _scrItemStates.filter(s => s === 'pending').length;
+    if (pendingCount > 0) {
+        toast('Please approve or reject all items before finalizing.', 'warning');
+        return;
+    }
+
+    const btn = document.getElementById('scr-finalize-btn');
+    _btnWait(btn);
+    showProcessing('Finalizing stock count...');
+
+    try {
+        // Only create adjustments for approved items
+        if (approvedDiscrepancies.length > 0) {
+            const adjustments = approvedDiscrepancies.map(d => ({
+                itemId: d.itemId,
+                itemName: d.itemName,
+                serialized: d.serialized,
+                addSerials: d.extraSerials || [],
+                removeSerials: d.missingSerials || [],
+                adjustQty: d.serialized ? 0 : d.qtyDifference
+            }));
+
+            const data = await apiPost('createStockCountAdjustment', {
+                stockCountId: _scrData.id,
+                locationId: _scrData.locationId,
+                binId: _scrData.binId,
+                adjustments: adjustments
+            });
+
+            if (data.success) {
+                toast('Inventory adjustment created: ' + (data.tranId || data.adjustmentId), 'success');
+            } else {
+                toast(data.message || 'Failed to create adjustment.', 'error');
+                return;
+            }
+        } else {
+            // No adjustments needed - just mark the count as approved
+            const data = await apiPost('updateStockCount', {
+                id: _scrData.id,
+                status: 'approved'
+            });
+
+            if (data.success) {
+                toast('Count finalized. No adjustments needed.', 'success');
+            } else {
+                toast(data.message || 'Failed to finalize count.', 'error');
+                return;
+            }
+        }
+
+        navigateTo('sc-dashboard');
+        scdLoadStockCounts();
+    } catch (err) {
+        toast('Error: ' + err.message, 'error');
+    } finally {
+        _btnReset(btn);
+        hideProcessing();
+    }
+}
+
+function scrViewApproved(id) {
+    // For viewing already-approved counts, just show the review screen in read-only mode
+    scrStartReview(id);
+}
+
+// ═══════════════════════════════════════════════════════════
 //  INIT
 // ═══════════════════════════════════════════════════════════
 (async function init() {
     // Set initial padding for warehouse view (default)
     document.querySelector('.main').style.padding = '0';
 
-    await Promise.all([initCreateForm(), initSearchForm(), initPOForm(), initIRForm(), initPORcvForm(), initSOPickForm()]);
+    await Promise.all([initCreateForm(), initSearchForm(), initPOForm(), initIRForm(), initPORcvForm(), initSOPickForm(), initStockCountForm()]);
     // Dashboard loads lazily on first nav click (warehouse is default view)
 
     // Also populate search bin dropdown

@@ -174,6 +174,10 @@ define([
                     return respondJson(context, pickSOItems(JSON.parse(context.request.body)));
                 case 'getBinInventory':
                     return respondJson(context, getBinInventory(context.request.parameters));
+                case 'getBinContents':
+                    return respondJson(context, getBinContents(context.request.parameters));
+                case 'executeBulkBinTransfer':
+                    return respondJson(context, executeBulkBinTransfer(JSON.parse(context.request.body)));
                 case 'printReceiptLabels': {
                     const labelDataRaw = context.request.parameters.labelData;
                     const recordId = context.request.parameters.recordId || '';
@@ -530,7 +534,211 @@ define([
     };
 
     // ═══════════════════════════════════════════════════════════
+    //  HELPER: Find a bin by its bin number within a location
+    //  Module-scoped version (the warehouse handler has its own).
+    // ═══════════════════════════════════════════════════════════
+    const findBinByNumberAtLocation = (binNumber, locationId) => {
+        let result = null;
+        try {
+            search.create({
+                type: 'bin',
+                filters: [['binnumber', 'is', binNumber.trim()], 'AND', ['location', 'anyof', locationId]],
+                columns: ['internalid', 'binnumber']
+            }).run().each(r => {
+                result = { id: r.getValue('internalid'), binnumber: r.getValue('binnumber') };
+                return false;
+            });
+        } catch (e) { log.error('findBinByNumberAtLocation Error', e.message); }
+        return result;
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  BIN TRANSFER (ALL) — Get contents of a single bin
+    //  Returns every item in the bin grouped by item, with:
+    //    - serials[] for serialized items
+    //    - statusBuckets[] (qty per status) for non-serialized items
+    //  One inventorybalance search regardless of item count.
+    // ═══════════════════════════════════════════════════════════
+    const getBinContents = (params) => {
+        const locationId = params.locationId;
+        let binId = params.binId;
+        const binNumber = params.binNumber;
+        if (!locationId) return { success: false, message: 'Location is required.' };
+        if (!binId && !binNumber) return { success: false, message: 'Bin is required.' };
+
+        // Resolve bin number → id if only a name was given (scanner / typed)
+        let binName = '';
+        if (!binId && binNumber) {
+            const found = findBinByNumberAtLocation(binNumber, locationId);
+            if (!found) return { success: false, message: 'Bin "' + binNumber + '" not found in this warehouse.' };
+            binId = found.id;
+            binName = found.binnumber;
+        }
+
+        const itemsMap = {}; // itemId -> { itemId, itemName, isSerialized, totalQty, serials, statusBuckets }
+        try {
+            search.create({
+                type: 'inventorybalance',
+                filters: [
+                    ['location', 'anyof', [locationId]], 'AND',
+                    ['binnumber', 'anyof', [binId]], 'AND',
+                    ['onhand', 'greaterthan', 0]
+                ],
+                columns: [
+                    search.createColumn({ name: 'item' }),
+                    search.createColumn({ name: 'inventorynumber' }),
+                    search.createColumn({ name: 'onhand' }),
+                    search.createColumn({ name: 'status' }),
+                    search.createColumn({ name: 'binnumber' })
+                ]
+            }).run().each(r => {
+                const itemId   = String(r.getValue({ name: 'item' }));
+                const itemText = r.getText({ name: 'item' }) || itemId;
+                const serial   = r.getText({ name: 'inventorynumber' }) || '';
+                const qty      = parseFloat(r.getValue({ name: 'onhand' })) || 0;
+                const statusId = r.getValue({ name: 'status' }) || '';
+                const statusText = r.getText({ name: 'status' }) || '';
+                if (qty <= 0) return true;
+                if (!binName) binName = r.getText({ name: 'binnumber' }) || '';
+
+                if (!itemsMap[itemId]) {
+                    itemsMap[itemId] = {
+                        itemId, itemName: itemText, isSerialized: false,
+                        totalQty: 0, serials: [], statusBuckets: {}
+                    };
+                }
+                const it = itemsMap[itemId];
+                if (serial) {
+                    it.isSerialized = true;
+                    it.serials.push(serial);
+                    it.totalQty += qty; // qty per serial row is 1
+                } else {
+                    it.totalQty += qty;
+                    const key = statusId || '_default';
+                    if (!it.statusBuckets[key]) it.statusBuckets[key] = { statusId: statusId || '', statusText, qty: 0 };
+                    it.statusBuckets[key].qty += qty;
+                }
+                return true;
+            });
+        } catch (e) {
+            log.debug('getBinContents error', e.message);
+            return { success: false, message: 'Could not query bin contents: ' + e.message };
+        }
+
+        // Flatten statusBuckets to array; sort items by qty desc; trim serial dups.
+        const items = Object.values(itemsMap).map(it => {
+            it.statusBuckets = Object.values(it.statusBuckets);
+            if (it.isSerialized) it.serials = Array.from(new Set(it.serials));
+            return it;
+        }).sort((a, b) => b.totalQty - a.totalQty);
+
+        return { success: true, binId, binName, items };
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  BIN TRANSFER (ALL) — Execute bulk bin transfer
+    //  Creates ONE Bin Transfer record with multiple item lines.
+    //  Each item handled by type:
+    //    - serialized: one inventoryassignment per serial (NS auto-resolves
+    //      the from-bin from the serial's current location)
+    //    - non-serialized: one inventoryassignment per status bucket so
+    //      mixed-status stock in the same bin is preserved correctly
+    // ═══════════════════════════════════════════════════════════
+    const executeBulkBinTransfer = (data) => {
+        if (!data.locationId) return { success: false, message: 'Location is required.' };
+        if (!data.fromBinId)  return { success: false, message: 'Source bin is required.' };
+        if (!data.toBinId)    return { success: false, message: 'Destination bin is required.' };
+        if (String(data.fromBinId) === String(data.toBinId)) {
+            return { success: false, message: 'Source and destination bins must be different.' };
+        }
+        if (!data.items || !data.items.length) return { success: false, message: 'No items selected for transfer.' };
+
+        const bt = record.create({ type: record.Type.BIN_TRANSFER, isDynamic: true });
+        bt.setValue({ fieldId: 'subsidiary', value: '1' });
+        bt.setValue({ fieldId: 'location',   value: parseInt(data.locationId) });
+        bt.setValue({ fieldId: 'memo',       value: data.memo || 'Bulk Bin Transfer' });
+
+        let totalUnits = 0;
+        let totalItems = 0;
+        const skipped  = [];
+
+        data.items.forEach(item => {
+            if (!item.itemId) return;
+
+            if (item.isSerialized) {
+                const serials = (item.serials || []).map(s => (s || '').trim()).filter(Boolean);
+                if (!serials.length) { skipped.push(item.itemName + ' (no serials)'); return; }
+
+                bt.selectNewLine({ sublistId: 'inventory' });
+                bt.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'item',     value: parseInt(item.itemId) });
+                bt.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'quantity', value: serials.length });
+                const invDetail = bt.getCurrentSublistSubrecord({ sublistId: 'inventory', fieldId: 'inventorydetail' });
+                serials.forEach(s => {
+                    invDetail.selectNewLine({ sublistId: 'inventoryassignment' });
+                    invDetail.setCurrentSublistText({  sublistId: 'inventoryassignment', fieldId: 'issueinventorynumber', text: s });
+                    invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity',             value: 1 });
+                    invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'tobinnumber',          value: parseInt(data.toBinId) });
+                    invDetail.commitLine({ sublistId: 'inventoryassignment' });
+                });
+                bt.commitLine({ sublistId: 'inventory' });
+                totalUnits += serials.length;
+                totalItems += 1;
+            } else {
+                // Non-serialized: use the status buckets from getBinContents so
+                // mixed-status stock in the same bin is preserved.
+                const buckets = (item.statusBuckets && item.statusBuckets.length)
+                    ? item.statusBuckets
+                    : [{ statusId: '', qty: parseFloat(item.quantity) || 0 }];
+                const totalForItem = buckets.reduce((s, b) => s + (parseFloat(b.qty) || 0), 0);
+                if (totalForItem <= 0) { skipped.push(item.itemName + ' (qty 0)'); return; }
+
+                bt.selectNewLine({ sublistId: 'inventory' });
+                bt.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'item',     value: parseInt(item.itemId) });
+                bt.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'quantity', value: totalForItem });
+                const invDetail = bt.getCurrentSublistSubrecord({ sublistId: 'inventory', fieldId: 'inventorydetail' });
+                buckets.forEach(bk => {
+                    const bqty = parseFloat(bk.qty) || 0;
+                    if (bqty <= 0) return;
+                    invDetail.selectNewLine({ sublistId: 'inventoryassignment' });
+                    invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity',    value: bqty });
+                    invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber',   value: parseInt(data.fromBinId) });
+                    invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'tobinnumber', value: parseInt(data.toBinId) });
+                    if (bk.statusId) {
+                        invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'inventorystatus', value: parseInt(bk.statusId) });
+                    }
+                    invDetail.commitLine({ sublistId: 'inventoryassignment' });
+                });
+                bt.commitLine({ sublistId: 'inventory' });
+                totalUnits += totalForItem;
+                totalItems += 1;
+            }
+        });
+
+        if (totalItems === 0) {
+            return { success: false, message: 'No valid items to transfer. ' + (skipped.length ? ('Skipped: ' + skipped.join(', ')) : '') };
+        }
+
+        const btId = bt.save({ enableSourcing: true, ignoreMandatoryFields: false });
+        let btTranId = String(btId);
+        try {
+            const lk = search.lookupFields({ type: record.Type.BIN_TRANSFER, id: btId, columns: ['tranid'] });
+            btTranId = lk.tranid || String(btId);
+        } catch (e) { /* fall back to internal id */ }
+
+        return {
+            success: true,
+            message: 'Bin transfer ' + btTranId + ' created. ' + totalItems + ' item(s), ' + totalUnits + ' unit(s) moved.'
+                     + (skipped.length ? ' Skipped: ' + skipped.join(', ') : ''),
+            transferId: btId,
+            tranId: btTranId,
+            itemCount: totalItems,
+            unitCount: totalUnits
+        };
+    };
+
+    // ═══════════════════════════════════════════════════════════
     //  HELPER: Get Inventory Number internal ID from serial string
+    //  (existing — kept below the bulk-transfer helpers above)
     // ═══════════════════════════════════════════════════════════
     const getInventoryNumberId = (itemId, serialNumber) => {
         const srch = search.create({
@@ -570,6 +778,83 @@ define([
             return true;
         });
         return idMap;
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  PRE-FLIGHT: VALIDATE SERIALS ARE IN STOCK
+    //  Catches typos, already-shipped serials, and depleted serials
+    //  BEFORE NetSuite barfs with a generic "inventory detail" error.
+    //  Returns [] if everything is fine, otherwise:
+    //    [{ itemId, itemText, serials: [missing serials] }]
+    // ═══════════════════════════════════════════════════════════
+    const validateSerialsInStock = (linesToPick) => {
+        // Collect submitted serials grouped by item, deduped.
+        const byItem = {}; // itemId -> Set<serial>
+        linesToPick.forEach(l => {
+            if (l.isKit && l.components) {
+                l.components.forEach(comp => {
+                    if (comp.isSerialized && comp.serialNumbers && comp.serialNumbers.length) {
+                        if (!byItem[comp.itemId]) byItem[comp.itemId] = new Set();
+                        comp.serialNumbers.forEach(s => { const t = (s || '').trim(); if (t) byItem[comp.itemId].add(t); });
+                    }
+                });
+            } else if (l.isSerialized && l.serialNumbers && l.serialNumbers.length) {
+                if (!byItem[l.itemId]) byItem[l.itemId] = new Set();
+                l.serialNumbers.forEach(s => { const t = (s || '').trim(); if (t) byItem[l.itemId].add(t); });
+            }
+        });
+
+        const offenders = [];
+        const BATCH = 50; // NS filter chains over ~100 conditions get unreliable
+
+        Object.keys(byItem).forEach(itemId => {
+            const serialList = Array.from(byItem[itemId]);
+            if (!serialList.length) return;
+
+            const inStockSet = new Set();
+            let itemText = '';
+
+            for (let offset = 0; offset < serialList.length; offset += BATCH) {
+                const batch = serialList.slice(offset, offset + BATCH);
+                const filterExpr = [];
+                batch.forEach((s, i) => {
+                    if (i > 0) filterExpr.push('OR');
+                    filterExpr.push(['inventorynumber', 'is', s]);
+                });
+                try {
+                    search.create({
+                        type: 'inventorynumber',
+                        filters: [['item', 'anyof', [itemId]], 'AND', filterExpr],
+                        columns: [
+                            search.createColumn({ name: 'inventorynumber' }),
+                            search.createColumn({ name: 'quantityonhand' }),
+                            search.createColumn({ name: 'item' })
+                        ]
+                    }).run().each(r => {
+                        const sn = (r.getValue({ name: 'inventorynumber' }) || '').trim();
+                        const qty = parseFloat(r.getValue({ name: 'quantityonhand' })) || 0;
+                        if (sn && qty > 0) inStockSet.add(sn);
+                        if (!itemText) itemText = r.getText({ name: 'item' }) || '';
+                        return true;
+                    });
+                } catch (e) {
+                    log.debug('validateSerialsInStock batch failed for item ' + itemId, e.message);
+                }
+            }
+
+            // Fallback for item label if no rows came back at all.
+            if (!itemText) {
+                try {
+                    const meta = search.lookupFields({ type: search.Type.ITEM, id: itemId, columns: ['itemid'] });
+                    itemText = meta.itemid || ('Item ' + itemId);
+                } catch (e) { itemText = 'Item ' + itemId; }
+            }
+
+            const missing = serialList.filter(s => !inStockSet.has(s));
+            if (missing.length) offenders.push({ itemId, itemText, serials: missing });
+        });
+
+        return offenders;
     };
 
     // ═══════════════════════════════════════════════════════════
@@ -1768,6 +2053,25 @@ define([
         if (!data.soId) return { success: false, message: 'Sales Order ID is required.' };
         if (!data.lines || !data.lines.length) return { success: false, message: 'No lines selected for picking.' };
 
+        // ── Pre-flight: verify every submitted serial actually has on-hand stock ──
+        // Catches typos, already-shipped serials, and depleted serials so the user
+        // gets a clear message instead of NetSuite's generic "inventory detail" error.
+        const notInStock = validateSerialsInStock(data.lines);
+        if (notInStock.length) {
+            // Build a readable message. Truncate per-item lists past 10 to keep the
+            // toast manageable; full list still ships back in `notInStock`.
+            const fmt = notInStock.map(g => {
+                const shown = g.serials.slice(0, 10).join(', ');
+                const extra = g.serials.length > 10 ? ' (+' + (g.serials.length - 10) + ' more)' : '';
+                return g.itemText + ' \u2192 ' + shown + extra;
+            }).join('  |  ');
+            return {
+                success: false,
+                message: 'Cannot fulfill \u2014 these serials are not in stock: ' + fmt,
+                notInStock
+            };
+        }
+
         const fulfillment = record.transform({
             fromType: record.Type.SALES_ORDER,
             fromId: data.soId,
@@ -1778,11 +2082,17 @@ define([
         const pickQueue = {};
         data.lines.forEach(l => {
             if (l.isKit && l.components) {
-                // For kit lines expand to individual components
+                // Kit parent line on the IF sublist carries the `itemreceive` checkbox.
+                // Without an entry for it the parent row gets unchecked and NetSuite drops
+                // the entire kit (yielding "You must enter at least one line item").
+                const parentKey = String(l.itemId);
+                if (!pickQueue[parentKey]) pickQueue[parentKey] = [];
+                pickQueue[parentKey].push({ _kitParent: true, itemId: l.itemId });
+                // Components carry the inventory detail (bin / serial assignments).
                 l.components.forEach(comp => {
                     const key = String(comp.itemId);
                     if (!pickQueue[key]) pickQueue[key] = [];
-                    pickQueue[key].push(comp);
+                    pickQueue[key].push(Object.assign({ _isKitComponent: true }, comp));
                 });
             } else {
                 const key = String(l.itemId);
@@ -1801,6 +2111,43 @@ define([
 
             if (!matchedLine) {
                 fulfillment.setCurrentSublistValue({ sublistId: 'item', fieldId: 'itemreceive', value: false });
+            } else if (matchedLine._kitParent) {
+                // Kit parent line — just check it in. The transform already set the kit qty
+                // from the SO; the per-component bin/serial assignments live on the
+                // component lines below.
+                fulfillment.setCurrentSublistValue({ sublistId: 'item', fieldId: 'itemreceive', value: true });
+            } else if (matchedLine._isKitComponent) {
+                // Kit component line — itemreceive and quantity are managed by the parent
+                // kit row and are read-only here. We only touch inventory detail.
+                try {
+                    const invDetail = fulfillment.getCurrentSublistSubrecord({ sublistId: 'item', fieldId: 'inventorydetail' });
+                    const existingLines = invDetail.getLineCount({ sublistId: 'inventoryassignment' });
+                    for (let x = existingLines - 1; x >= 0; x--) {
+                        try { invDetail.removeLine({ sublistId: 'inventoryassignment', line: x }); } catch (re) { /* pre-populated line may not be removable */ }
+                    }
+                    if (matchedLine.isSerialized) {
+                        const serialIdMap = bulkGetInventoryNumberIds(matchedLine.itemId, matchedLine.serialNumbers);
+                        matchedLine.serialNumbers.forEach(serial => {
+                            const numId = serialIdMap[serial.trim()];
+                            if (!numId) { log.debug('SO Picking (kit comp): serial not found in inventory: ' + serial); return; }
+                            try {
+                                invDetail.selectNewLine({ sublistId: 'inventoryassignment' });
+                                invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity', value: 1 });
+                                invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'issueinventorynumber', value: numId });
+                                invDetail.commitLine({ sublistId: 'inventoryassignment' });
+                            } catch (se) { log.debug('SO Picking (kit comp): serial assignment failed for ' + serial, se.message); }
+                        });
+                    } else {
+                        const compQty = parseFloat(matchedLine.quantity) || 0;
+                        invDetail.selectNewLine({ sublistId: 'inventoryassignment' });
+                        invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity', value: compQty });
+                        if (matchedLine.binId) invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', value: parseInt(matchedLine.binId) });
+                        if (matchedLine.inventoryStatusId) invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'inventorystatus', value: parseInt(matchedLine.inventoryStatusId) });
+                        invDetail.commitLine({ sublistId: 'inventoryassignment' });
+                    }
+                } catch (invErr) {
+                    log.debug('SO Picking: Kit component inventory detail not available for line ' + i, invErr.message);
+                }
             } else {
                 fulfillment.setCurrentSublistValue({ sublistId: 'item', fieldId: 'itemreceive', value: true });
                 const requestedQty = matchedLine.isSerialized ? matchedLine.serialNumbers.length : (parseFloat(matchedLine.quantity) || 0);
@@ -1870,33 +2217,87 @@ define([
         const locationId = params.locationId;
         if (!itemId || !locationId) return { success: false, message: 'Item and location are required.' };
 
-        const binMap = {};
+        // ── Detect kit ───────────────────────────────────────────
+        // Kits don't have inventory of their own — only their components do.
+        // If this is a kit, expand to the member items and return their bin
+        // balances grouped by component.
+        let itemType = '';
+        try {
+            const meta = search.lookupFields({ type: search.Type.ITEM, id: itemId, columns: ['type'] });
+            itemType = (meta && meta.type && meta.type[0] && meta.type[0].value) || '';
+        } catch (e) { /* fall through, treat as regular item */ }
+
+        const isKit = (itemType === 'Kit' || itemType === 'kit');
+
+        // Build list of item IDs to actually query inventory for, plus a map
+        // from item id -> { name, qtyPerKit } so we can label/group results.
+        const lookupItems = [];   // [itemId]
+        const itemLabel   = {};   // itemId -> displayName
+        const itemQtyPer  = {};   // itemId -> qty per kit (for kits only)
+
+        if (isKit) {
+            try {
+                const kitRec = record.load({ type: 'kititem', id: parseInt(itemId) });
+                const memberCount = kitRec.getLineCount({ sublistId: 'member' });
+                for (let m = 0; m < memberCount; m++) {
+                    const compId   = String(kitRec.getSublistValue({ sublistId: 'member', fieldId: 'item', line: m }));
+                    const compText = kitRec.getSublistText({ sublistId: 'member', fieldId: 'item', line: m }) || compId;
+                    const compQty  = parseFloat(kitRec.getSublistValue({ sublistId: 'member', fieldId: 'quantity', line: m })) || 1;
+                    if (!lookupItems.includes(compId)) lookupItems.push(compId);
+                    itemLabel[compId]  = compText;
+                    itemQtyPer[compId] = compQty;
+                }
+            } catch (e) {
+                log.debug('getBinInventory: failed to load kit components for ' + itemId, e.message);
+                return { success: false, message: 'Could not load kit components: ' + e.message };
+            }
+            if (!lookupItems.length) {
+                return { success: true, results: [], isKit: true, message: 'Kit has no components.' };
+            }
+        } else {
+            lookupItems.push(String(itemId));
+        }
+
+        // ── One inventorybalance search across all target items ──
+        const grouped = {}; // itemId -> { component, qtyPerKit, rows: { binName -> {bin, qtyOH, qtyAvail} } }
+        lookupItems.forEach(id => {
+            grouped[id] = {
+                component: itemLabel[id] || '',
+                qtyPerKit: itemQtyPer[id] || 0,
+                rows: {}
+            };
+        });
+
         try {
             search.create({
                 type: 'inventorybalance',
                 filters: [
                     ['item.isinactive', 'is', 'F'],
                     'AND',
-                    ['item', 'anyof', [itemId]],
+                    ['item', 'anyof', lookupItems],
                     'AND',
                     ['location', 'anyof', [locationId]]
                 ],
                 columns: [
+                    search.createColumn({ name: 'item' }),
                     search.createColumn({ name: 'binnumber' }),
                     search.createColumn({ name: 'onhand' }),
                     search.createColumn({ name: 'available' })
                 ]
             }).run().each(r => {
-                const binName  = r.getText({ name: 'binnumber' }) || r.getValue({ name: 'binnumber' }) || '(No Bin)';
-                const qtyOH    = parseFloat(r.getValue({ name: 'onhand' })) || 0;
-                const qtyAvail = parseFloat(r.getValue({ name: 'available' })) || qtyOH;
-                if (qtyOH > 0) {
-                    if (binMap[binName]) {
-                        binMap[binName].qtyOH    += qtyOH;
-                        binMap[binName].qtyAvail += qtyAvail;
-                    } else {
-                        binMap[binName] = { bin: binName, qtyOH, qtyAvail };
-                    }
+                const rowItemId = String(r.getValue({ name: 'item' }));
+                const binName   = r.getText({ name: 'binnumber' }) || r.getValue({ name: 'binnumber' }) || '(No Bin)';
+                const qtyOH     = parseFloat(r.getValue({ name: 'onhand' })) || 0;
+                const qtyAvail  = parseFloat(r.getValue({ name: 'available' })) || qtyOH;
+                if (qtyOH <= 0) return true;
+
+                const group = grouped[rowItemId];
+                if (!group) return true;
+                if (group.rows[binName]) {
+                    group.rows[binName].qtyOH    += qtyOH;
+                    group.rows[binName].qtyAvail += qtyAvail;
+                } else {
+                    group.rows[binName] = { bin: binName, qtyOH, qtyAvail };
                 }
                 return true;
             });
@@ -1905,8 +2306,24 @@ define([
             return { success: false, message: 'Could not retrieve bin inventory: ' + e.message };
         }
 
-        const results = Object.values(binMap).sort((a, b) => b.qtyOH - a.qtyOH);
-        return { success: true, results };
+        // ── Flatten ──────────────────────────────────────────────
+        // For regular items: return a flat array (back-compat with old client).
+        // For kits: tag each row with `component` and `qtyPerKit` so the client
+        // can render a subheader per component.
+        const results = [];
+        lookupItems.forEach(id => {
+            const group = grouped[id];
+            const rows = Object.values(group.rows).sort((a, b) => b.qtyOH - a.qtyOH);
+            if (isKit) {
+                rows.forEach(row => {
+                    results.push(Object.assign({ component: group.component, qtyPerKit: group.qtyPerKit }, row));
+                });
+            } else {
+                rows.forEach(row => results.push(row));
+            }
+        });
+
+        return { success: true, results, isKit };
     };
 
 
@@ -6642,6 +7059,65 @@ tr:hover td { background:var(--surface-hover); }
 /* ─── HAMBURGER (unused with bottom nav) ─── */
 .hamburger { display:none !important; }
 
+/* ─── HOME BUTTON (always visible in topbar) ─── */
+.btn-home {
+    display:inline-flex; align-items:center; gap:6px;
+    height:34px; padding:0 12px; border-radius:8px;
+    border:1px solid var(--border); background:var(--surface);
+    color:var(--text); font-size:13px; font-weight:600; cursor:pointer;
+    transition:all .12s; -webkit-tap-highlight-color:transparent;
+    touch-action:manipulation;
+}
+.btn-home:hover, .btn-home:active { background:var(--accent-glow); border-color:var(--accent); color:var(--accent); }
+.btn-home svg { width:16px; height:16px; }
+.btn-home .btn-home-label { white-space:nowrap; }
+
+/* ─── HOME / LAUNCHER TILES ─── */
+.home-hero {
+    background:linear-gradient(135deg, var(--accent), var(--accent-hover));
+    border-radius:14px; padding:22px 24px; color:#fff;
+    margin-bottom:18px;
+}
+.home-hero-title { font-size:20px; font-weight:700; letter-spacing:-.2px; }
+.home-hero-sub { font-size:13px; opacity:.9; margin-top:4px; }
+
+.home-section { margin-bottom:20px; }
+.home-section-title {
+    font-size:11px; font-weight:700; color:var(--text-dim);
+    text-transform:uppercase; letter-spacing:.1em;
+    margin:0 4px 10px;
+}
+.home-tiles {
+    display:grid;
+    grid-template-columns:repeat(auto-fill, minmax(160px, 1fr));
+    gap:12px;
+}
+.home-tile {
+    display:flex; flex-direction:column; align-items:flex-start;
+    background:var(--surface); border:1px solid var(--border);
+    border-radius:12px; padding:16px; cursor:pointer;
+    transition:transform .12s, box-shadow .12s, border-color .12s;
+    -webkit-tap-highlight-color:transparent; touch-action:manipulation;
+    text-align:left; min-height:104px;
+}
+.home-tile:hover { border-color:var(--accent); box-shadow:0 4px 14px rgba(59,130,246,.12); transform:translateY(-1px); }
+.home-tile:active { transform:translateY(0); }
+.home-tile-icon {
+    width:36px; height:36px; border-radius:9px;
+    display:flex; align-items:center; justify-content:center;
+    background:var(--accent-glow); color:var(--accent);
+    margin-bottom:10px;
+}
+.home-tile-icon svg { width:20px; height:20px; }
+.home-tile.tile-warehouse .home-tile-icon { background:rgba(217,119,6,.1); color:var(--warning); }
+.home-tile.tile-receive   .home-tile-icon { background:rgba(22,163,74,.1); color:var(--success); }
+.home-tile.tile-pick      .home-tile-icon { background:rgba(59,130,246,.1); color:var(--accent); }
+.home-tile.tile-putaway   .home-tile-icon { background:rgba(168,85,247,.1); color:#a855f7; }
+.home-tile.tile-print     .home-tile-icon { background:rgba(220,38,38,.1); color:var(--danger); }
+.home-tile.tile-count     .home-tile-icon { background:rgba(14,165,233,.1); color:#0ea5e9; }
+.home-tile-title { font-size:14px; font-weight:700; color:var(--text); }
+.home-tile-sub { font-size:11.5px; color:var(--text-muted); margin-top:2px; line-height:1.35; }
+
 /* ─── SIDEBAR OVERLAY (desktop only) ─── */
 .sidebar-overlay {
     display:none; position:fixed; inset:0; z-index:199;
@@ -6690,38 +7166,49 @@ tr:hover td { background:var(--surface-hover); }
    Optimised for Honeywell CT60 and similar handheld devices
    ═══════════════════════════════════════════════════════════ */
 @media (max-width:768px) {
-    /* ── Topbar ── */
-    .topbar { height:48px; padding:0 14px; }
+    /* ── Viewport guards ── */
+    html, body { overflow-x:hidden; }
+
+    /* ── Topbar (slimmer, room for home button) ── */
+    .topbar { height:48px; padding:0 10px; gap:8px; }
     .topbar-user { display:none; }
+    .topbar-brand { font-size:13px; gap:6px; min-width:0; flex:1; }
+    .topbar-brand svg { width:18px; height:18px; flex-shrink:0; }
+    .topbar-brand-text { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .btn-home { height:36px; padding:0 10px; font-size:12px; }
+    .btn-home .btn-home-label { display:none; }
+    .btn-home svg { width:18px; height:18px; }
 
     /* ── Sidebar → hidden; bottom nav takes over ── */
     .sidebar, .sidebar-overlay { display:none !important; }
 
     /* ── Bottom nav ── */
     .mob-nav {
-        display:flex; position:fixed; bottom:0; left:0; right:0; height:58px;
+        display:flex; position:fixed; bottom:0; left:0; right:0; height:56px;
         z-index:200; background:var(--surface); border-top:1px solid var(--border);
         box-shadow:0 -2px 10px rgba(0,0,0,.08);
+        padding-bottom:env(safe-area-inset-bottom, 0);
     }
     .mob-nav-btn {
         flex:1; display:flex; flex-direction:column; align-items:center;
         justify-content:center; gap:2px; border:none; background:none;
         cursor:pointer; color:var(--text-dim); font-size:10px; font-weight:600;
-        padding:5px 2px; touch-action:manipulation;
+        padding:4px 2px; touch-action:manipulation;
         -webkit-tap-highlight-color:transparent; min-width:0; transition:color .12s;
     }
-    .mob-nav-btn svg { width:22px; height:22px; flex-shrink:0; }
+    .mob-nav-btn svg { width:20px; height:20px; flex-shrink:0; }
     .mob-nav-btn span { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:100%; }
     .mob-nav-btn.active { color:var(--accent); }
     .mob-nav-btn:active { opacity:.6; }
 
     /* ── Main content ── */
-    .main { padding:10px; padding-bottom:70px; max-height:none; }
+    .layout { min-height:calc(100dvh - 48px); }
+    .main { padding:10px; padding-bottom:calc(64px + env(safe-area-inset-bottom, 0)); max-height:none; }
     .main:has(#view-warehouse.active),
     .main:has(#view-printlabel.active),
-    .main:has(#view-binputaway.active) { padding:0 0 58px 0; }
+    .main:has(#view-binputaway.active) { padding:0 0 calc(56px + env(safe-area-inset-bottom, 0)) 0; }
     #view-warehouse iframe, #view-printlabel iframe, #view-binputaway iframe {
-        height:calc(100vh - 48px - 58px);
+        height:calc(100dvh - 48px - 56px); display:block;
     }
 
     /* ── Cards ── */
@@ -6751,6 +7238,19 @@ tr:hover td { background:var(--surface-hover); }
     /* ── Buttons ── */
     .btn { min-height:44px; font-size:14px; padding:0 16px; border-radius:8px; }
     .btn-group { gap:8px; }
+
+    /* ── Home tiles ── */
+    .home-hero { padding:16px 16px; margin-bottom:12px; border-radius:12px; }
+    .home-hero-title { font-size:17px; }
+    .home-hero-sub { font-size:12px; }
+    .home-section { margin-bottom:14px; }
+    .home-section-title { font-size:10px; margin:0 2px 8px; }
+    .home-tiles { grid-template-columns:repeat(2, 1fr); gap:10px; }
+    .home-tile { padding:12px; min-height:96px; border-radius:10px; }
+    .home-tile-icon { width:32px; height:32px; margin-bottom:8px; border-radius:8px; }
+    .home-tile-icon svg { width:18px; height:18px; }
+    .home-tile-title { font-size:13px; }
+    .home-tile-sub { font-size:11px; }
 
     /* ── Layout helpers ── */
     .plate-detail { grid-template-columns:1fr; }
@@ -6818,13 +7318,14 @@ tr:hover td { background:var(--surface-hover); }
 
 <!-- ═══ TOP BAR ═══ -->
 <div class="topbar">
-    <div style="display:flex;align-items:center;gap:8px;">
-        <button class="hamburger" id="hamburger-btn" onclick="toggleMobileMenu()">
-            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+    <div style="display:flex;align-items:center;gap:10px;min-width:0;flex:1;">
+        <button class="btn-home" id="topbar-home-btn" onclick="navigateTo('home')" aria-label="Home" title="Home">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11.5 12 4l9 7.5"/><path d="M5 10v10a1 1 0 0 0 1 1h4v-6h4v6h4a1 1 0 0 0 1-1V10"/></svg>
+            <span class="btn-home-label">Home</span>
         </button>
         <div class="topbar-brand">
-            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="7" width="20" height="14" rx="2"/><path d="M16 7V4a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v3"/><line x1="12" y1="12" x2="12" y2="12.01"/></svg>
-            TelQuest Warehouse
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="22" height="22"><rect x="2" y="7" width="20" height="14" rx="2"/><path d="M16 7V4a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v3"/><line x1="12" y1="12" x2="12" y2="12.01"/></svg>
+            <span class="topbar-brand-text">TelQuest Warehouse</span>
         </div>
     </div>
     <div class="topbar-user">Warehouse Management</div>
@@ -6832,9 +7333,9 @@ tr:hover td { background:var(--surface-hover); }
 
 <!-- ═══ MOBILE BOTTOM NAV ═══ -->
 <nav class="mob-nav" id="mob-nav">
-    <button class="mob-nav-btn active" data-view="warehouse" onclick="mobNavTo('warehouse')">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7V5a2 2 0 0 1 2-2h2"/><path d="M17 3h2a2 2 0 0 1 2 2v2"/><path d="M21 17v2a2 2 0 0 1-2 2h-2"/><path d="M7 21H5a2 2 0 0 1-2-2v-2"/><line x1="7" y1="12" x2="17" y2="12"/></svg>
-        <span>Assistant</span>
+    <button class="mob-nav-btn active" data-view="home" onclick="mobNavTo('home')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11.5 12 4l9 7.5"/><path d="M5 10v10a1 1 0 0 0 1 1h4v-6h4v6h4a1 1 0 0 0 1-1V10"/></svg>
+        <span>Home</span>
     </button>
     <button class="mob-nav-btn" data-view="poreceive" onclick="mobNavTo('poreceive')">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg>
@@ -6858,9 +7359,17 @@ tr:hover td { background:var(--surface-hover); }
 <div class="mob-more-overlay" id="mob-more-overlay" onclick="closeMobMore()"></div>
 <div class="mob-more-drawer" id="mob-more-drawer">
     <div class="mob-more-handle"></div>
+    <div class="mob-more-item" data-view="warehouse" onclick="mobNavTo('warehouse')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7V5a2 2 0 0 1 2-2h2"/><path d="M17 3h2a2 2 0 0 1 2 2v2"/><path d="M21 17v2a2 2 0 0 1-2 2h-2"/><path d="M7 21H5a2 2 0 0 1-2-2v-2"/><line x1="7" y1="12" x2="17" y2="12"/></svg>
+        Warehouse Assistant
+    </div>
     <div class="mob-more-item" data-view="printlabel" onclick="mobNavTo('printlabel')">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 6 2 18 2 18 9"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8"/></svg>
         Print Label
+    </div>
+    <div class="mob-more-item" data-view="bintransferall" onclick="mobNavTo('bintransferall')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/><rect x="9" y="9" width="6" height="6" rx="1"/></svg>
+        Bin Transfer (All)
     </div>
     <div class="mob-more-section">TQ License Plates</div>
     <div class="mob-more-item" data-view="dashboard" onclick="mobNavTo('dashboard')">
@@ -6918,7 +7427,11 @@ tr:hover td { background:var(--surface-hover); }
 
 <!-- ═══ SIDEBAR ═══ -->
 <nav class="sidebar">
-    <div class="nav-item active" data-view="warehouse">
+    <div class="nav-item active" data-view="home">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11.5 12 4l9 7.5"/><path d="M5 10v10a1 1 0 0 0 1 1h4v-6h4v6h4a1 1 0 0 0 1-1V10"/></svg>
+        Home
+    </div>
+    <div class="nav-item" data-view="warehouse">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7V5a2 2 0 0 1 2-2h2"/><path d="M17 3h2a2 2 0 0 1 2 2v2"/><path d="M21 17v2a2 2 0 0 1-2 2h-2"/><path d="M7 21H5a2 2 0 0 1-2-2v-2"/><line x1="7" y1="12" x2="17" y2="12"/></svg>
         Assistant
     </div>
@@ -6937,6 +7450,10 @@ tr:hover td { background:var(--surface-hover); }
     <div class="nav-item" data-view="binputaway">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12"/><path d="M8 11l4 4 4-4"/><rect x="3" y="17" width="18" height="4" rx="1"/></svg>
         Bin Putaway
+    </div>
+    <div class="nav-item" data-view="bintransferall">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/><rect x="9" y="9" width="6" height="6" rx="1"/></svg>
+        Bin Transfer (All)
     </div>
     <div class="nav-group">
         <div class="nav-group-toggle" onclick="toggleNavGroup(this)">
@@ -7009,19 +7526,130 @@ tr:hover td { background:var(--surface-hover); }
 <!-- ═══ MAIN CONTENT ═══ -->
 <div class="main">
 
+<!-- ═══════ HOME / LAUNCHER VIEW ═══════ -->
+<div class="view active" id="view-home">
+    <div class="home-hero">
+        <div class="home-hero-title">Welcome back</div>
+        <div class="home-hero-sub">Pick a workflow to get started</div>
+    </div>
+
+    <div class="home-section">
+        <div class="home-section-title">Warehouse Operations</div>
+        <div class="home-tiles">
+            <button class="home-tile tile-warehouse" onclick="navigateTo('warehouse')">
+                <div class="home-tile-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7V5a2 2 0 0 1 2-2h2"/><path d="M17 3h2a2 2 0 0 1 2 2v2"/><path d="M21 17v2a2 2 0 0 1-2 2h-2"/><path d="M7 21H5a2 2 0 0 1-2-2v-2"/><line x1="7" y1="12" x2="17" y2="12"/></svg></div>
+                <div class="home-tile-title">Assistant</div>
+                <div class="home-tile-sub">Serial actions &amp; transfers</div>
+            </button>
+            <button class="home-tile tile-print" onclick="navigateTo('printlabel')">
+                <div class="home-tile-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 6 2 18 2 18 9"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8"/></svg></div>
+                <div class="home-tile-title">Print Label</div>
+                <div class="home-tile-sub">Reprint item labels</div>
+            </button>
+            <button class="home-tile tile-receive" onclick="navigateTo('poreceive')">
+                <div class="home-tile-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg></div>
+                <div class="home-tile-title">PO Receiving</div>
+                <div class="home-tile-sub">Receive items from POs</div>
+            </button>
+            <button class="home-tile tile-pick" onclick="navigateTo('sopick')">
+                <div class="home-tile-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 5H7a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-2"/><rect x="9" y="3" width="6" height="4" rx="1"/><path d="M9 14l2 2 4-4"/></svg></div>
+                <div class="home-tile-title">SO Picking</div>
+                <div class="home-tile-sub">Pick and fulfill orders</div>
+            </button>
+            <button class="home-tile tile-putaway" onclick="navigateTo('binputaway')">
+                <div class="home-tile-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12"/><path d="M8 11l4 4 4-4"/><rect x="3" y="17" width="18" height="4" rx="1"/></svg></div>
+                <div class="home-tile-title">Bin Putaway</div>
+                <div class="home-tile-sub">Move stock between bins</div>
+            </button>
+            <button class="home-tile" onclick="navigateTo('bintransferall')">
+                <div class="home-tile-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/><rect x="9" y="9" width="6" height="6" rx="1"/></svg></div>
+                <div class="home-tile-title">Bin Transfer (All)</div>
+                <div class="home-tile-sub">Empty a bin into another bin</div>
+            </button>
+        </div>
+    </div>
+
+    <div class="home-section">
+        <div class="home-section-title">TQ License Plates</div>
+        <div class="home-tiles">
+            <button class="home-tile" onclick="navigateTo('dashboard')">
+                <div class="home-tile-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg></div>
+                <div class="home-tile-title">Dashboard</div>
+                <div class="home-tile-sub">All plates overview</div>
+            </button>
+            <button class="home-tile" onclick="navigateTo('scan')">
+                <div class="home-tile-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7V5a2 2 0 0 1 2-2h2"/><path d="M17 3h2a2 2 0 0 1 2 2v2"/><path d="M21 17v2a2 2 0 0 1-2 2h-2"/><path d="M7 21H5a2 2 0 0 1-2-2v-2"/><rect x="9" y="9" width="6" height="6" rx="1"/></svg></div>
+                <div class="home-tile-title">Scan &amp; Lookup</div>
+                <div class="home-tile-sub">Find a plate by QR</div>
+            </button>
+            <button class="home-tile" onclick="navigateTo('create')">
+                <div class="home-tile-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="16"/><line x1="8" y1="12" x2="16" y2="12"/></svg></div>
+                <div class="home-tile-title">Create Plate</div>
+                <div class="home-tile-sub">New license plate</div>
+            </button>
+            <button class="home-tile" onclick="navigateTo('search')">
+                <div class="home-tile-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg></div>
+                <div class="home-tile-title">Search</div>
+                <div class="home-tile-sub">Filter &amp; list plates</div>
+            </button>
+            <button class="home-tile" onclick="navigateTo('transfer')">
+                <div class="home-tile-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg></div>
+                <div class="home-tile-title">Bin Transfer</div>
+                <div class="home-tile-sub">Move a whole plate</div>
+            </button>
+            <button class="home-tile" onclick="navigateTo('fulfill')">
+                <div class="home-tile-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg></div>
+                <div class="home-tile-title">Fulfill SO</div>
+                <div class="home-tile-sub">Plate-based SO fulfill</div>
+            </button>
+            <button class="home-tile" onclick="navigateTo('poimport')">
+                <div class="home-tile-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><line x1="9" y1="15" x2="15" y2="15"/></svg></div>
+                <div class="home-tile-title">Create from PO</div>
+                <div class="home-tile-sub">Plate from PO serials</div>
+            </button>
+            <button class="home-tile" onclick="navigateTo('irimport')">
+                <div class="home-tile-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg></div>
+                <div class="home-tile-title">Create from IR</div>
+                <div class="home-tile-sub">Plate from receipt</div>
+            </button>
+        </div>
+    </div>
+
+    <div class="home-section">
+        <div class="home-section-title">Stock Counts</div>
+        <div class="home-tiles">
+            <button class="home-tile tile-count" onclick="navigateTo('sc-dashboard')">
+                <div class="home-tile-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="9" y1="21" x2="9" y2="9"/></svg></div>
+                <div class="home-tile-title">Dashboard</div>
+                <div class="home-tile-sub">All counts</div>
+            </button>
+            <button class="home-tile tile-count" onclick="navigateTo('sc-pending-review')">
+                <div class="home-tile-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg></div>
+                <div class="home-tile-title">Pending Review</div>
+                <div class="home-tile-sub">Approve counts</div>
+            </button>
+            <button class="home-tile tile-count" onclick="navigateTo('sc-create')">
+                <div class="home-tile-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 5H7a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-2"/><rect x="9" y="3" width="6" height="4" rx="1"/><line x1="9" y1="12" x2="15" y2="12"/><line x1="9" y1="16" x2="12" y2="16"/></svg></div>
+                <div class="home-tile-title">Create Count</div>
+                <div class="home-tile-sub">Start a stock count</div>
+            </button>
+        </div>
+    </div>
+</div>
+
 <!-- ═══════ WAREHOUSE ASSISTANT VIEW ═══════ -->
-<div class="view active" id="view-warehouse">
-    <iframe id="wh-iframe" src="${apiUrl}&action=warehouse" style="width:100%;height:calc(100vh - 56px);border:none;display:block;"></iframe>
+<div class="view" id="view-warehouse">
+    <iframe id="wh-iframe" src="${apiUrl}&action=warehouse" style="width:100%;height:calc(100dvh - 56px);border:none;display:block;"></iframe>
 </div>
 
 <!-- ═══════ PRINT LABEL VIEW ═══════ -->
 <div class="view" id="view-printlabel">
-    <iframe id="pl-iframe" src="${apiUrl}&action=printlabel" style="width:100%;height:calc(100vh - 56px);border:none;display:block;"></iframe>
+    <iframe id="pl-iframe" src="${apiUrl}&action=printlabel" style="width:100%;height:calc(100dvh - 56px);border:none;display:block;"></iframe>
 </div>
 
 <!-- ═══════ BIN PUTAWAY VIEW ═══════ -->
 <div class="view" id="view-binputaway">
-    <iframe id="bp-iframe" src="${apiUrl}&action=binputaway" style="width:100%;height:calc(100vh - 56px);border:none;display:block;"></iframe>
+    <iframe id="bp-iframe" src="${apiUrl}&action=binputaway" style="width:100%;height:calc(100dvh - 56px);border:none;display:block;"></iframe>
 </div>
 
 <!-- ═══════ DASHBOARD VIEW ═══════ -->
@@ -7184,6 +7812,83 @@ tr:hover td { background:var(--surface-hover); }
             <tbody id="search-results"><tr><td colspan="7" style="text-align:center;color:var(--text-dim)">Use the filters above to search</td></tr></tbody>
         </table></div>
         <div id="search-pagination" style="margin-top:12px; display:flex; gap:8px; justify-content:center;"></div>
+    </div>
+</div>
+
+<!-- ═══════ BIN TRANSFER (ALL) VIEW ═══════ -->
+<div class="view" id="view-bintransferall">
+    <div class="page-header">
+        <div><div class="page-title">Bin Transfer (All)</div><div class="page-subtitle">Scan a bin, pick items, and move them to a different bin in one shot</div></div>
+    </div>
+    <div class="card">
+        <div class="form-grid">
+            <div class="form-group">
+                <label class="form-label">Warehouse (Location)</label>
+                <select id="bta-location"></select>
+            </div>
+            <div class="form-group">
+                <label class="form-label">Source Bin *</label>
+                <input type="text" id="bta-source-bin" list="bta-source-bin-datalist" autocomplete="off" placeholder="Scan or type the source bin\u2026">
+                <datalist id="bta-source-bin-datalist"></datalist>
+            </div>
+        </div>
+        <div style="margin-top:14px;display:flex;gap:8px;">
+            <button class="btn btn-primary" onclick="btaLoadContents()" id="bta-load-btn">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+                Load Bin Contents
+            </button>
+            <button class="btn" onclick="btaReset()">Reset</button>
+        </div>
+    </div>
+
+    <div id="bta-contents-section" style="display:none;">
+        <div class="card">
+            <div class="card-title" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+                Items in <span id="bta-bin-name" style="font-weight:700;color:var(--primary);"></span>
+                <span id="bta-item-count" class="badge badge-info" style="font-size:11px;"></span>
+            </div>
+            <div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap;">
+                <button class="btn btn-sm" onclick="btaToggleAll(true)">Select All</button>
+                <button class="btn btn-sm" onclick="btaToggleAll(false)">Deselect All</button>
+                <div style="margin-left:auto;font-size:12px;color:var(--text-muted);align-self:center;">
+                    <span id="bta-selected-count">0</span> selected
+                </div>
+            </div>
+            <div id="bta-items-list"></div>
+        </div>
+
+        <div class="card">
+            <div class="card-title">Transfer To</div>
+            <div class="form-grid">
+                <div class="form-group">
+                    <label class="form-label">Destination Bin *</label>
+                    <input type="text" id="bta-dest-bin" list="bta-dest-bin-datalist" autocomplete="off" placeholder="Scan or type the destination bin\u2026">
+                    <datalist id="bta-dest-bin-datalist"></datalist>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Memo (optional)</label>
+                    <input type="text" id="bta-memo" placeholder="Reason / note">
+                </div>
+            </div>
+            <div style="margin-top:16px;">
+                <button class="btn btn-success" onclick="btaSubmit()" id="bta-submit-btn" style="width:100%;justify-content:center;padding:14px;">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg>
+                    Execute Bin Transfer
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <div class="card" id="bta-success" style="display:none;">
+        <div style="text-align:center;padding:24px;">
+            <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="var(--success)" stroke-width="2" style="margin-bottom:12px;"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg>
+            <div style="font-size:18px;font-weight:700;margin-bottom:4px;">Bin Transfer Created!</div>
+            <div style="font-size:22px;font-weight:800;color:var(--primary);margin:8px 0;" id="bta-success-num"></div>
+            <div style="color:var(--text-muted);font-size:14px;" id="bta-success-msg"></div>
+            <div style="display:flex;gap:10px;justify-content:center;margin-top:16px;flex-wrap:wrap;">
+                <button class="btn" onclick="btaReset()" style="min-width:160px;">New Transfer</button>
+            </div>
+        </div>
     </div>
 </div>
 
@@ -7962,13 +8667,24 @@ async function openStockLookup(itemId, itemName, locationId) {
         body.innerHTML = '<div style="text-align:center;padding:20px;color:var(--text-muted);">No inventory found at this warehouse.</div>';
         return;
     }
-    body.innerHTML = data.results.map(r =>
-        '<div class="stock-sheet-row">' +
-        '<div class="stock-sheet-bin">' + escHtml(r.bin) + '</div>' +
-        '<div class="stock-sheet-qty"><span class="stock-sheet-oh">' + r.qtyOH + ' on hand</span>' +
-        '<span class="stock-sheet-avail">' + r.qtyAvail + ' avail</span></div>' +
-        '</div>'
-    ).join('');
+    // If results are tagged with a 'component' field (kit lookup), insert a
+    // subheader each time the component changes. Regular items render flat.
+    let html = '';
+    let currentComponent = null;
+    data.results.forEach(r => {
+        if (r.component && r.component !== currentComponent) {
+            currentComponent = r.component;
+            const perKit = r.qtyPerKit ? ' <span style="color:var(--text-muted);font-weight:400;">\u00b7 ' + r.qtyPerKit + ' per kit</span>' : '';
+            html += '<div style="padding:10px 16px 6px;font-size:12px;font-weight:700;color:var(--text);background:var(--bg-soft,#f5f7fa);border-bottom:1px solid var(--border);">' + escHtml(currentComponent) + perKit + '</div>';
+        }
+        html +=
+            '<div class="stock-sheet-row">' +
+            '<div class="stock-sheet-bin">' + escHtml(r.bin) + '</div>' +
+            '<div class="stock-sheet-qty"><span class="stock-sheet-oh">' + r.qtyOH + ' on hand</span>' +
+            '<span class="stock-sheet-avail">' + r.qtyAvail + ' avail</span></div>' +
+            '</div>';
+    });
+    body.innerHTML = html;
 }
 
 function closeStockLookup() {
@@ -8729,6 +9445,151 @@ async function executeBinTransfer() {
         }
     } catch (err) { toast('Error: ' + err.message, 'error'); }
     finally { hideProcessing(); }
+}
+
+// ═══════════════════════════════════════════════════════════
+//  BIN TRANSFER (ALL)
+// ═══════════════════════════════════════════════════════════
+let _btaContents = null; // { binId, binName, items: [...] }
+
+function btaReset() {
+    _btaContents = null;
+    document.getElementById('bta-source-bin').value = '';
+    document.getElementById('bta-dest-bin').value = '';
+    document.getElementById('bta-memo').value = '';
+    document.getElementById('bta-items-list').innerHTML = '';
+    document.getElementById('bta-contents-section').style.display = 'none';
+    document.getElementById('bta-success').style.display = 'none';
+    document.getElementById('bta-source-bin').focus();
+}
+
+function btaUpdateSelectedCount() {
+    const checks = document.querySelectorAll('#bta-items-list input[type="checkbox"][data-bta-item]');
+    let n = 0;
+    checks.forEach(c => { if (c.checked) n++; });
+    document.getElementById('bta-selected-count').textContent = n;
+}
+
+function btaToggleAll(state) {
+    document.querySelectorAll('#bta-items-list input[type="checkbox"][data-bta-item]').forEach(c => { c.checked = !!state; });
+    btaUpdateSelectedCount();
+}
+
+async function btaRefreshBins(locationId) {
+    if (!locationId) return;
+    const bins = await loadBins(locationId);
+    ['bta-source-bin-datalist', 'bta-dest-bin-datalist'].forEach(dlId => {
+        const dl = document.getElementById(dlId);
+        if (!dl) return;
+        dl.innerHTML = '';
+        bins.forEach(b => { const opt = document.createElement('option'); opt.value = b.name; dl.appendChild(opt); });
+    });
+}
+
+async function btaLoadContents() {
+    const loadBtn = document.getElementById('bta-load-btn');
+    const locationId = document.getElementById('bta-location').value;
+    const binNumber  = document.getElementById('bta-source-bin').value.trim();
+    if (!locationId) { toast('Select a warehouse.', 'error'); return; }
+    if (!binNumber)  { toast('Enter or scan a source bin.', 'error'); return; }
+
+    document.getElementById('bta-success').style.display = 'none';
+    _btnWait(loadBtn);
+    showProcessing('Loading Bin\u2026', 'Reading on-hand inventory');
+    try {
+        const data = await apiGet('getBinContents', { locationId, binNumber });
+        if (!data.success) { toast(data.message || 'Could not load bin.', 'error'); return; }
+        _btaContents = { binId: data.binId, binName: data.binName, locationId, items: data.items || [] };
+
+        document.getElementById('bta-bin-name').textContent = data.binName || binNumber;
+        document.getElementById('bta-item-count').textContent = (data.items || []).length + ' item(s)';
+
+        const list = document.getElementById('bta-items-list');
+        if (!data.items || !data.items.length) {
+            list.innerHTML = '<div style="text-align:center;padding:24px;color:var(--text-muted);">This bin has no on-hand inventory.</div>';
+        } else {
+            list.innerHTML = data.items.map((it, idx) => {
+                const subtitle = it.isSerialized
+                    ? (it.serials.length + ' serial(s)')
+                    : (it.totalQty + ' unit(s)' + (it.statusBuckets && it.statusBuckets.length > 1 ? ' across ' + it.statusBuckets.length + ' statuses' : ''));
+                const serialPreview = it.isSerialized && it.serials.length
+                    ? '<div style="margin-top:6px;font-size:11px;font-family:var(--mono,monospace);color:var(--text-dim);max-height:60px;overflow-y:auto;word-break:break-all;">' + escHtml(it.serials.slice(0, 8).join(', ')) + (it.serials.length > 8 ? ', \u2026 (+' + (it.serials.length - 8) + ' more)' : '') + '</div>'
+                    : '';
+                return '<label style="display:flex;align-items:flex-start;gap:10px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;margin-bottom:8px;cursor:pointer;background:var(--surface);">' +
+                    '<input type="checkbox" data-bta-item="' + idx + '" checked onchange="btaUpdateSelectedCount()" style="margin-top:3px;flex-shrink:0;">' +
+                    '<div style="flex:1;min-width:0;">' +
+                        '<div style="font-weight:600;font-size:13px;color:var(--text);">' + escHtml(it.itemName) + (it.isSerialized ? ' <span class="badge badge-info" style="font-size:10px;">SERIAL</span>' : '') + '</div>' +
+                        '<div style="font-size:12px;color:var(--text-muted);margin-top:2px;">' + escHtml(subtitle) + '</div>' +
+                        serialPreview +
+                    '</div>' +
+                    '<div style="font-weight:700;font-size:14px;color:var(--primary);align-self:center;flex-shrink:0;">' + it.totalQty + '</div>' +
+                '</label>';
+            }).join('');
+        }
+
+        document.getElementById('bta-contents-section').style.display = 'block';
+        btaUpdateSelectedCount();
+        document.getElementById('bta-dest-bin').focus();
+    } catch (err) { toast('Error: ' + err.message, 'error'); }
+    finally { hideProcessing(); _btnReset(loadBtn); }
+}
+
+async function btaSubmit() {
+    if (!_btaContents) { toast('Load a bin first.', 'error'); return; }
+    const destBinName = document.getElementById('bta-dest-bin').value.trim();
+    if (!destBinName) { toast('Enter a destination bin.', 'error'); return; }
+
+    const locationId = _btaContents.locationId;
+    const bins = _bins[locationId] || [];
+    const match = bins.find(b => b.name === destBinName);
+    if (!match) { toast('Destination bin not found. Pick one from the list.', 'error'); return; }
+    const destBinId = match.id;
+    if (String(destBinId) === String(_btaContents.binId)) { toast('Source and destination bin are the same.', 'error'); return; }
+
+    // Collect selected items
+    const selectedItems = [];
+    document.querySelectorAll('#bta-items-list input[type="checkbox"][data-bta-item]').forEach(c => {
+        if (c.checked) {
+            const idx = parseInt(c.getAttribute('data-bta-item'));
+            const it = _btaContents.items[idx];
+            if (it) selectedItems.push(it);
+        }
+    });
+    if (!selectedItems.length) { toast('Select at least one item.', 'error'); return; }
+
+    const submitBtn = document.getElementById('bta-submit-btn');
+    submitBtn.disabled = true;
+    showProcessing('Creating Bin Transfer\u2026', 'Moving ' + selectedItems.length + ' item(s)');
+    try {
+        const result = await apiPost('executeBulkBinTransfer', {
+            locationId,
+            fromBinId: _btaContents.binId,
+            toBinId:   destBinId,
+            items:     selectedItems,
+            memo:      document.getElementById('bta-memo').value.trim()
+        });
+        if (result.success) {
+            document.getElementById('bta-contents-section').style.display = 'none';
+            document.getElementById('bta-success-num').textContent = result.tranId || '';
+            document.getElementById('bta-success-msg').textContent = result.message || '';
+            document.getElementById('bta-success').style.display = 'block';
+            toast('Bin transfer ' + (result.tranId || '') + ' created.', 'success');
+        } else {
+            toast(result.message || 'Transfer failed.', 'error');
+        }
+    } catch (err) { toast('Error: ' + err.message, 'error'); }
+    finally { hideProcessing(); submitBtn.disabled = false; }
+}
+
+async function initBinTransferAllForm() {
+    const locs = await loadLocations();
+    populateSelect(document.getElementById('bta-location'), locs);
+    document.getElementById('bta-location').value = '1';
+    await btaRefreshBins('1');
+    document.getElementById('bta-location').addEventListener('change', async function() { await btaRefreshBins(this.value); });
+    document.getElementById('bta-source-bin').addEventListener('keydown', e => {
+        if (e.key === 'Enter') { e.preventDefault(); btaLoadContents(); }
+    });
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -10638,7 +11499,7 @@ function scrViewApproved(id) {
     // Set initial padding for warehouse view (default)
     document.querySelector('.main').style.padding = '0';
 
-    await Promise.all([initCreateForm(), initSearchForm(), initPOForm(), initIRForm(), initPORcvForm(), initSOPickForm(), initStockCountForm()]);
+    await Promise.all([initCreateForm(), initSearchForm(), initPOForm(), initIRForm(), initPORcvForm(), initSOPickForm(), initStockCountForm(), initBinTransferAllForm()]);
     // Dashboard loads lazily on first nav click (warehouse is default view)
 
     // Also populate search bin dropdown

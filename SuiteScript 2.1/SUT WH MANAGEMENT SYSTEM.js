@@ -172,8 +172,12 @@ define([
                     return respondJson(context, loadSOForPicking(context.request.parameters.soNumber));
                 case 'pickSOItems':
                     return respondJson(context, pickSOItems(JSON.parse(context.request.body)));
+                case 'validateSerialBatch':
+                    return respondJson(context, validateSerialBatch(JSON.parse(context.request.body)));
                 case 'getBinInventory':
                     return respondJson(context, getBinInventory(context.request.parameters));
+                case 'getBinInventoryForSerials':
+                    return respondJson(context, getBinInventoryForSerials(context.request.parameters));
                 case 'getBinContents':
                     return respondJson(context, getBinContents(context.request.parameters));
                 case 'executeBulkBinTransfer':
@@ -855,6 +859,100 @@ define([
         });
 
         return offenders;
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  REAL-TIME SCAN VALIDATION
+    //  Validates one or more serials against an expected item id and
+    //  returns a categorized result per serial so the UI can tell the
+    //  picker WHY a scan was bad (wrong item / not in stock / typo).
+    //    inStock:        serial exists for expected item with QoH > 0
+    //    reason 'wrong_item':  serial belongs to a different item
+    //                          (also returns belongsToItemId/Name)
+    //    reason 'depleted':    correct item, QoH = 0 (already shipped)
+    //    reason 'not_found':   serial doesn't exist in NetSuite at all
+    //  Batches the search in groups of 50 to stay safe on filter chain
+    //  length. One search per batch regardless of item.
+    // ═══════════════════════════════════════════════════════════
+    const validateSerialBatch = (data) => {
+        const itemId  = data.itemId;
+        const serials = (data.serials || []).map(s => (s || '').trim()).filter(Boolean);
+        if (!itemId)         return { success: false, message: 'Item ID is required.' };
+        if (!serials.length) return { success: true, validations: [] };
+
+        // Expected item label for nicer error messages.
+        let expectedItemName = '';
+        try {
+            const meta = search.lookupFields({ type: search.Type.ITEM, id: itemId, columns: ['itemid'] });
+            expectedItemName = meta.itemid || ('Item ' + itemId);
+        } catch (e) { expectedItemName = 'Item ' + itemId; }
+
+        // De-dupe so we never search the same serial twice in one call.
+        const unique = Array.from(new Set(serials));
+        // Per-serial map of itemId -> { itemName, totalQoh }.  Without an item
+        // filter on the search a single serial can come back over multiple rows
+        // (location-split, mixed contexts, etc).  We aggregate qoh per item so
+        // a stale qoh=0 row can't poison the verdict for a serial that's
+        // actually in stock.
+        const found  = {}; // serial -> { [itemId]: { itemName, totalQoh } }
+        const BATCH  = 50;
+        for (let off = 0; off < unique.length; off += BATCH) {
+            const batch = unique.slice(off, off + BATCH);
+            const filterExpr = [];
+            batch.forEach((s, i) => {
+                if (i > 0) filterExpr.push('OR');
+                filterExpr.push(['inventorynumber', 'is', s]);
+            });
+            try {
+                // NOTE: no item filter — we want to discover whether the
+                // serial belongs to the WRONG item, not just whether it
+                // matches the expected one.
+                search.create({
+                    type: 'inventorynumber',
+                    filters: filterExpr,
+                    columns: [
+                        search.createColumn({ name: 'inventorynumber' }),
+                        search.createColumn({ name: 'item' }),
+                        search.createColumn({ name: 'quantityonhand' })
+                    ]
+                }).run().each(r => {
+                    const sn   = (r.getValue({ name: 'inventorynumber' }) || '').trim();
+                    const itId = String(r.getValue({ name: 'item' }));
+                    const itTx = r.getText({ name: 'item' }) || itId;
+                    const qoh  = parseFloat(r.getValue({ name: 'quantityonhand' })) || 0;
+                    if (!sn) return true;
+                    if (!found[sn]) found[sn] = {};
+                    if (!found[sn][itId]) found[sn][itId] = { itemName: itTx, totalQoh: 0 };
+                    found[sn][itId].totalQoh += qoh;
+                    return true;
+                });
+            } catch (e) {
+                log.debug('validateSerialBatch batch error', e.message);
+            }
+        }
+
+        const expectedKey = String(itemId);
+        const validations = serials.map(s => {
+            const base = { serial: s, expectedItemId: expectedKey, expectedItemName };
+            const byItem = found[s];
+            if (!byItem) return Object.assign(base, { inStock: false, reason: 'not_found' });
+            const matching = byItem[expectedKey];
+            if (!matching) {
+                // Belongs to a different item (or items). Surface the first one
+                // we saw so the picker knows what they actually scanned.
+                const wrongIds = Object.keys(byItem);
+                const wrongId  = wrongIds[0];
+                return Object.assign(base, {
+                    inStock: false, reason: 'wrong_item',
+                    belongsToItemId:   wrongId,
+                    belongsToItemName: byItem[wrongId].itemName
+                });
+            }
+            if (matching.totalQoh <= 0) return Object.assign(base, { inStock: false, reason: 'depleted' });
+            return Object.assign(base, { inStock: true });
+        });
+
+        return { success: true, validations };
     };
 
     // ═══════════════════════════════════════════════════════════
@@ -2012,6 +2110,71 @@ define([
             });
         }
 
+        // ── Open Item Fulfillments (Picked / Packed) ────────────
+        // NetSuite only bumps quantityfulfilled on the SO line when the IF is
+        // SHIPPED. A line that's been "picked" already has an open IF in
+        // Picked or Packed status holding the unit(s), but quantityfulfilled
+        // on the SO line is still 0 — so without this we'd let the user
+        // re-pick the same unit and either error out or double-fulfill.
+        //   - status ItemShip:A = Picked
+        //   - status ItemShip:B = Packed
+        //   - status ItemShip:C = Shipped  (already reflected in quantityfulfilled)
+        const openIFByLine = {}; // soLineIdx -> qty
+        const openFulfillments = []; // [{ id, tranId, statusText }]
+        try {
+            // Step 1: find the open IFs (mainline=T returns one row per IF).
+            // `orderline` isn't exposed as a search column, so we can't get
+            // per-line link in a single search. Instead, we list the open IFs
+            // and load each to walk its item sublist (orderline IS available
+            // there). Typically 0–1 open IF per SO, so the extra loads are cheap.
+            const openIFList = [];
+            search.create({
+                type: search.Type.ITEM_FULFILLMENT,
+                filters: [
+                    ['createdfrom', 'anyof', soId], 'AND',
+                    ['mainline', 'is', 'T'], 'AND',
+                    ['status', 'anyof', ['ItemShip:A', 'ItemShip:B']]
+                ],
+                columns: [
+                    search.createColumn({ name: 'internalid' }),
+                    search.createColumn({ name: 'tranid' }),
+                    search.createColumn({ name: 'statusref' })
+                ]
+            }).run().each(r => {
+                openIFList.push({
+                    id:         String(r.getValue({ name: 'internalid' })),
+                    tranId:     r.getValue({ name: 'tranid' }) || String(r.getValue({ name: 'internalid' })),
+                    statusText: r.getText({ name: 'statusref' }) || ''
+                });
+                return true;
+            });
+
+            // Step 2: load each open IF and walk its sublist for per-SO-line qty.
+            openIFList.forEach(info => {
+                openFulfillments.push(info);
+                try {
+                    const ifRec = record.load({ type: record.Type.ITEM_FULFILLMENT, id: parseInt(info.id) });
+                    const ifLineCount = ifRec.getLineCount({ sublistId: 'item' });
+                    for (let li = 0; li < ifLineCount; li++) {
+                        const receive = ifRec.getSublistValue({ sublistId: 'item', fieldId: 'itemreceive', line: li });
+                        // Skip unchecked lines (they're not actually being fulfilled by this IF).
+                        if (receive === false || receive === 'F') continue;
+                        const qty       = Math.abs(parseFloat(ifRec.getSublistValue({ sublistId: 'item', fieldId: 'quantity',  line: li })) || 0);
+                        const orderLine = parseFloat(ifRec.getSublistValue({ sublistId: 'item', fieldId: 'orderline', line: li }));
+                        if (qty <= 0 || isNaN(orderLine)) continue;
+                        // orderline on the IF sublist is 1-based; SO sublist is 0-based.
+                        const idx = orderLine - 1;
+                        openIFByLine[idx] = (openIFByLine[idx] || 0) + qty;
+                    }
+                } catch (le) {
+                    log.debug('loadSOForPicking: IF load failed for ' + info.id, le.message);
+                }
+            });
+        } catch (e) {
+            log.debug('loadSOForPicking: open-IF search failed', e.message);
+            // Non-fatal: continue with the previous (over-counted) remaining.
+        }
+
         const lines = [];
         for (let i = 0; i < lineCount; i++) {
             const itemId = String(soRec.getSublistValue({ sublistId: 'item', fieldId: 'item', line: i }));
@@ -2019,13 +2182,14 @@ define([
             const description = soRec.getSublistValue({ sublistId: 'item', fieldId: 'description', line: i }) || '';
             const quantity = parseFloat(soRec.getSublistValue({ sublistId: 'item', fieldId: 'quantity', line: i })) || 0;
             const quantityFulfilled = parseFloat(soRec.getSublistValue({ sublistId: 'item', fieldId: 'quantityfulfilled', line: i })) || 0;
-            const quantityRemaining = Math.max(0, quantity - quantityFulfilled);
+            const quantityOnOpenIF  = openIFByLine[i] || 0;
+            const quantityRemaining = Math.max(0, quantity - quantityFulfilled - quantityOnOpenIF);
             const isFullyFulfilled = quantityRemaining <= 0;
             const isKit = !!(itemMeta[itemId] && itemMeta[itemId].isKit);
 
             const lineData = {
                 lineNum: i, itemId, itemText, description,
-                quantity, quantityFulfilled, quantityRemaining,
+                quantity, quantityFulfilled, quantityOnOpenIF, quantityRemaining,
                 isSerialized: !!(itemMeta[itemId] && itemMeta[itemId].isSerialized),
                 isFullyFulfilled, isKit
             };
@@ -2043,7 +2207,128 @@ define([
             lines.push(lineData);
         }
 
-        return { success: true, soId, soTranId, soStatus: soStatusText, soCustomer, soDate, lines };
+        return { success: true, soId, soTranId, soStatus: soStatusText, soCustomer, soDate, lines, openFulfillments };
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  PICK STAGING
+    //  Every serialized SO pick gets routed through this bin first:
+    //  a Bin Transfer moves the picked serials into the staging bin,
+    //  then the Item Fulfillment auto-resolves them from there.
+    // ═══════════════════════════════════════════════════════════
+    const SO_PICK_STAGING_BIN_ID = 1738;
+
+    // Look up each serial's current bin (per-item), build a Bin Transfer that
+    // moves anything not already in the staging bin, and save it. Returns the
+    // BT internal id (or null if nothing needed moving). Throws on hard errors.
+    const stageSerialsForPick = (data) => {
+        // Group submitted serials by item, deduped.
+        const serialsByItem = {}; // itemId -> Set<serial>
+        const addSerials = (itemId, serials) => {
+            if (!serials || !serials.length) return;
+            if (!serialsByItem[itemId]) serialsByItem[itemId] = new Set();
+            serials.forEach(s => { const t = (s || '').trim(); if (t) serialsByItem[itemId].add(t); });
+        };
+        data.lines.forEach(l => {
+            if (l.isKit && l.components) {
+                l.components.forEach(comp => {
+                    if (comp.isSerialized) addSerials(comp.itemId, comp.serialNumbers);
+                });
+            } else if (l.isSerialized) {
+                addSerials(l.itemId, l.serialNumbers);
+            }
+        });
+        if (!Object.keys(serialsByItem).length) return null; // No serialized lines.
+
+        // We need the SO's location to scope the lookup + set on the BT. The
+        // client passes data.locationId; if missing, derive from the SO header.
+        let locationId = data.locationId ? String(data.locationId) : '';
+        if (!locationId) {
+            try {
+                const meta = search.lookupFields({ type: search.Type.SALES_ORDER, id: data.soId, columns: ['location'] });
+                if (meta && meta.location && meta.location[0] && meta.location[0].value) locationId = String(meta.location[0].value);
+            } catch (e) { log.debug('stageSerialsForPick: SO location lookup failed', e.message); }
+        }
+
+        // Per-item current-bin lookup. `inventorynumber` on inventorybalance
+        // is a numeric reference field, so we convert serial text → internal
+        // id first (one search per item) and then filter `anyof` against the
+        // numeric list. Filtering with the raw text triggers "Filter expecting
+        // numeric value was removed".
+        const toMoveByItem = {}; // itemId -> [serials needing transfer]
+        Object.keys(serialsByItem).forEach(itemId => {
+            const serials = Array.from(serialsByItem[itemId]);
+            if (!serials.length) return;
+
+            const idMap = bulkGetInventoryNumberIds(itemId, serials);
+            const reverseMap = {}; // numericId -> serialText
+            Object.keys(idMap).forEach(sn => { reverseMap[String(idMap[sn])] = sn; });
+            const idList = Object.keys(reverseMap);
+            const currentBin = {}; // serial -> binId string
+            if (idList.length) {
+                const filters = [];
+                if (locationId) { filters.push(['location', 'anyof', locationId]); filters.push('AND'); }
+                filters.push(['item', 'anyof', itemId]);
+                filters.push('AND');
+                filters.push(['inventorynumber', 'anyof', idList]);
+                filters.push('AND');
+                filters.push(['onhand', 'greaterthan', 0]);
+                try {
+                    search.create({
+                        type: 'inventorybalance',
+                        filters,
+                        columns: [
+                            search.createColumn({ name: 'inventorynumber' }),
+                            search.createColumn({ name: 'binnumber' })
+                        ]
+                    }).run().each(r => {
+                        const numId = String(r.getValue({ name: 'inventorynumber' }));
+                        const sn    = reverseMap[numId];
+                        const binId = r.getValue({ name: 'binnumber' });
+                        if (sn && binId && !currentBin[sn]) currentBin[sn] = String(binId);
+                        return true;
+                    });
+                } catch (e) {
+                    log.debug('stageSerialsForPick: bin lookup failed for item ' + itemId, e.message);
+                }
+            }
+
+            const toMove = serials.filter(s => {
+                const cur = currentBin[s];
+                // Skip serials with no resolvable bin (let the IF error out
+                // naturally) and serials already in the staging bin.
+                return cur && cur !== String(SO_PICK_STAGING_BIN_ID);
+            });
+            if (toMove.length) toMoveByItem[itemId] = toMove;
+        });
+
+        if (!Object.keys(toMoveByItem).length) return null; // Already staged.
+
+        // Build the Bin Transfer (one record, multiple item lines).
+        const bt = record.create({ type: record.Type.BIN_TRANSFER, isDynamic: true });
+        bt.setValue({ fieldId: 'subsidiary', value: '1' });
+        if (locationId) bt.setValue({ fieldId: 'location', value: parseInt(locationId) });
+        bt.setValue({ fieldId: 'memo', value: 'Auto-staged for SO ' + data.soId });
+
+        Object.keys(toMoveByItem).forEach(itemId => {
+            const serials = toMoveByItem[itemId];
+            bt.selectNewLine({ sublistId: 'inventory' });
+            bt.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'item',     value: parseInt(itemId) });
+            bt.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'quantity', value: serials.length });
+            const invDetail = bt.getCurrentSublistSubrecord({ sublistId: 'inventory', fieldId: 'inventorydetail' });
+            serials.forEach(s => {
+                invDetail.selectNewLine({ sublistId: 'inventoryassignment' });
+                invDetail.setCurrentSublistText({  sublistId: 'inventoryassignment', fieldId: 'issueinventorynumber', text: s });
+                invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity',             value: 1 });
+                invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'tobinnumber',          value: SO_PICK_STAGING_BIN_ID });
+                invDetail.commitLine({ sublistId: 'inventoryassignment' });
+            });
+            bt.commitLine({ sublistId: 'inventory' });
+        });
+
+        const btId = bt.save({ enableSourcing: true, ignoreMandatoryFields: false });
+        log.audit('SO Pick Staging', 'Moved serials into bin ' + SO_PICK_STAGING_BIN_ID + ' via Bin Transfer ' + btId + ' for SO ' + data.soId);
+        return btId;
     };
 
     // ═══════════════════════════════════════════════════════════
@@ -2069,6 +2354,20 @@ define([
                 success: false,
                 message: 'Cannot fulfill \u2014 these serials are not in stock: ' + fmt,
                 notInStock
+            };
+        }
+
+        // ── Stage serials into the picking bin BEFORE creating the IF ──
+        // Once they're in bin 1738, NetSuite auto-resolves the from-bin on
+        // every serial-bearing inventoryassignment below.
+        let stagingBtId = null;
+        try {
+            stagingBtId = stageSerialsForPick(data);
+        } catch (stageErr) {
+            log.error('SO Pick: staging failed', stageErr);
+            return {
+                success: false,
+                message: 'Could not stage serials into staging bin: ' + (stageErr.message || stageErr)
             };
         }
 
@@ -2205,7 +2504,8 @@ define([
             success: true,
             message: 'Item Fulfillment ' + ffTranId + ' created successfully.',
             fulfillmentId: ffId,
-            fulfillmentTranId: ffTranId
+            fulfillmentTranId: ffTranId,
+            stagingTransferId: stagingBtId
         };
     };
 
@@ -2269,7 +2569,9 @@ define([
         });
 
         try {
-            search.create({
+            // Use summary search to collapse per-status/per-unit rows server-side,
+            // and runPaged to avoid the 4000-row cap of .each().
+            const balSearch = search.create({
                 type: 'inventorybalance',
                 filters: [
                     ['item.isinactive', 'is', 'F'],
@@ -2279,27 +2581,29 @@ define([
                     ['location', 'anyof', [locationId]]
                 ],
                 columns: [
-                    search.createColumn({ name: 'item' }),
-                    search.createColumn({ name: 'binnumber' }),
-                    search.createColumn({ name: 'onhand' }),
-                    search.createColumn({ name: 'available' })
+                    search.createColumn({ name: 'item',      summary: search.Summary.GROUP }),
+                    search.createColumn({ name: 'binnumber', summary: search.Summary.GROUP }),
+                    search.createColumn({ name: 'onhand',    summary: search.Summary.SUM }),
+                    search.createColumn({ name: 'available', summary: search.Summary.SUM })
                 ]
-            }).run().each(r => {
-                const rowItemId = String(r.getValue({ name: 'item' }));
-                const binName   = r.getText({ name: 'binnumber' }) || r.getValue({ name: 'binnumber' }) || '(No Bin)';
-                const qtyOH     = parseFloat(r.getValue({ name: 'onhand' })) || 0;
-                const qtyAvail  = parseFloat(r.getValue({ name: 'available' })) || qtyOH;
-                if (qtyOH <= 0) return true;
+            });
 
-                const group = grouped[rowItemId];
-                if (!group) return true;
-                if (group.rows[binName]) {
-                    group.rows[binName].qtyOH    += qtyOH;
-                    group.rows[binName].qtyAvail += qtyAvail;
-                } else {
+            const pagedData = balSearch.runPaged({ pageSize: 1000 });
+            pagedData.pageRanges.forEach(pr => {
+                pagedData.fetch({ index: pr.index }).data.forEach(r => {
+                    const rowItemId = String(r.getValue({ name: 'item',      summary: search.Summary.GROUP }));
+                    const binName   = r.getText({ name: 'binnumber', summary: search.Summary.GROUP })
+                                   || r.getValue({ name: 'binnumber', summary: search.Summary.GROUP })
+                                   || '(No Bin)';
+                    const qtyOH     = parseFloat(r.getValue({ name: 'onhand',    summary: search.Summary.SUM })) || 0;
+                    const qtyAvail  = parseFloat(r.getValue({ name: 'available', summary: search.Summary.SUM })) || qtyOH;
+                    if (qtyOH <= 0) return;
+
+                    const group = grouped[rowItemId];
+                    if (!group) return;
+                    // Rows are already unique per item × bin thanks to GROUP summary.
                     group.rows[binName] = { bin: binName, qtyOH, qtyAvail };
-                }
-                return true;
+                });
             });
         } catch (e) {
             log.debug('getBinInventory error', e.message);
@@ -2325,6 +2629,180 @@ define([
 
         return { success: true, results, isKit };
     };
+
+    // Resolve a paste/scan of serial numbers to the unique items they belong to,
+    // then return current bin balances per item at the location each serial sits in.
+    // Used by the serialized bin-putaway "🔍 Where is this stuff?" sheet so the
+    // operator can pick a destination bin that consolidates with existing stock.
+    const getBinInventoryForSerials = (params) => {
+        const serialsRaw = params.serials || '';
+        if (!serialsRaw) return { success: false, message: 'Serials are required.' };
+        const serialTexts = cleanSerialInput(serialsRaw);
+        if (!serialTexts.length) return { success: false, message: 'No serials provided.' };
+
+        const serialData = lookupSerialDetails(serialTexts);
+
+        // Group scanned serials by item, counting per current bin so we can
+        // surface "currently scattered across N bins" insight to the client.
+        const itemMap = {};
+        (serialData.valid || []).forEach(s => {
+            if (!itemMap[s.itemId]) {
+                itemMap[s.itemId] = {
+                    itemId: s.itemId,
+                    itemName: s.itemText,
+                    locationId: s.locationId,
+                    scannedCount: 0,
+                    currentBins: {} // binText -> count
+                };
+            }
+            itemMap[s.itemId].scannedCount++;
+            const bk = s.binText || '(No Bin)';
+            itemMap[s.itemId].currentBins[bk] = (itemMap[s.itemId].currentBins[bk] || 0) + 1;
+        });
+
+        // For each unique item, pull all bin balances at that item's location.
+        // Reuses getBinInventory so kit/regular logic and inventorybalance
+        // summary search stay in one place.
+        const items = Object.keys(itemMap).map(itemId => {
+            const it = itemMap[itemId];
+            let bins = [];
+            try {
+                const inv = getBinInventory({ itemId: it.itemId, locationId: it.locationId });
+                if (inv && inv.success && inv.results) bins = inv.results;
+            } catch (e) {
+                log.debug('getBinInventoryForSerials: getBinInventory failed for ' + it.itemId, e.message);
+            }
+            return {
+                itemId: it.itemId,
+                itemName: it.itemName,
+                scannedCount: it.scannedCount,
+                currentBins: Object.keys(it.currentBins).map(b => ({ bin: b, count: it.currentBins[b] })),
+                bins: bins
+            };
+        });
+
+        return { success: true, items: items, invalid: serialData.invalid || [] };
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  SHARED CLIENT-SIDE HELPER — duplicate-serial detection
+    // ───────────────────────────────────────────────────────────
+    //  Returns a JS string that gets injected into every page that
+    //  accepts serial-number input (Warehouse Assistant, Bin Putaway,
+    //  Print Label, PO Receiving, SO Picking). Defines:
+    //   - window._dedupeDing()        — chirp on dupe rejection
+    //   - window._dedupeSerialTextarea(opts) — checks textarea + optional
+    //     sibling textareas; rejects dupes, animates feedback,
+    //     calls onDupesFound / onClean callbacks
+    //  Single source of truth for dupe UX across the whole app.
+    // ═══════════════════════════════════════════════════════════
+    function getDupeCheckHelperJs() {
+        return `
+            <script>
+            (function() {
+                if (window._dedupeSerialTextarea) return; // idempotent
+
+                window._dedupeDing = window._dedupeDing || function() {
+                    try {
+                        var ctx = new (window.AudioContext || window.webkitAudioContext)();
+                        var osc = ctx.createOscillator();
+                        var gain = ctx.createGain();
+                        osc.connect(gain); gain.connect(ctx.destination);
+                        osc.type = 'sine';
+                        osc.frequency.setValueAtTime(880, ctx.currentTime);
+                        osc.frequency.exponentialRampToValueAtTime(220, ctx.currentTime + 0.25);
+                        gain.gain.setValueAtTime(0.6, ctx.currentTime);
+                        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.35);
+                        osc.start(ctx.currentTime);
+                        osc.stop(ctx.currentTime + 0.35);
+                    } catch (e) {}
+                };
+
+                window._dedupeSerialTextarea = function(opts) {
+                    opts = opts || {};
+                    var ta = (typeof opts.textarea === 'string')
+                        ? document.getElementById(opts.textarea)
+                        : opts.textarea;
+                    if (!ta) return { deduped: [], dupes: [], internal: [], cross: [] };
+
+                    var serials = ta.value.split(/[\\r\\n]+/)
+                        .map(function(s) { return s.trim(); })
+                        .filter(function(s) { return s !== ''; });
+
+                    // Build the cross-textarea seen set
+                    var outsideSet = new Set();
+                    var otherIds = opts.otherTextareaIds || [];
+                    otherIds.forEach(function(oid) {
+                        var o = document.getElementById(oid);
+                        if (!o || o === ta) return;
+                        o.value.split(/[\\r\\n]+/).forEach(function(s) {
+                            var t = s.trim();
+                            if (t) outsideSet.add(t);
+                        });
+                    });
+
+                    var seenSelf = new Set();
+                    var dupesInternal = [];
+                    var dupesCross = [];
+                    var deduped = serials.filter(function(s) {
+                        if (outsideSet.has(s)) { dupesCross.push(s); return false; }
+                        if (seenSelf.has(s))  { dupesInternal.push(s); return false; }
+                        seenSelf.add(s);
+                        return true;
+                    });
+
+                    var allDupes = dupesInternal.concat(dupesCross);
+
+                    if (allDupes.length > 0) {
+                        // Rewrite minus dupes, preserve trailing newline for next scan
+                        ta.value = deduped.join('\\n') + (ta.value.endsWith('\\n') ? '\\n' : '');
+                        try { window._dedupeDing(); } catch (e) {}
+                        ta.classList.remove('dupe-shake');
+                        // Force reflow so the animation restarts on rapid dupes
+                        void ta.offsetWidth;
+                        ta.classList.add('dupe-shake');
+                        ta.classList.add('has-dupe');
+                        if (typeof opts.onDupesFound === 'function') {
+                            opts.onDupesFound({
+                                dupes: allDupes,
+                                internal: dupesInternal,
+                                cross: dupesCross,
+                                deduped: deduped
+                            });
+                        }
+                        var ms = opts.flashMs || 2500;
+                        setTimeout(function() {
+                            ta.classList.remove('has-dupe');
+                            if (typeof opts.onClean === 'function') opts.onClean({ deduped: deduped });
+                        }, ms);
+                    } else {
+                        ta.classList.remove('has-dupe');
+                        if (typeof opts.onClean === 'function') opts.onClean({ deduped: deduped });
+                    }
+
+                    return {
+                        deduped: deduped,
+                        dupes: allDupes,
+                        internal: dupesInternal,
+                        cross: dupesCross
+                    };
+                };
+
+                // Convenience: collect all textarea IDs matching a CSS selector,
+                // excluding one self-ID. Used by PO Receive / SO Pick for the
+                // cross-line dupe check.
+                window._collectSiblingTextareaIds = function(selector, selfId) {
+                    var list = document.querySelectorAll(selector);
+                    var ids = [];
+                    for (var i = 0; i < list.length; i++) {
+                        if (list[i].id && list[i].id !== selfId) ids.push(list[i].id);
+                    }
+                    return ids;
+                };
+            })();
+            </script>
+        `;
+    }
 
 
     // ═══════════════════════════════════════════════════════════
@@ -3694,7 +4172,7 @@ define([
         // ====================================================================
 
         function getEntryFormScript(suiteletUrl) {
-            return `
+            return getDupeCheckHelperJs() + `
                 <script>
                     window.onbeforeunload = null;
                     if (typeof setWindowChanged === 'function') setWindowChanged(window, false);
@@ -3865,8 +4343,28 @@ define([
                     function updateCount() {
                         var field = document.getElementById('custpage_serial_numbers');
                         var display = document.getElementById('serial_count');
+                        var msgEl = document.getElementById('wh_serial_dupe_msg');
                         if (!field || !display) return;
-                        display.textContent = field.value.split(/[\\r\\n]+/).filter(function(s) { return s.trim() !== ''; }).length;
+                        if (typeof window._dedupeSerialTextarea !== 'function') {
+                            display.textContent = field.value.split(/[\\r\\n]+/).filter(function(s) { return s.trim() !== ''; }).length;
+                            return;
+                        }
+                        window._dedupeSerialTextarea({
+                            textarea: field,
+                            onDupesFound: function(r) {
+                                display.textContent = r.deduped.length;
+                                display.classList.add('has-dupe-count');
+                                if (msgEl) {
+                                    msgEl.innerHTML = '<span class="icon">\u26A0</span>Duplicate rejected: ' + [...new Set(r.dupes)].join(', ');
+                                    msgEl.classList.add('show');
+                                }
+                            },
+                            onClean: function(r) {
+                                display.textContent = r.deduped.length;
+                                display.classList.remove('has-dupe-count');
+                                if (msgEl) msgEl.classList.remove('show');
+                            }
+                        });
                     }
 
                     function submitSerials() {
@@ -4185,6 +4683,7 @@ define([
                                 <div class="input-group">
                                     <label class="custom-label">Serial Numbers <span class="badge-count"><span id="serial_count">0</span> scanned</span></label>
                                     <div id="serial-field-wrap"></div>
+                                    <div class="serial-dupe-msg" id="wh_serial_dupe_msg"></div>
                                 </div>
                             </div>
 
@@ -5058,11 +5557,17 @@ define([
                             <div id="bp-serialized-section" class="form-section active">
                                 <div class="input-group">
                                     <label class="custom-label">Destination Bin</label>
-                                    <input type="text" id="bp_to_bin" list="bp-bin-datalist" autocomplete="off" placeholder="Type or scan bin" style="width:100%;padding:14px 16px;border:2px solid #d1d5db;border-radius:10px;font-size:16px;background:#f9fafb;min-height:48px;">
+                                    <div style="display:flex;gap:6px;align-items:center;">
+                                        <input type="text" id="bp_to_bin" list="bp-bin-datalist" autocomplete="off" placeholder="Type or scan bin" style="flex:1;min-width:0;padding:14px 16px;border:2px solid #d1d5db;border-radius:10px;font-size:16px;background:#f9fafb;min-height:48px;">
+                                        <button type="button" title="Where are these serials' items currently stored?" onclick="openBpSerialStockLookup()" style="background:#f3f4f6;border:1.5px solid #d1d5db;border-radius:10px;cursor:pointer;padding:0;width:48px;height:48px;flex-shrink:0;display:flex;align-items:center;justify-content:center;color:#374151;">
+                                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.3-4.3"></path></svg>
+                                        </button>
+                                    </div>
                                 </div>
                                 <div class="input-group">
                                     <label class="custom-label">Serial Numbers <span class="badge-count"><span id="bp_serial_count">0</span> scanned</span></label>
                                     <div id="bp-serial-field-wrap"></div>
+                                    <div class="serial-dupe-msg" id="bp_serial_dupe_msg"></div>
                                 </div>
                             </div>
                             <div id="bp-nonserialized-section" class="form-section">
@@ -5084,6 +5589,19 @@ define([
                             <button type="button" class="custom-btn btn-success" onclick="submitBinPutaway()">Put Away</button>
                             <button type="button" class="custom-btn btn-outline" onclick="clearBpForm()">Clear</button>
                         </div>
+                    </div>
+                </div>
+                <!-- ▼ Bin lookup modal (popup) -->
+                <div class="bp-modal-overlay" id="bp-modal-overlay" onclick="if(event.target===this)closeBpStockLookup()">
+                    <div class="bp-modal" role="dialog" aria-modal="true" aria-labelledby="bp-modal-title">
+                        <div class="bp-modal-head">
+                            <div class="bp-modal-head-text">
+                                <div class="bp-modal-title" id="bp-modal-title"></div>
+                                <div class="bp-modal-sub" id="bp-modal-sub">Tap a bin to set it as the destination</div>
+                            </div>
+                            <button type="button" class="bp-modal-close" aria-label="Close" onclick="closeBpStockLookup()">&times;</button>
+                        </div>
+                        <div class="bp-modal-body" id="bp-modal-body"></div>
                     </div>
                 </div>
                 <div style="display:none;">
@@ -5132,7 +5650,100 @@ define([
         }
 
         function getBinPutawayFormScript(bpSuiteletUrl) {
-            return `
+            return getDupeCheckHelperJs() + `
+                <style>
+                    /* ─── Bin Putaway lookup modal (scoped) ─── */
+                    .bp-modal-overlay {
+                        display:none; position:fixed; inset:0; z-index:99999;
+                        background:rgba(0,0,0,.55);
+                        align-items:center; justify-content:center;
+                        padding:12px; -webkit-tap-highlight-color: transparent;
+                    }
+                    .bp-modal-overlay.open { display:flex; }
+                    .bp-modal {
+                        background:#fff; border-radius:14px;
+                        box-shadow:0 20px 60px rgba(0,0,0,.35);
+                        width:100%; max-width:480px;
+                        max-height:88vh;
+                        display:flex; flex-direction:column;
+                        overflow:hidden;
+                        animation: bpModalIn .18s ease-out;
+                    }
+                    @keyframes bpModalIn {
+                        from { opacity:0; transform: scale(.94); }
+                        to   { opacity:1; transform: scale(1); }
+                    }
+                    .bp-modal-head {
+                        padding:14px 18px;
+                        border-bottom:1px solid #e5e7eb;
+                        flex-shrink:0;
+                        display:flex; align-items:flex-start; justify-content:space-between; gap:12px;
+                        background:#fff;
+                    }
+                    .bp-modal-head-text { flex:1; min-width:0; }
+                    .bp-modal-title {
+                        font-size:15px; font-weight:700; color:#111827;
+                        margin-bottom:2px; word-break:break-word;
+                    }
+                    .bp-modal-sub { font-size:12px; color:#6b7280; }
+                    .bp-modal-close {
+                        width:36px; height:36px; flex-shrink:0;
+                        background:#f3f4f6; border:none; border-radius:50%;
+                        cursor:pointer; font-size:22px; line-height:1;
+                        color:#374151;
+                        display:flex; align-items:center; justify-content:center;
+                    }
+                    .bp-modal-close:hover { background:#e5e7eb; }
+                    .bp-modal-body { flex:1; overflow-y:auto; -webkit-overflow-scrolling:touch; }
+                    .bp-modal-row {
+                        width:100%; background:transparent;
+                        border:none; border-bottom:1px solid #f1f3f5;
+                        text-align:left; cursor:pointer; font:inherit; color:inherit;
+                        padding:14px 18px;
+                        display:flex; align-items:center; justify-content:space-between;
+                        gap:12px;
+                        min-height:56px;
+                        transition: background .12s;
+                    }
+                    .bp-modal-row:last-child { border-bottom:none; }
+                    .bp-modal-row:hover { background:#f9fafb; }
+                    .bp-modal-row:active { background:#eff6ff; }
+                    .bp-modal-row-bin { font-size:15px; font-weight:600; color:#111827; flex:1; min-width:0; word-break:break-word; }
+                    .bp-modal-row-qty {
+                        font-size:13px; color:#6b7280; white-space:nowrap;
+                        display:flex; flex-direction:column; align-items:flex-end; gap:2px;
+                    }
+                    .bp-modal-row-oh { color:#111827; font-weight:700; font-size:14px; }
+                    .bp-modal-row-avail { color:#6b7280; font-size:11px; }
+                    .bp-modal-section {
+                        padding:10px 18px;
+                        font-size:12px; font-weight:700; color:#374151;
+                        background:#f9fafb; border-bottom:1px solid #e5e7eb;
+                        position:sticky; top:0; z-index:1;
+                    }
+                    .bp-modal-banner {
+                        padding:10px 18px;
+                        font-size:12px;
+                        border-bottom:1px solid #e5e7eb;
+                    }
+                    .bp-modal-banner.info { color:#6b7280; background:#f9fafb; }
+                    .bp-modal-banner.warn { color:#92400e; background:#fef3c7; border-color:#fde68a; }
+                    .bp-modal-empty { padding:30px 18px; text-align:center; color:#6b7280; font-size:13px; }
+                    .bp-modal-badge {
+                        display:inline-block;
+                        font-size:10px; padding:2px 6px; border-radius:10px;
+                        margin-left:6px; font-weight:600; vertical-align:middle;
+                    }
+                    .bp-modal-badge.largest { background:#fef3c7; color:#92400e; }
+                    .bp-modal-badge.scattered { background:#fee2e2; color:#991b1b; }
+                    @media (max-width: 480px) {
+                        .bp-modal-overlay { padding:8px; }
+                        .bp-modal { max-width:100%; max-height:90vh; }
+                        .bp-modal-head { padding:12px 14px; }
+                        .bp-modal-row { padding:14px; }
+                        .bp-modal-section, .bp-modal-banner { padding:10px 14px; }
+                    }
+                </style>
                 <script>
                     window.onbeforeunload = null;
                     if (typeof setWindowChanged === 'function') setWindowChanged(window, false);
@@ -5186,8 +5797,28 @@ define([
                     function updateBpCount() {
                         var field = document.getElementById('custpage_bp_serials');
                         var display = document.getElementById('bp_serial_count');
+                        var msgEl = document.getElementById('bp_serial_dupe_msg');
                         if (!field || !display) return;
-                        display.textContent = field.value.split(/[\\r\\n]+/).filter(function(s) { return s.trim() !== ''; }).length;
+                        if (typeof window._dedupeSerialTextarea !== 'function') {
+                            display.textContent = field.value.split(/[\\r\\n]+/).filter(function(s) { return s.trim() !== ''; }).length;
+                            return;
+                        }
+                        window._dedupeSerialTextarea({
+                            textarea: field,
+                            onDupesFound: function(r) {
+                                display.textContent = r.deduped.length;
+                                display.classList.add('has-dupe-count');
+                                if (msgEl) {
+                                    msgEl.innerHTML = '<span class="icon">\u26A0</span>Duplicate rejected: ' + [...new Set(r.dupes)].join(', ');
+                                    msgEl.classList.add('show');
+                                }
+                            },
+                            onClean: function(r) {
+                                display.textContent = r.deduped.length;
+                                display.classList.remove('has-dupe-count');
+                                if (msgEl) msgEl.classList.remove('show');
+                            }
+                        });
                     }
 
                     function addBpNsGridRow() {
@@ -5196,10 +5827,15 @@ define([
                         bpNsGridRowId++;
                         var tr = document.createElement('tr');
                         tr.setAttribute('data-row-id', bpNsGridRowId);
-                        tr.innerHTML = '<td data-label="SKU"><input type="text" class="bp-ns-item-input" data-row="' + bpNsGridRowId + '" placeholder="SKU" style="width:100%;padding:10px;border:1.5px solid #d1d5db;border-radius:6px;font-size:16px;min-height:44px;"></td>'
-                            + '<td data-label="From Bin"><input type="text" class="bp-ns-frombin-input" data-row="' + bpNsGridRowId + '" list="bp-bin-datalist" autocomplete="off" placeholder="From" style="min-width:100px;padding:10px;border:1.5px solid #d1d5db;border-radius:6px;font-size:16px;min-height:44px;"></td>'
-                            + '<td data-label="To Bin"><input type="text" class="bp-ns-tobin-input" data-row="' + bpNsGridRowId + '" list="bp-bin-datalist" autocomplete="off" placeholder="To" style="min-width:100px;padding:10px;border:1.5px solid #d1d5db;border-radius:6px;font-size:16px;min-height:44px;"></td>'
-                            + '<td data-label="Qty"><input type="number" class="bp-ns-qty-input" data-row="' + bpNsGridRowId + '" placeholder="Qty" min="1" style="width:70px;padding:10px;border:1.5px solid #d1d5db;border-radius:6px;font-size:16px;min-height:44px;"></td>'
+                        tr.innerHTML = '<td data-label="SKU"><div style="display:flex;gap:6px;align-items:center;">'
+                                + '<input type="text" class="bp-ns-item-input" id="bp-ns-item-' + bpNsGridRowId + '" data-row="' + bpNsGridRowId + '" placeholder="SKU" style="flex:1;min-width:0;padding:10px;border:1.5px solid #d1d5db;border-radius:6px;font-size:16px;min-height:44px;">'
+                                + '<button type="button" title="Where else is this item?" onclick="openBpStockLookup(' + bpNsGridRowId + ')" style="background:#f3f4f6;border:1.5px solid #d1d5db;border-radius:6px;cursor:pointer;padding:0;width:44px;height:44px;flex-shrink:0;display:flex;align-items:center;justify-content:center;color:#374151;">'
+                                + '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.3-4.3"></path></svg>'
+                                + '</button>'
+                                + '</div></td>'
+                            + '<td data-label="From Bin"><input type="text" class="bp-ns-frombin-input" id="bp-ns-frombin-' + bpNsGridRowId + '" data-row="' + bpNsGridRowId + '" list="bp-bin-datalist" autocomplete="off" placeholder="From" style="min-width:100px;padding:10px;border:1.5px solid #d1d5db;border-radius:6px;font-size:16px;min-height:44px;"></td>'
+                            + '<td data-label="To Bin"><input type="text" class="bp-ns-tobin-input" id="bp-ns-tobin-' + bpNsGridRowId + '" data-row="' + bpNsGridRowId + '" list="bp-bin-datalist" autocomplete="off" placeholder="To" style="min-width:100px;padding:10px;border:1.5px solid #d1d5db;border-radius:6px;font-size:16px;min-height:44px;"></td>'
+                            + '<td data-label="Qty"><input type="number" class="bp-ns-qty-input" id="bp-ns-qty-' + bpNsGridRowId + '" data-row="' + bpNsGridRowId + '" placeholder="Qty" min="1" style="width:70px;padding:10px;border:1.5px solid #d1d5db;border-radius:6px;font-size:16px;min-height:44px;"></td>'
                             + '<td><button type="button" onclick="removeBpNsGridRow(' + bpNsGridRowId + ')" style="background:none;border:none;color:#ef4444;cursor:pointer;font-size:20px;padding:6px 10px;min-height:44px;min-width:44px;">&times;</button></td>';
                         tbody.appendChild(tr);
                         updateBpNsRowCount();
@@ -5267,6 +5903,172 @@ define([
                             var b = document.getElementById('bp_to_bin'); if (b) b.value = '';
                         } else { clearBpNsGrid(); }
                     }
+
+                    // ── Bin lookup sheet (consolidation helper) ──────────────
+                    function _bpEscHtml(s) {
+                        return String(s == null ? '' : s).replace(/[&<>"']/g, function(c) {
+                            return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c];
+                        });
+                    }
+
+                    async function openBpStockLookup(rowId) {
+                        var itemInput = document.querySelector('.bp-ns-item-input[data-row="' + rowId + '"]');
+                        if (!itemInput || !itemInput.value.trim()) {
+                            alert('Enter a SKU first.');
+                            if (itemInput) itemInput.focus();
+                            return;
+                        }
+                        var sku = itemInput.value.trim();
+                        var overlay = document.getElementById('bp-modal-overlay');
+                        var title = document.getElementById('bp-modal-title');
+                        var sub = document.getElementById('bp-modal-sub');
+                        var body = document.getElementById('bp-modal-body');
+                        title.textContent = sku;
+                        sub.textContent = 'Tap a bin to set it as the destination';
+                        body.innerHTML = '<div class="bp-modal-empty">Loading\u2026</div>';
+                        overlay.classList.add('open');
+                        overlay.dataset.targetInputId = 'bp-ns-tobin-' + rowId;
+                        try {
+                            // Resolve SKU -> itemId via existing getItems endpoint
+                            var itemResp = await fetch(bpBinsApiUrl + '&action=getItems&q=' + encodeURIComponent(sku));
+                            var itemData = await itemResp.json();
+                            var match = null;
+                            if (itemData.results && itemData.results.length) {
+                                for (var i = 0; i < itemData.results.length; i++) {
+                                    if ((itemData.results[i].name || '').toLowerCase() === sku.toLowerCase()) {
+                                        match = itemData.results[i]; break;
+                                    }
+                                }
+                                if (!match) match = itemData.results[0];
+                            }
+                            if (!match) {
+                                body.innerHTML = '<div class="bp-modal-empty" style="color:#ef4444;">Item not found: ' + _bpEscHtml(sku) + '</div>';
+                                return;
+                            }
+                            title.textContent = match.name + (match.display ? ' \u2014 ' + match.display : '');
+                            // Fetch bin balances at the warehouse
+                            var binResp = await fetch(bpBinsApiUrl + '&action=getBinInventory&itemId=' + encodeURIComponent(match.id) + '&locationId=1');
+                            var binData = await binResp.json();
+                            if (!binData.success) {
+                                body.innerHTML = '<div class="bp-modal-empty" style="color:#ef4444;">' + _bpEscHtml(binData.message || 'Error loading inventory.') + '</div>';
+                                return;
+                            }
+                            if (!binData.results || !binData.results.length) {
+                                body.innerHTML = '<div class="bp-modal-empty">No existing inventory for this SKU at the warehouse. Any bin you pick will start a new home for it.</div>';
+                                return;
+                            }
+                            // Sort by qtyOH desc so the biggest pile shows first
+                            binData.results.sort(function(a, b) { return (b.qtyOH || 0) - (a.qtyOH || 0); });
+                            var html = '';
+                            binData.results.forEach(function(r, idx) {
+                                var badge = idx === 0 ? ' <span class="bp-modal-badge largest">LARGEST PILE</span>' : '';
+                                html += '<button type="button" class="bp-modal-row" data-bin-name="' + _bpEscHtml(String(r.bin)) + '" onclick="pickBinFromBpSheet(this)">'
+                                    + '<div class="bp-modal-row-bin">' + _bpEscHtml(r.bin) + badge + '</div>'
+                                    + '<div class="bp-modal-row-qty"><span class="bp-modal-row-oh">' + r.qtyOH + ' on hand</span>'
+                                    + '<span class="bp-modal-row-avail">' + r.qtyAvail + ' avail</span></div>'
+                                    + '</button>';
+                            });
+                            body.innerHTML = html;
+                        } catch (e) {
+                            body.innerHTML = '<div class="bp-modal-empty" style="color:#ef4444;">Error: ' + _bpEscHtml(e.message) + '</div>';
+                        }
+                    }
+
+                    // Serialized mode: resolve the serials currently in the textarea,
+                    // then show one section per unique item with that item's bin balances.
+                    // Tap any bin row to set the single destination bin.
+                    async function openBpSerialStockLookup() {
+                        var serialField = document.getElementById('custpage_bp_serials');
+                        var raw = serialField ? serialField.value : '';
+                        if (!raw.trim()) {
+                            alert('Scan or paste at least one serial first.');
+                            if (serialField) serialField.focus();
+                            return;
+                        }
+                        var overlay = document.getElementById('bp-modal-overlay');
+                        var title = document.getElementById('bp-modal-title');
+                        var sub = document.getElementById('bp-modal-sub');
+                        var body = document.getElementById('bp-modal-body');
+                        title.textContent = 'Where is this stuff?';
+                        sub.textContent = 'Tap a bin to set it as the destination for all serials';
+                        body.innerHTML = '<div class="bp-modal-empty">Resolving serials\u2026</div>';
+                        overlay.classList.add('open');
+                        overlay.dataset.targetInputId = 'bp_to_bin';
+                        try {
+                            var resp = await fetch(bpBinsApiUrl + '&action=getBinInventoryForSerials&serials=' + encodeURIComponent(raw));
+                            var data = await resp.json();
+                            if (!data.success) {
+                                body.innerHTML = '<div class="bp-modal-empty" style="color:#ef4444;">' + _bpEscHtml(data.message || 'Error.') + '</div>';
+                                return;
+                            }
+                            if (!data.items || !data.items.length) {
+                                var msg = 'None of the scanned serials were found in stock.';
+                                if (data.invalid && data.invalid.length) msg += ' (' + data.invalid.length + ' invalid)';
+                                body.innerHTML = '<div class="bp-modal-empty">' + _bpEscHtml(msg) + '</div>';
+                                return;
+                            }
+                            var html = '';
+                            // Optional warning chip if any serials were invalid
+                            if (data.invalid && data.invalid.length) {
+                                html += '<div class="bp-modal-banner warn">\u26a0 ' + data.invalid.length + ' serial(s) not found in stock and were skipped</div>';
+                            }
+                            data.items.forEach(function(item) {
+                                // Section header per item
+                                var spread = (item.currentBins && item.currentBins.length > 1)
+                                    ? ' <span class="bp-modal-badge scattered">SCATTERED \u00d7' + item.currentBins.length + '</span>'
+                                    : '';
+                                html += '<div class="bp-modal-section">'
+                                     + _bpEscHtml(item.itemName)
+                                     + ' <span style="color:#6b7280;font-weight:400;">\u00b7 ' + item.scannedCount + ' scanned</span>'
+                                     + spread + '</div>';
+                                if (!item.bins || !item.bins.length) {
+                                    html += '<div class="bp-modal-empty" style="padding:14px 18px;text-align:left;">No existing inventory \u2014 picking any bin starts a new home for this SKU.</div>';
+                                    return;
+                                }
+                                // Sort by qtyOH desc within the item
+                                var rows = item.bins.slice().sort(function(a, b) { return (b.qtyOH || 0) - (a.qtyOH || 0); });
+                                rows.forEach(function(r, idx) {
+                                    var badge = idx === 0 ? ' <span class="bp-modal-badge largest">LARGEST PILE</span>' : '';
+                                    html += '<button type="button" class="bp-modal-row" data-bin-name="' + _bpEscHtml(String(r.bin)) + '" onclick="pickBinFromBpSheet(this)">'
+                                        + '<div class="bp-modal-row-bin">' + _bpEscHtml(r.bin) + badge + '</div>'
+                                        + '<div class="bp-modal-row-qty"><span class="bp-modal-row-oh">' + r.qtyOH + ' on hand</span>'
+                                        + '<span class="bp-modal-row-avail">' + r.qtyAvail + ' avail</span></div>'
+                                        + '</button>';
+                                });
+                            });
+                            body.innerHTML = html;
+                        } catch (e) {
+                            body.innerHTML = '<div class="bp-modal-empty" style="color:#ef4444;">Error: ' + _bpEscHtml(e.message) + '</div>';
+                        }
+                    }
+
+                    function pickBinFromBpSheet(btn) {
+                        var overlay = document.getElementById('bp-modal-overlay');
+                        var targetInputId = overlay ? overlay.dataset.targetInputId : '';
+                        if (!targetInputId) { closeBpStockLookup(); return; }
+                        var binName = btn.dataset.binName || '';
+                        var input = document.getElementById(targetInputId);
+                        if (input) {
+                            input.value = binName;
+                            input.style.borderColor = '#d1d5db';
+                            input.dispatchEvent(new Event('input', { bubbles: true }));
+                            input.dispatchEvent(new Event('change', { bubbles: true }));
+                        }
+                        closeBpStockLookup();
+                    }
+
+                    function closeBpStockLookup() {
+                        var overlay = document.getElementById('bp-modal-overlay');
+                        if (overlay) overlay.classList.remove('open');
+                    }
+
+                    // Escape key closes the modal
+                    document.addEventListener('keydown', function(e) {
+                        if (e.key === 'Escape') {
+                            var overlay = document.getElementById('bp-modal-overlay');
+                            if (overlay && overlay.classList.contains('open')) closeBpStockLookup();
+                        }
+                    });
 
                     document.addEventListener('DOMContentLoaded', function() {
                         window.onbeforeunload = null;
@@ -5981,7 +6783,7 @@ define([
         }
 
         function plGetEntryFormScript() {
-            return `
+            return getDupeCheckHelperJs() + `
                 <script>
                     // Disable "Leave page?" warning
                     window.onbeforeunload = null;
@@ -6000,9 +6802,29 @@ define([
                     function updateCount() {
                         var field = document.getElementById('custpage_serial_numbers');
                         var display = document.getElementById('serial_count');
+                        var msgEl = document.getElementById('pl_serial_dupe_msg');
                         if (!field || !display) return;
-                        var lines = field.value.split(/[\\r\\n]+/).filter(function(s) { return s.trim() !== ''; });
-                        display.textContent = lines.length;
+                        if (typeof window._dedupeSerialTextarea !== 'function') {
+                            var lines = field.value.split(/[\\r\\n]+/).filter(function(s) { return s.trim() !== ''; });
+                            display.textContent = lines.length;
+                            return;
+                        }
+                        window._dedupeSerialTextarea({
+                            textarea: field,
+                            onDupesFound: function(r) {
+                                display.textContent = r.deduped.length;
+                                display.classList.add('has-dupe-count');
+                                if (msgEl) {
+                                    msgEl.innerHTML = '<span class="icon">\u26A0</span>Duplicate rejected: ' + [...new Set(r.dupes)].join(', ');
+                                    msgEl.classList.add('show');
+                                }
+                            },
+                            onClean: function(r) {
+                                display.textContent = r.deduped.length;
+                                display.classList.remove('has-dupe-count');
+                                if (msgEl) msgEl.classList.remove('show');
+                            }
+                        });
                     }
 
                     function searchPO() {
@@ -6171,6 +6993,7 @@ define([
                             <div class="input-group">
                                 <label class="custom-label">Serial Numbers <span class="badge-count"><span id="serial_count">0</span> labels</span></label>
                                 <div id="serial-field-wrap"></div>
+                                <div class="serial-dupe-msg" id="pl_serial_dupe_msg"></div>
                             </div>
                             <div class="btn-area">
                                 <button type="button" class="custom-btn btn-success" onclick="createLabels()">Generate Labels</button>
@@ -6917,6 +7740,20 @@ tr:hover td { background:var(--surface-hover); }
 @keyframes porcvShake { 0%,100%{transform:translateX(0)} 15%{transform:translateX(-6px)} 30%{transform:translateX(6px)} 45%{transform:translateX(-5px)} 60%{transform:translateX(5px)} 75%{transform:translateX(-3px)} 90%{transform:translateX(3px)} }
 .porcv-line-input textarea.dupe-shake { animation:porcvShake .45s ease; }
 
+/* ─── Shared dupe styling (works on any textarea / count display / dupe-msg) ─── */
+textarea.has-dupe { border-color:#dc2626 !important; box-shadow:0 0 0 3px rgba(220,38,38,.35); }
+textarea.dupe-shake { animation:porcvShake .45s ease; }
+.has-dupe-count { color:#dc2626 !important; font-weight:600 !important; }
+.serial-dupe-msg {
+    display:none;
+    color:#dc2626; font-size:12px; font-weight:600;
+    margin-top:6px; padding:6px 10px;
+    background:#fef2f2; border:1px solid #fecaca; border-radius:6px;
+    animation: porcvShake .45s ease;
+}
+.serial-dupe-msg.show { display:block; }
+.serial-dupe-msg .icon { display:inline-block; margin-right:4px; }
+
 /* ─── SO PICKING LINE CARDS ─── */
 .sopick-line {
     background:var(--surface); border:2px solid var(--border);
@@ -6941,8 +7778,29 @@ tr:hover td { background:var(--surface-hover); }
 .sopick-line-input select { max-width:280px; }
 .sopick-serial-count { font-size:11px; color:var(--text-dim); margin-top:4px; }
 .sopick-serial-count.has-dupe { color:#dc2626; font-weight:600; }
+.sopick-serial-count.validating { color:var(--accent, #1866c2); }
+.sopick-serial-count.validating::after {
+    content:""; display:inline-block; width:8px; height:8px; margin-left:6px; border-radius:50%;
+    background:var(--accent, #1866c2); opacity:.4; animation:sopickPulse 1s ease-in-out infinite;
+    vertical-align:middle;
+}
+@keyframes sopickPulse { 0%,100% { opacity:.2; transform:scale(.8); } 50% { opacity:.9; transform:scale(1.1); } }
 .sopick-line-input textarea.has-dupe, .sopick-kit-component textarea.has-dupe { border-color:#dc2626 !important; box-shadow:0 0 0 3px rgba(220,38,38,.35); }
 .sopick-line-input textarea.dupe-shake, .sopick-kit-component textarea.dupe-shake { animation:porcvShake .45s ease; }
+.sopick-line-input textarea.sopick-has-error, .sopick-kit-component textarea.sopick-has-error {
+    border-color:#dc2626 !important;
+    background:rgba(220,38,38,.06) !important;
+    box-shadow:0 0 0 3px rgba(220,38,38,.25) !important;
+}
+.sopick-serial-issues {
+    margin-top:6px; padding:8px 10px; background:rgba(220,38,38,.07);
+    border:1px solid rgba(220,38,38,.35); border-radius:6px; font-size:12px;
+    color:#7a1414; display:flex; flex-direction:column; gap:4px;
+}
+.sopick-serial-issues-head { display:flex; align-items:center; justify-content:space-between; font-weight:700; gap:8px; }
+.sopick-serial-issues-clear { background:transparent; border:none; color:#7a1414; cursor:pointer; font-size:11px; padding:2px 6px; text-decoration:underline; }
+.sopick-serial-issue { font-family:var(--mono,monospace); font-size:11.5px; line-height:1.4; }
+.sopick-serial-issue code { background:rgba(220,38,38,.15); padding:0 4px; border-radius:3px; font-weight:700; }
 .sopick-bin-row { display:flex; gap:10px; align-items:end; flex-wrap:wrap; margin-top:8px; }
 .sopick-bin-row .form-group { margin:0; flex:1; min-width:120px; }
 .sopick-kit-components { display:flex; flex-direction:column; gap:12px; margin-top:4px; }
@@ -6992,6 +7850,14 @@ tr:hover td { background:var(--surface-hover); }
     gap:12px;
 }
 .stock-sheet-row:last-child { border-bottom:none; }
+button.stock-sheet-row-pick {
+    width:100%; background:transparent; border:none;
+    border-bottom:1px solid var(--border); text-align:left; cursor:pointer;
+    font:inherit; color:inherit; transition:background 0.12s;
+}
+button.stock-sheet-row-pick:last-child { border-bottom:none; }
+button.stock-sheet-row-pick:hover { background:var(--bg-soft, #f5f7fa); }
+button.stock-sheet-row-pick:active { background:var(--primary-soft, #e3edff); }
 .stock-sheet-bin { font-size:14px; font-weight:600; color:var(--text); flex:1; min-width:0; }
 .stock-sheet-qty { font-size:13px; color:var(--text-muted); white-space:nowrap; display:flex; flex-direction:column; align-items:flex-end; gap:2px; }
 .stock-sheet-qty strong { color:var(--text); font-weight:700; }
@@ -8179,6 +9045,7 @@ tr:hover td { background:var(--surface-hover); }
             </div>
         </div>
 
+        <div id="sopick-open-if-banner" style="display:none;"></div>
         <div id="sopick-lines-container"></div>
 
         <div class="card" style="text-align:center;">
@@ -8572,6 +9439,7 @@ tr:hover td { background:var(--surface-hover); }
     </div>
 </div>
 
+${getDupeCheckHelperJs()}
 <script>
 // ═══════════════════════════════════════════════════════════
 //  APP STATE & CONFIG
@@ -8644,10 +9512,19 @@ function stockLookupBtn(btn) {
     const locEl = document.getElementById(btn.dataset.locfn);
     const locationId = locEl ? locEl.value : '';
     if (!locationId) { toast('Please select a warehouse first.', 'warning'); return; }
-    openStockLookup(itemId, itemName, locationId);
+    // Click-to-pick: data-bin-target (and optionally data-qty-target) make
+    // each bin row in the sheet clickable, filling the bin/qty inputs.
+    // Only wired up for non-serialized lines.
+    const opts = {
+        binTarget: btn.dataset.binTarget || '',
+        qtyTarget: btn.dataset.qtyTarget || '',
+        pickable:  btn.dataset.binTarget ? true : false
+    };
+    openStockLookup(itemId, itemName, locationId, opts);
 }
 
-async function openStockLookup(itemId, itemName, locationId) {
+async function openStockLookup(itemId, itemName, locationId, opts) {
+    opts = opts || {};
     const overlay = document.getElementById('stock-sheet-overlay');
     const sheet = document.getElementById('stock-sheet');
     const title = document.getElementById('stock-sheet-title');
@@ -8671,20 +9548,74 @@ async function openStockLookup(itemId, itemName, locationId) {
     // subheader each time the component changes. Regular items render flat.
     let html = '';
     let currentComponent = null;
+    // Pickable header hint when the sheet is acting as a bin picker.
+    if (opts.pickable) {
+        html += '<div style="padding:8px 16px;font-size:11px;color:var(--text-muted);background:var(--bg-soft,#f5f7fa);border-bottom:1px solid var(--border);">Tap a bin to select it</div>';
+    }
     data.results.forEach(r => {
         if (r.component && r.component !== currentComponent) {
             currentComponent = r.component;
             const perKit = r.qtyPerKit ? ' <span style="color:var(--text-muted);font-weight:400;">\u00b7 ' + r.qtyPerKit + ' per kit</span>' : '';
             html += '<div style="padding:10px 16px 6px;font-size:12px;font-weight:700;color:var(--text);background:var(--bg-soft,#f5f7fa);border-bottom:1px solid var(--border);">' + escHtml(currentComponent) + perKit + '</div>';
         }
-        html +=
-            '<div class="stock-sheet-row">' +
-            '<div class="stock-sheet-bin">' + escHtml(r.bin) + '</div>' +
-            '<div class="stock-sheet-qty"><span class="stock-sheet-oh">' + r.qtyOH + ' on hand</span>' +
-            '<span class="stock-sheet-avail">' + r.qtyAvail + ' avail</span></div>' +
-            '</div>';
+        if (opts.pickable) {
+            // Encode payload in dataset rather than building an inline onclick
+            // (avoids quote-escaping issues with bin names like O'Brien).
+            html +=
+                '<button type="button" class="stock-sheet-row stock-sheet-row-pick" data-bin-name="' + escHtml(String(r.bin)) + '" data-qty-avail="' + r.qtyAvail + '" onclick="_sopickPickBinFromSheet(this)">' +
+                '<div class="stock-sheet-bin">' + escHtml(r.bin) + '</div>' +
+                '<div class="stock-sheet-qty"><span class="stock-sheet-oh">' + r.qtyOH + ' on hand</span>' +
+                '<span class="stock-sheet-avail">' + r.qtyAvail + ' avail</span></div>' +
+                '</button>';
+        } else {
+            html +=
+                '<div class="stock-sheet-row">' +
+                '<div class="stock-sheet-bin">' + escHtml(r.bin) + '</div>' +
+                '<div class="stock-sheet-qty"><span class="stock-sheet-oh">' + r.qtyOH + ' on hand</span>' +
+                '<span class="stock-sheet-avail">' + r.qtyAvail + ' avail</span></div>' +
+                '</div>';
+        }
     });
     body.innerHTML = html;
+
+    // Stash the pickable targets on the sheet so the click handler can find
+    // them. We do this on the sheet element itself instead of globals so two
+    // simultaneous opens never trample each other.
+    sheet.dataset.binTarget = opts.binTarget || '';
+    sheet.dataset.qtyTarget = opts.qtyTarget || '';
+}
+
+// Click-to-pick handler. Called from rows rendered when opts.pickable.
+// Fills the bin input, optionally caps the qty input to qtyAvail, fires
+// 'input' events so any listeners react, and closes the sheet.
+function _sopickPickBinFromSheet(rowBtn) {
+    const sheet = document.getElementById('stock-sheet');
+    const binTargetId = sheet ? sheet.dataset.binTarget : '';
+    const qtyTargetId = sheet ? sheet.dataset.qtyTarget : '';
+    if (!binTargetId) { closeStockLookup(); return; }
+    const binName  = rowBtn.dataset.binName || '';
+    const qtyAvail = parseFloat(rowBtn.dataset.qtyAvail || '0');
+
+    const binInput = document.getElementById(binTargetId);
+    if (binInput) {
+        binInput.value = binName;
+        binInput.dispatchEvent(new Event('input', { bubbles: true }));
+        binInput.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+    // Cap requested qty at what's actually available in this bin.
+    if (qtyTargetId) {
+        const qtyInput = document.getElementById(qtyTargetId);
+        if (qtyInput && qtyAvail > 0) {
+            const current = parseFloat(qtyInput.value) || 0;
+            if (current > qtyAvail) {
+                qtyInput.value = qtyAvail;
+                qtyInput.dispatchEvent(new Event('input', { bubbles: true }));
+                toast('Qty capped at ' + qtyAvail + ' (available in ' + binName + ').', 'warning');
+            }
+        }
+    }
+    closeStockLookup();
+    toast('Bin set to ' + escHtml(binName), 'success');
 }
 
 function closeStockLookup() {
@@ -8770,7 +9701,7 @@ async function sopickLoadLP() {
 
     const existing = ta.value.split('\\n').map(s => s.trim()).filter(s => s);
     const toAdd = serials.filter(s => !existing.includes(s.trim()));
-    ta.value = [...existing, ...toAdd].join('\\n');
+    ta.value = [...existing, ...toAdd].join('\\n') + '\\n';
     ta.dispatchEvent(new Event('input'));
 
     statusEl.textContent = toAdd.length + ' serial(s) loaded from ' + escHtml(data.plate.name) + '.';
@@ -9957,32 +10888,25 @@ function porcvDing() {
 function porcvUpdateSerialCount(idx, max) {
     const ta = document.getElementById('porcv-serials-' + idx);
     const countEl = document.getElementById('porcv-serial-count-' + idx);
-    const serials = ta.value.split('\\n').map(s => s.trim()).filter(s => s !== '');
+    if (!ta || !countEl) return;
 
-    const seen = new Set();
-    const dupes = [];
-    const deduped = serials.filter(s => { if (seen.has(s)) { dupes.push(s); return false; } seen.add(s); return true; });
+    // Cross-line dupe check: every other porcv serial textarea on this PO
+    const otherIds = window._collectSiblingTextareaIds
+        ? window._collectSiblingTextareaIds('[id^="porcv-serials-"]', ta.id)
+        : [];
 
-    if (dupes.length > 0) {
-        // Rewrite textarea without the duplicates, preserving cursor at end
-        ta.value = deduped.join('\\n') + (ta.value.endsWith('\\n') ? '\\n' : '');
-        porcvDing();
-        ta.classList.remove('dupe-shake');
-        void ta.offsetWidth;
-        ta.classList.add('dupe-shake');
-        countEl.textContent = '\u26A0 Duplicate rejected: ' + [...new Set(dupes)].join(', ');
-        countEl.classList.add('has-dupe');
-        ta.classList.add('has-dupe');
-        setTimeout(() => {
-            countEl.textContent = deduped.length + ' of ' + max + ' serials entered';
+    window._dedupeSerialTextarea({
+        textarea: ta,
+        otherTextareaIds: otherIds,
+        onDupesFound: function(r) {
+            countEl.textContent = '\u26A0 Duplicate rejected: ' + [...new Set(r.dupes)].join(', ');
+            countEl.classList.add('has-dupe');
+        },
+        onClean: function(r) {
+            countEl.textContent = r.deduped.length + ' of ' + max + ' serials entered';
             countEl.classList.remove('has-dupe');
-            ta.classList.remove('has-dupe');
-        }, 2500);
-    } else {
-        countEl.textContent = deduped.length + ' of ' + max + ' serials entered';
-        countEl.classList.remove('has-dupe');
-        ta.classList.remove('has-dupe');
-    }
+        }
+    });
 }
 
 async function porcvSubmit() {
@@ -10113,6 +11037,9 @@ async function sopickLoadSO() {
         if (!data.success) { toast(data.message, 'error'); return; }
 
         currentSOPickData = data;
+        // Fresh SO → drop any leftover per-textarea validation cache/timers.
+        Object.keys(_sopickValCache).forEach(k => delete _sopickValCache[k]);
+        Object.keys(_sopickValTimer).forEach(k => { clearTimeout(_sopickValTimer[k]); delete _sopickValTimer[k]; });
         document.getElementById('sopick-so-tranid').textContent = data.soTranId;
         document.getElementById('sopick-so-status').textContent = data.soStatus || '';
         document.getElementById('sopick-so-customer').textContent = data.soCustomer || '';
@@ -10126,32 +11053,66 @@ async function sopickLoadSO() {
             if (line.quantityRemaining > 0) hasPickable = true;
         });
 
+        // Warning banner: SO already has open Item Fulfillments (Picked/Packed)
+        // that haven't shipped yet. Those units have been subtracted from
+        // remaining counts above, but the picker needs to know — otherwise they
+        // could end up thinking the order has unfulfilled work that's actually
+        // sitting on an existing IF waiting to ship.
+        const banner = document.getElementById('sopick-open-if-banner');
+        const openIFs = data.openFulfillments || [];
+        if (banner) {
+            if (openIFs.length) {
+                const list = openIFs.map(f => '<strong>' + escHtml(f.tranId) + '</strong>' + (f.statusText ? ' <span style="color:var(--text-muted);font-weight:400;">(' + escHtml(f.statusText) + ')</span>' : '')).join(', ');
+                banner.innerHTML =
+                    '<div class="card" style="border-left:4px solid var(--warning, #f59e0b);background:var(--warning-soft, #fff7ed);">' +
+                        '<div style="display:flex;gap:10px;align-items:center;">' +
+                            '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--warning, #f59e0b)" stroke-width="2" style="flex-shrink:0;"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>' +
+                            '<div style="flex:1;font-size:13px;font-weight:600;color:var(--text);">Already picked on ' + list + '</div>' +
+                        '</div>' +
+                    '</div>';
+                banner.style.display = 'block';
+            } else {
+                banner.style.display = 'none';
+                banner.innerHTML = '';
+            }
+        }
+
         const locationId = document.getElementById('sopick-location').value;
         if (locationId) await sopickRefreshBins(locationId);
 
         document.getElementById('sopick-lines-section').style.display = 'block';
         document.getElementById('sopick-success').style.display = 'none';
 
-        if (!hasPickable) toast('All items on this SO are fully fulfilled.', 'warning');
-        else toast(data.lines.length + ' line(s) loaded from SO ' + data.soTranId + '.', 'success');
+        if (!hasPickable) {
+            if (openIFs.length) toast('All lines are already on open fulfillment ' + openIFs.map(f => f.tranId).join(', ') + '.', 'warning');
+            else toast('All items on this SO are fully fulfilled.', 'warning');
+        } else {
+            toast(data.lines.length + ' line(s) loaded from SO ' + data.soTranId + '.', 'success');
+        }
     } finally { hideProcessing(); }
 }
 
 function sopickRenderComponentInput(comp, idx, cidx) {
     const totalQty = comp.totalQuantity;
-    const compLookupBtn = '<button class="stock-lookup-btn" data-iid="' + escHtml(String(comp.itemId)) + '" data-iname="' + escHtml(comp.itemText) + '" data-locfn="sopick-location" onclick="stockLookupBtn(this)" title="Check bin stock"><svg viewBox=\\"0 0 24 24\\" fill=\\"none\\" stroke=\\"currentColor\\" stroke-width=\\"2\\"><line x1=\\"18\\" y1=\\"20\\" x2=\\"18\\" y2=\\"10\\"/><line x1=\\"12\\" y1=\\"20\\" x2=\\"12\\" y2=\\"4\\"/><line x1=\\"6\\" y1=\\"20\\" x2=\\"6\\" y2=\\"14\\"/></svg></button>';
+    // Build the lookup button. For non-serialized components, wire it as a
+    // click-to-pick bin picker against the qty/bin inputs in this row.
+    const compLookupSvg = '<svg viewBox=\\"0 0 24 24\\" fill=\\"none\\" stroke=\\"currentColor\\" stroke-width=\\"2\\"><line x1=\\"18\\" y1=\\"20\\" x2=\\"18\\" y2=\\"10\\"/><line x1=\\"12\\" y1=\\"20\\" x2=\\"12\\" y2=\\"4\\"/><line x1=\\"6\\" y1=\\"20\\" x2=\\"6\\" y2=\\"14\\"/></svg>';
+    const compLookupCommon = 'class="stock-lookup-btn" data-iid="' + escHtml(String(comp.itemId)) + '" data-iname="' + escHtml(comp.itemText) + '" data-locfn="sopick-location" onclick="stockLookupBtn(this)" title="Check bin stock"';
+    const compLookupBtnSerial    = '<button ' + compLookupCommon + '>' + compLookupSvg + '</button>';
+    const compLookupBtnNonSerial = '<button ' + compLookupCommon + ' data-bin-target="sopick-comp-bin-' + idx + '-' + cidx + '" data-qty-target="sopick-comp-qty-' + idx + '-' + cidx + '">' + compLookupSvg + '</button>';
     if (comp.isSerialized) {
         return '<div class="sopick-kit-component" id="sopick-comp-' + idx + '-' + cidx + '">' +
-            '<div class="sopick-comp-name" style="display:flex;align-items:center;gap:6px;">' + escHtml(comp.itemText) + ' <span style="color:var(--text-muted);font-size:12px;">&times;' + totalQty + '</span>' + compLookupBtn + '</div>' +
+            '<div class="sopick-comp-name" style="display:flex;align-items:center;gap:6px;">' + escHtml(comp.itemText) + ' <span style="color:var(--text-muted);font-size:12px;">&times;' + totalQty + '</span>' + compLookupBtnSerial + '</div>' +
             '<label class="form-label" style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;">Serial Numbers (one per line)' +
             '<button class="btn" style="font-size:11px;padding:2px 10px;height:26px;gap:4px;" data-target="sopick-comp-serials-' + idx + '-' + cidx + '" data-max="' + totalQty + '" onclick="sopickOpenLPSheet(this)"><svg width="12" height="12" viewBox=\\"0 0 24 24\\" fill=\\"none\\" stroke=\\"currentColor\\" stroke-width=\\"2\\"><rect x=\\"3\\" y=\\"3\\" width=\\"7\\" height=\\"7\\"/><rect x=\\"14\\" y=\\"3\\" width=\\"7\\" height=\\"7\\"/><rect x=\\"3\\" y=\\"14\\" width=\\"7\\" height=\\"7\\"/><path d=\\"M14 14h3v3m0 4h4m-4-4v4m-4 0h4\\"/></svg> Scan LP QR</button>' +
             '</label>' +
-            '<textarea id="sopick-comp-serials-' + idx + '-' + cidx + '" rows="3" placeholder="Scan serial numbers, one per line..." oninput="sopickUpdateCompSerialCount(' + idx + ',' + cidx + ',' + totalQty + ')"></textarea>' +
+            '<textarea id="sopick-comp-serials-' + idx + '-' + cidx + '" rows="3" placeholder="Scan serial numbers, one per line..." oninput="sopickUpdateCompSerialCount(' + idx + ',' + cidx + ',' + totalQty + ')" onblur="sopickValidateCompOnBlur(' + idx + ',' + cidx + ')"></textarea>' +
             '<div class="sopick-serial-count" id="sopick-comp-serial-count-' + idx + '-' + cidx + '">0 of ' + totalQty + ' serials entered</div>' +
+            '<div class="sopick-serial-issues" id="sopick-comp-serial-issues-' + idx + '-' + cidx + '" style="display:none;"></div>' +
             '</div>';
     } else {
         return '<div class="sopick-kit-component" id="sopick-comp-' + idx + '-' + cidx + '">' +
-            '<div class="sopick-comp-name" style="display:flex;align-items:center;gap:6px;">' + escHtml(comp.itemText) + compLookupBtn + '</div>' +
+            '<div class="sopick-comp-name" style="display:flex;align-items:center;gap:6px;">' + escHtml(comp.itemText) + compLookupBtnNonSerial + '</div>' +
             '<div class="sopick-bin-row">' +
             '<div class="form-group"><label class="form-label">Quantity</label>' +
             '<input type="number" id="sopick-comp-qty-' + idx + '-' + cidx + '" value="' + totalQty + '" min="1" max="' + totalQty + '"></div>' +
@@ -10188,8 +11149,9 @@ function sopickRenderLine(line, idx) {
                 '<label class="form-label" style="display:flex;align-items:center;justify-content:space-between;">Serial Numbers (one per line)' +
                 '<button class="btn" style="font-size:11px;padding:2px 10px;height:26px;gap:4px;" data-target="sopick-serials-' + idx + '" data-max="' + line.quantityRemaining + '" onclick="sopickOpenLPSheet(this)"><svg width="12" height="12" viewBox=\\"0 0 24 24\\" fill=\\"none\\" stroke=\\"currentColor\\" stroke-width=\\"2\\"><rect x=\\"3\\" y=\\"3\\" width=\\"7\\" height=\\"7\\"/><rect x=\\"14\\" y=\\"3\\" width=\\"7\\" height=\\"7\\"/><rect x=\\"3\\" y=\\"14\\" width=\\"7\\" height=\\"7\\"/><path d=\\"M14 14h3v3m0 4h4m-4-4v4m-4 0h4\\"/></svg> Scan LP QR</button>' +
                 '</label>' +
-                '<textarea id="sopick-serials-' + idx + '" rows="4" placeholder="Scan serial numbers, one per line..." oninput="sopickUpdateSerialCount(' + idx + ',' + line.quantityRemaining + ')"></textarea>' +
-                '<div class="sopick-serial-count" id="sopick-serial-count-' + idx + '">0 of ' + line.quantityRemaining + ' serials entered</div></div>';
+                '<textarea id="sopick-serials-' + idx + '" rows="4" placeholder="Scan serial numbers, one per line..." oninput="sopickUpdateSerialCount(' + idx + ',' + line.quantityRemaining + ')" onblur="sopickValidateOnBlur(' + idx + ')"></textarea>' +
+                '<div class="sopick-serial-count" id="sopick-serial-count-' + idx + '">0 of ' + line.quantityRemaining + ' serials entered</div>' +
+                '<div class="sopick-serial-issues" id="sopick-serial-issues-' + idx + '" style="display:none;"></div></div>';
         } else {
             inputHtml = '<div class="sopick-line-input">' +
                 '<div class="sopick-bin-row">' +
@@ -10203,7 +11165,11 @@ function sopickRenderLine(line, idx) {
     }
 
     const kitBadge = line.isKit ? ' <span class="badge badge-info" style="font-size:10px;">Kit</span>' : '';
-    const sopickLookupBtn = '<button class="stock-lookup-btn" data-iid="' + escHtml(String(line.itemId)) + '" data-iname="' + escHtml(line.itemText) + '" data-locfn="sopick-location" onclick="stockLookupBtn(this)" title="Check bin stock"><svg viewBox=\\"0 0 24 24\\" fill=\\"none\\" stroke=\\"currentColor\\" stroke-width=\\"2\\"><line x1=\\"18\\" y1=\\"20\\" x2=\\"18\\" y2=\\"10\\"/><line x1=\\"12\\" y1=\\"20\\" x2=\\"12\\" y2=\\"4\\"/><line x1=\\"6\\" y1=\\"20\\" x2=\\"6\\" y2=\\"14\\"/></svg></button>';
+    // For non-serialized non-kit lines, wire the lookup sheet to act as a
+    // bin picker — click a bin row to fill the inputs below instead of typing.
+    const sopickPickAttrs = (!line.isKit && !line.isSerialized)
+        ? ' data-bin-target="sopick-bin-' + idx + '" data-qty-target="sopick-qty-' + idx + '"' : '';
+    const sopickLookupBtn = '<button class="stock-lookup-btn" data-iid="' + escHtml(String(line.itemId)) + '" data-iname="' + escHtml(line.itemText) + '" data-locfn="sopick-location"' + sopickPickAttrs + ' onclick="stockLookupBtn(this)" title="Check bin stock"><svg viewBox=\\"0 0 24 24\\" fill=\\"none\\" stroke=\\"currentColor\\" stroke-width=\\"2\\"><line x1=\\"18\\" y1=\\"20\\" x2=\\"18\\" y2=\\"10\\"/><line x1=\\"12\\" y1=\\"20\\" x2=\\"12\\" y2=\\"4\\"/><line x1=\\"6\\" y1=\\"20\\" x2=\\"6\\" y2=\\"14\\"/></svg></button>';
     return '<div class="sopick-line' + stateClass + (line.quantityRemaining > 0 ? ' selected' : '') + '" id="sopick-line-' + idx + '">' +
         '<div class="sopick-line-header">' +
         '<input type="checkbox" id="sopick-check-' + idx + '" ' + checkedAttr + ' ' + disabledAttr + ' onchange="sopickToggleLine(' + idx + ')">' +
@@ -10212,6 +11178,7 @@ function sopickRenderLine(line, idx) {
         '<div class="sopick-line-meta">' +
         '<div><div>Ordered</div><div class="value">' + line.quantity + '</div></div>' +
         '<div><div>Fulfilled</div><div class="value">' + line.quantityFulfilled + '</div></div>' +
+        (line.quantityOnOpenIF ? '<div><div>On Open IF</div><div class="value" style="color:var(--warning, #f59e0b);">' + line.quantityOnOpenIF + '</div></div>' : '') +
         '<div><div>Remaining</div><div class="value">' + line.quantityRemaining + '</div></div></div>' +
         inputHtml + '</div>';
 }
@@ -10219,30 +11186,34 @@ function sopickRenderLine(line, idx) {
 function sopickUpdateCompSerialCount(idx, cidx, max) {
     const ta = document.getElementById('sopick-comp-serials-' + idx + '-' + cidx);
     const countEl = document.getElementById('sopick-comp-serial-count-' + idx + '-' + cidx);
-    const serials = ta.value.split('\\n').map(s => s.trim()).filter(s => s !== '');
+    if (!ta || !countEl) return;
 
-    const seen = new Set();
-    const dupes = [];
-    const deduped = serials.filter(s => { if (seen.has(s)) { dupes.push(s); return false; } seen.add(s); return true; });
+    // Cross-line + cross-component dupe check across the whole SO
+    const otherIds = window._collectSiblingTextareaIds
+        ? [].concat(
+            window._collectSiblingTextareaIds('[id^="sopick-serials-"]', ta.id),
+            window._collectSiblingTextareaIds('[id^="sopick-comp-serials-"]', ta.id)
+          )
+        : [];
 
-    if (dupes.length > 0) {
-        ta.value = deduped.join('\\n') + (ta.value.endsWith('\\n') ? '\\n' : '');
-        porcvDing();
-        ta.classList.remove('dupe-shake');
-        void ta.offsetWidth;
-        ta.classList.add('dupe-shake');
-        countEl.textContent = '\u26A0 Duplicate rejected: ' + [...new Set(dupes)].join(', ');
-        countEl.classList.add('has-dupe');
-        ta.classList.add('has-dupe');
-        setTimeout(() => {
-            countEl.textContent = deduped.length + ' of ' + max + ' serials entered';
+    window._dedupeSerialTextarea({
+        textarea: ta,
+        otherTextareaIds: otherIds,
+        onDupesFound: function(r) {
+            countEl.textContent = '\u26A0 Duplicate rejected: ' + [...new Set(r.dupes)].join(', ');
+            countEl.classList.add('has-dupe');
+        },
+        onClean: function(r) {
+            countEl.textContent = r.deduped.length + ' of ' + max + ' serials entered';
             countEl.classList.remove('has-dupe');
-            ta.classList.remove('has-dupe');
-        }, 2500);
-    } else {
-        countEl.textContent = deduped.length + ' of ' + max + ' serials entered';
-        countEl.classList.remove('has-dupe');
-        ta.classList.remove('has-dupe');
+        }
+    });
+
+    // Kick off real-time scan validation against the expected component item.
+    if (currentSOPickData && currentSOPickData.lines && currentSOPickData.lines[idx]
+        && currentSOPickData.lines[idx].components && currentSOPickData.lines[idx].components[cidx]) {
+        const comp = currentSOPickData.lines[idx].components[cidx];
+        _sopickQueueValidate('sopick-comp-serials-' + idx + '-' + cidx, comp.itemId, comp.itemText);
     }
 }
 
@@ -10252,33 +11223,272 @@ function sopickToggleLine(idx) {
     if (checked) el.classList.add('selected'); else el.classList.remove('selected');
 }
 
+// ═══════════════════════════════════════════════════════════
+//  REAL-TIME SERIAL SCAN VALIDATION
+//  As serials land in a textarea, check them against the expected
+//  item id. Wrong-item / not-in-stock scans get rejected immediately
+//  (line stripped, audible ding, red shake, toast, AND a persistent
+//  issues panel below the textarea so the picker can't miss it).
+//  Cache prevents re-checking the same serial twice.
+// ═══════════════════════════════════════════════════════════
+const _sopickValCache    = {};   // textareaId -> { serial: { state, info? } }
+const _sopickValTimer    = {};   // textareaId -> debounce handle
+const _sopickValIssues   = {};   // textareaId -> [{ serial, label, detail }]
+const _sopickErrorSerials = {};  // textareaId -> Set<string>  (invalid serials still in the textarea)
+
+// Map textareaId -> count subtitle id / issues panel id.
+function _sopickCountId(textareaId) {
+    if (textareaId.indexOf('sopick-comp-serials-') === 0) return textareaId.replace('sopick-comp-serials-', 'sopick-comp-serial-count-');
+    if (textareaId.indexOf('sopick-serials-')      === 0) return textareaId.replace('sopick-serials-',      'sopick-serial-count-');
+    return null;
+}
+function _sopickIssuesId(textareaId) {
+    if (textareaId.indexOf('sopick-comp-serials-') === 0) return textareaId.replace('sopick-comp-serials-', 'sopick-comp-serial-issues-');
+    if (textareaId.indexOf('sopick-serials-')      === 0) return textareaId.replace('sopick-serials-',      'sopick-serial-issues-');
+    return null;
+}
+
+function _sopickQueueValidate(textareaId, itemId, itemName, opts) {
+    if (!itemId) return;
+    if (_sopickValTimer[textareaId]) clearTimeout(_sopickValTimer[textareaId]);
+    const delay = (opts && opts.immediate) ? 0 : 250;
+    _sopickValTimer[textareaId] = setTimeout(() => {
+        _sopickRunValidate(textareaId, String(itemId), itemName || '', !!(opts && opts.includeTrailing));
+    }, delay);
+}
+
+async function _sopickRunValidate(textareaId, expectedItemId, expectedItemName, includeTrailing) {
+    const ta = document.getElementById(textareaId);
+    if (!ta) return;
+    if (!_sopickValCache[textareaId]) _sopickValCache[textareaId] = {};
+    const cache = _sopickValCache[textareaId];
+
+    // A line is "complete" if there's a newline after it. The last line without
+    // a trailing newline is treated as still being typed — unless includeTrailing
+    // is set (used by the blur handler so typed-then-tabbed entries still check).
+    const text = ta.value;
+    const rawLines = text.split('\\n').map(s => s.trim());
+    const completeLines = (includeTrailing || text.endsWith('\\n'))
+        ? rawLines.filter(Boolean)
+        : rawLines.slice(0, -1).filter(Boolean);
+
+    // First pass: reject any line cached as invalid. Catches the case where a
+    // user re-scans a previously-rejected serial — without this they'd land in
+    // the textarea silently because the cache hit skipped the server check.
+    // If already marked as an error (serial kept in textarea), just ensure
+    // the CSS class is still applied — don't re-toast on every keystroke.
+    completeLines.forEach(s => {
+        const e = cache[s];
+        if (e && e.state === 'invalid' && e.info) {
+            if (_sopickErrorSerials[textareaId] && _sopickErrorSerials[textareaId].has(s)) {
+                const _ta = document.getElementById(textareaId);
+                if (_ta) _ta.classList.add('sopick-has-error');
+            } else {
+                _sopickRejectBadSerial(textareaId, e.info, expectedItemName);
+            }
+        }
+    });
+
+    // Re-read after any rejections stripped lines.
+    const text2 = ta.value;
+    const rawLines2 = text2.split('\\n').map(s => s.trim());
+    const completeLines2 = (includeTrailing || text2.endsWith('\\n'))
+        ? rawLines2.filter(Boolean)
+        : rawLines2.slice(0, -1).filter(Boolean);
+
+    // ── Error-serial gate ────────────────────────────────────────────────
+    // While any invalid serial is still sitting in the textarea, block new
+    // scans.  The user must manually delete the highlighted line to continue.
+    {
+        const _activeErrors = _sopickErrorSerials[textareaId];
+        if (_activeErrors && _activeErrors.size > 0) {
+            // Prune serials the user already deleted from the textarea.
+            for (const s of [..._activeErrors]) {
+                if (!completeLines2.includes(s)) _activeErrors.delete(s);
+            }
+            if (_activeErrors.size > 0) {
+                // Strip any new serials that appeared while an error is unresolved.
+                const newScans = completeLines2.filter(
+                    s => !_activeErrors.has(s) && !(cache[s] && cache[s].state === 'valid')
+                );
+                if (newScans.length > 0) {
+                    const newScansSet = new Set(newScans);
+                    const hadTrailing2 = ta.value.endsWith('\\n');
+                    const filtered2 = ta.value.split('\\n').filter(l => !newScansSet.has(l.trim()));
+                    ta.value = filtered2.join('\\n') + (hadTrailing2 && filtered2.length ? '\\n' : '');
+                    toast('\\u26A0 Fix invalid serial first: <code>' + escHtml([..._activeErrors].join(', ')) + '</code>', 'error');
+                    ta.classList.remove('dupe-shake'); void ta.offsetWidth; ta.classList.add('dupe-shake');
+                    porcvDing();
+                }
+                if (countEl) countEl.classList.remove('validating');
+                return; // nothing more to do until the error is cleared
+            } else {
+                // All error serials have been deleted — clear the error state.
+                delete _sopickErrorSerials[textareaId];
+                ta.classList.remove('sopick-has-error');
+            }
+        }
+    }
+    // ─────────────────────────────────────────────────────────────────────
+
+    const toCheck = completeLines2.filter(s => !cache[s]);
+    if (!toCheck.length) return;
+
+    toCheck.forEach(s => { cache[s] = { state: 'pending' }; });
+
+    // In-flight indicator on the count subtitle.
+    const countEl = document.getElementById(_sopickCountId(textareaId));
+    if (countEl) countEl.classList.add('validating');
+
+    let result;
+    try {
+        result = await apiPost('validateSerialBatch', { itemId: expectedItemId, serials: toCheck });
+    } catch (e) {
+        toCheck.forEach(s => delete cache[s]); // allow retry
+        if (countEl) countEl.classList.remove('validating');
+        return;
+    }
+    if (countEl) countEl.classList.remove('validating');
+
+    if (!result || !result.success || !Array.isArray(result.validations)) {
+        toCheck.forEach(s => delete cache[s]);
+        return;
+    }
+    result.validations.forEach(v => {
+        cache[v.serial] = v.inStock ? { state: 'valid' } : { state: 'invalid', info: v };
+        if (!v.inStock) _sopickRejectBadSerial(textareaId, v, expectedItemName);
+    });
+}
+
+function _sopickRejectBadSerial(textareaId, info, expectedItemName) {
+    const ta = document.getElementById(textareaId);
+    if (!ta) return;
+    const trimmedTarget = (info.serial || '').trim();
+    if (!trimmedTarget) return;
+
+    // Keep the bad serial in the textarea — highlight it instead of removing it.
+    // The user must manually delete the invalid serial; new scans are blocked
+    // until they do (enforced by the error gate in _sopickRunValidate).
+    if (!_sopickErrorSerials[textareaId]) _sopickErrorSerials[textareaId] = new Set();
+    _sopickErrorSerials[textareaId].add(trimmedTarget);
+    ta.classList.add('sopick-has-error');
+
+    ta.classList.remove('dupe-shake');
+    void ta.offsetWidth;
+    ta.classList.add('dupe-shake');
+    porcvDing();
+
+    // Build clear messages for the toast + the persistent issues panel.
+    let reasonLabel, reasonDetail;
+    if (info.reason === 'wrong_item') {
+        reasonLabel  = 'WRONG ITEM';
+        reasonDetail = 'belongs to <strong>' + escHtml(info.belongsToItemName || 'another item') + '</strong>, not ' + escHtml(expectedItemName);
+    } else if (info.reason === 'depleted') {
+        reasonLabel  = 'NOT IN STOCK';
+        reasonDetail = 'serial exists for ' + escHtml(expectedItemName) + ' but quantity on hand is 0';
+    } else if (info.reason === 'not_found') {
+        reasonLabel  = 'NOT FOUND';
+        reasonDetail = 'this serial does not exist in NetSuite inventory';
+    } else {
+        reasonLabel  = 'INVALID';
+        reasonDetail = 'serial is not available for picking';
+    }
+    toast('\u26A0 <strong>' + reasonLabel + '</strong>: <code>' + escHtml(trimmedTarget) + '</code> \u2014 ' + reasonDetail, 'error');
+
+    // Persistent issues panel — accumulates, de-duped by serial (last reason wins).
+    if (!_sopickValIssues[textareaId]) _sopickValIssues[textareaId] = [];
+    _sopickValIssues[textareaId] = _sopickValIssues[textareaId].filter(it => it.serial !== trimmedTarget);
+    _sopickValIssues[textareaId].push({ serial: trimmedTarget, label: reasonLabel, detail: reasonDetail });
+    _sopickRenderIssuesPanel(textareaId);
+
+    // Reflect the removal in the count subtitle.
+    const countEl = document.getElementById(_sopickCountId(textareaId));
+    if (countEl) {
+        const liveSerials = ta.value.split('\\n').map(s => s.trim()).filter(Boolean);
+        const maxMatch = (countEl.textContent.match(/of (\\d+)/) || [])[1];
+        if (maxMatch) countEl.textContent = liveSerials.length + ' of ' + maxMatch + ' serials entered';
+    }
+}
+
+const _sopickIssuesTimer = {}; // textareaId -> auto-dismiss timeout handle
+
+function _sopickRenderIssuesPanel(textareaId) {
+    const panel = document.getElementById(_sopickIssuesId(textareaId));
+    if (!panel) return;
+    const issues = _sopickValIssues[textareaId] || [];
+    if (!issues.length) { panel.style.display = 'none'; panel.innerHTML = ''; return; }
+    panel.innerHTML =
+        '<div class="sopick-serial-issues-head">' +
+            '<span>\u26A0 ' + issues.length + ' rejected serial' + (issues.length === 1 ? '' : 's') + '</span>' +
+            '<button type="button" class="sopick-serial-issues-clear" onclick="_sopickClearIssues(\\''+textareaId+'\\')">clear</button>' +
+        '</div>' +
+        issues.map(it =>
+            '<div class="sopick-serial-issue"><code>' + escHtml(it.serial) + '</code> \u2014 <strong>' + it.label + '</strong>: ' + it.detail + '</div>'
+        ).join('');
+    panel.style.display = 'block';
+
+    // Auto-dismiss after 5 seconds. Resets on every new rejection so the user
+    // gets a fresh window after their most recent scan instead of the message
+    // vanishing in the middle of reading it.
+    if (_sopickIssuesTimer[textareaId]) clearTimeout(_sopickIssuesTimer[textareaId]);
+    _sopickIssuesTimer[textareaId] = setTimeout(() => {
+        _sopickClearIssues(textareaId);
+    }, 5000);
+}
+
+function _sopickClearIssues(textareaId) {
+    _sopickValIssues[textareaId] = [];
+    if (_sopickIssuesTimer[textareaId]) { clearTimeout(_sopickIssuesTimer[textareaId]); delete _sopickIssuesTimer[textareaId]; }
+    _sopickRenderIssuesPanel(textareaId);
+}
+
+// Blur handlers — validate the FINAL line too (handles cases where the user
+// types a serial and tabs/clicks away without pressing Enter first).
+function sopickValidateOnBlur(idx) {
+    if (!currentSOPickData || !currentSOPickData.lines || !currentSOPickData.lines[idx]) return;
+    const line = currentSOPickData.lines[idx];
+    if (!line.isSerialized) return;
+    _sopickQueueValidate('sopick-serials-' + idx, line.itemId, line.itemText, { immediate: true, includeTrailing: true });
+}
+function sopickValidateCompOnBlur(idx, cidx) {
+    if (!currentSOPickData || !currentSOPickData.lines || !currentSOPickData.lines[idx]) return;
+    const line = currentSOPickData.lines[idx];
+    if (!line.components || !line.components[cidx]) return;
+    const comp = line.components[cidx];
+    if (!comp.isSerialized) return;
+    _sopickQueueValidate('sopick-comp-serials-' + idx + '-' + cidx, comp.itemId, comp.itemText, { immediate: true, includeTrailing: true });
+}
+
 function sopickUpdateSerialCount(idx, max) {
     const ta = document.getElementById('sopick-serials-' + idx);
     const countEl = document.getElementById('sopick-serial-count-' + idx);
-    const serials = ta.value.split('\\n').map(s => s.trim()).filter(s => s !== '');
+    if (!ta || !countEl) return;
 
-    const seen = new Set();
-    const dupes = [];
-    const deduped = serials.filter(s => { if (seen.has(s)) { dupes.push(s); return false; } seen.add(s); return true; });
+    // Cross-line + cross-component dupe check across the whole SO
+    const otherIds = window._collectSiblingTextareaIds
+        ? [].concat(
+            window._collectSiblingTextareaIds('[id^="sopick-serials-"]', ta.id),
+            window._collectSiblingTextareaIds('[id^="sopick-comp-serials-"]', ta.id)
+          )
+        : [];
 
-    if (dupes.length > 0) {
-        ta.value = deduped.join('\\n') + (ta.value.endsWith('\\n') ? '\\n' : '');
-        porcvDing();
-        ta.classList.remove('dupe-shake');
-        void ta.offsetWidth;
-        ta.classList.add('dupe-shake');
-        countEl.textContent = '\u26A0 Duplicate rejected: ' + [...new Set(dupes)].join(', ');
-        countEl.classList.add('has-dupe');
-        ta.classList.add('has-dupe');
-        setTimeout(() => {
-            countEl.textContent = deduped.length + ' of ' + max + ' serials entered';
+    window._dedupeSerialTextarea({
+        textarea: ta,
+        otherTextareaIds: otherIds,
+        onDupesFound: function(r) {
+            countEl.textContent = '\u26A0 Duplicate rejected: ' + [...new Set(r.dupes)].join(', ');
+            countEl.classList.add('has-dupe');
+        },
+        onClean: function(r) {
+            countEl.textContent = r.deduped.length + ' of ' + max + ' serials entered';
             countEl.classList.remove('has-dupe');
-            ta.classList.remove('has-dupe');
-        }, 2500);
-    } else {
-        countEl.textContent = deduped.length + ' of ' + max + ' serials entered';
-        countEl.classList.remove('has-dupe');
-        ta.classList.remove('has-dupe');
+        }
+    });
+
+    // Kick off real-time scan validation (debounced) against the expected item.
+    if (currentSOPickData && currentSOPickData.lines && currentSOPickData.lines[idx]) {
+        const line = currentSOPickData.lines[idx];
+        _sopickQueueValidate('sopick-serials-' + idx, line.itemId, line.itemText);
     }
 }
 
@@ -10369,7 +11579,7 @@ async function sopickSubmit() {
     showProcessing('Creating Fulfillment...', 'Picking items from inventory');
 
     try {
-        const result = await apiPost('pickSOItems', { soId: currentSOPickData.soId, lines: selectedLines });
+        const result = await apiPost('pickSOItems', { soId: currentSOPickData.soId, locationId: sopickLocId, lines: selectedLines });
 
         if (result.success) {
             document.getElementById('sopick-lines-section').style.display = 'none';
@@ -10394,6 +11604,9 @@ function sopickReloadSO() {
 
 function sopickReset() {
     currentSOPickData = null;
+    // Clear per-textarea scan validation caches/timers
+    Object.keys(_sopickValCache).forEach(k => delete _sopickValCache[k]);
+    Object.keys(_sopickValTimer).forEach(k => { clearTimeout(_sopickValTimer[k]); delete _sopickValTimer[k]; });
     document.getElementById('sopick-so-input').value = '';
     document.getElementById('sopick-lines-section').style.display = 'none';
     document.getElementById('sopick-success').style.display = 'none';

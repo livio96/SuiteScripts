@@ -111,6 +111,19 @@ define([
             }
         }
 
+        // ── Item Lookup routing ────────────────────────────────
+        // Read-only lookup page: enter an item SKU or one+ serials,
+        // see exactly where they live (bins + qty + which serial in which bin).
+        if (action === 'itemlookup') {
+            try {
+                return createItemLookupForm(context);
+            } catch (ilErr) {
+                log.error({ title: 'Item Lookup Error', details: ilErr.message + '\n' + ilErr.stack });
+                context.response.write('Error: ' + ilErr.message);
+                return;
+            }
+        }
+
         try {
             switch (action) {
                 // ── API Endpoints (return JSON) ──────────────────
@@ -178,6 +191,18 @@ define([
                     return respondJson(context, getBinInventory(context.request.parameters));
                 case 'getBinInventoryForSerials':
                     return respondJson(context, getBinInventoryForSerials(context.request.parameters));
+                case 'validateSerialsExist':
+                    return respondJson(context, validateSerialsExist(context.request.parameters));
+                case 'binPutawaySerialized':
+                    return respondJson(context, apiBinPutawaySerialized(JSON.parse(context.request.body)));
+                case 'binPutawayNonSerialized':
+                    return respondJson(context, apiBinPutawayNonSerialized(JSON.parse(context.request.body)));
+                case 'inventoryStatusChangeSerialized':
+                    return respondJson(context, apiInventoryStatusChangeSerialized(JSON.parse(context.request.body)));
+                case 'inventoryStatusChangeNonSerialized':
+                    return respondJson(context, apiInventoryStatusChangeNonSerialized(JSON.parse(context.request.body)));
+                case 'getSerialsInBins':
+                    return respondJson(context, getSerialsInBins(context.request.parameters));
                 case 'getBinContents':
                     return respondJson(context, getBinContents(context.request.parameters));
                 case 'executeBulkBinTransfer':
@@ -1136,24 +1161,30 @@ define([
     //  DROPDOWN OPTIONS HELPERS
     // ═══════════════════════════════════════════════════════════
     const getItemOptions = (q) => {
-        const filters = [['type', 'anyof', 'InvtPart', 'SerializedInventoryItem']];
-        if (q) {
-            filters.push('AND');
-            filters.push([
-                ['itemid', 'contains', q], 'OR', ['displayname', 'contains', q]
-            ]);
-        }
         const results = [];
-        search.create({
-            type: search.Type.ITEM,
-            filters,
-            columns: [
-                search.createColumn({ name: 'itemid', sort: search.Sort.ASC }),
-                'displayname'
-            ]
-        }).run().getRange({ start: 0, end: 25 }).forEach(r => {
-            results.push({ id: r.id, name: r.getValue('itemid'), display: r.getValue('displayname') });
-        });
+        try {
+            const filters = [];
+            if (q && String(q).trim()) {
+                filters.push([
+                    ['itemid', 'contains', String(q).trim()], 'OR', ['displayname', 'contains', String(q).trim()]
+                ]);
+                filters.push('AND');
+            }
+            filters.push(['type', 'anyof', ['InvtPart', 'SerializedInventoryItem']]);
+            search.create({
+                type: search.Type.ITEM,
+                filters: filters,
+                columns: [
+                    search.createColumn({ name: 'itemid', sort: search.Sort.ASC }),
+                    search.createColumn({ name: 'displayname' })
+                ]
+            }).run().getRange({ start: 0, end: 25 }).forEach(r => {
+                results.push({ id: r.id, name: r.getValue('itemid'), display: r.getValue('displayname') });
+            });
+        } catch (e) {
+            log.error('getItemOptions Error', e.message);
+            return { success: false, message: 'getItemOptions: ' + e.message, results: [] };
+        }
         return { success: true, results };
     };
 
@@ -1960,9 +1991,15 @@ define([
             if (!matchedLine) {
                 receipt.setCurrentSublistValue({ sublistId: 'item', fieldId: 'itemreceive', value: false });
             } else {
+                // Final guard: serials are always stored UPPERCASE on receipt.
+                if (matchedLine.isSerialized && Array.isArray(matchedLine.serialNumbers)) {
+                    matchedLine.serialNumbers = matchedLine.serialNumbers.map(s => (s || '').trim().toUpperCase()).filter(Boolean);
+                }
                 receipt.setCurrentSublistValue({ sublistId: 'item', fieldId: 'itemreceive', value: true });
                 receipt.setCurrentSublistValue({ sublistId: 'item', fieldId: 'location', value: parseInt(data.locationId) });
                 const qty = matchedLine.isSerialized ? matchedLine.serialNumbers.length : (parseFloat(matchedLine.quantity) || 0);
+                // Per-item inventory status (set on the line in the wizard); falls back to a PO-level default.
+                const lineStatusId = matchedLine.inventoryStatusId || data.inventoryStatusId;
                 receipt.setCurrentSublistValue({ sublistId: 'item', fieldId: 'quantity', value: qty });
 
                 try {
@@ -1978,14 +2015,14 @@ define([
                             invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'receiptinventorynumber', value: serial.trim() });
                             invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity', value: 1 });
                             if (data.binId) invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', value: parseInt(data.binId) });
-                            if (data.inventoryStatusId) invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'inventorystatus', value: parseInt(data.inventoryStatusId) });
+                            if (lineStatusId) invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'inventorystatus', value: parseInt(lineStatusId) });
                             invDetail.commitLine({ sublistId: 'inventoryassignment' });
                         });
                     } else {
                         invDetail.selectNewLine({ sublistId: 'inventoryassignment' });
                         invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity', value: qty });
                         if (data.binId) invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', value: parseInt(data.binId) });
-                        if (data.inventoryStatusId) invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'inventorystatus', value: parseInt(data.inventoryStatusId) });
+                        if (lineStatusId) invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'inventorystatus', value: parseInt(lineStatusId) });
                         invDetail.commitLine({ sublistId: 'inventoryassignment' });
                     }
                 } catch (invErr) {
@@ -2121,6 +2158,15 @@ define([
         //   - status ItemShip:C = Shipped  (already reflected in quantityfulfilled)
         const openIFByLine = {}; // soLineIdx -> qty
         const openFulfillments = []; // [{ id, tranId, statusText }]
+        // Actual serial numbers already committed on those open IFs. Picked/Packed
+        // fulfillments do NOT reduce quantity-on-hand (that happens at Ship), so an
+        // already-picked serial still looks "in stock" to the validators — capturing
+        // them here is the only reliable way to know a serial is already spoken for
+        // and must not be picked a second time.
+        const pickedSerialsByLine = {}; // soLineIdx -> [serials]   (non-kit lines)
+        const pickedSerialsByItem = {}; // itemId    -> [serials]   (covers kit components)
+        const allPickedSerials = [];    // flat, de-duped list of every committed serial
+        const _pickedSeen = new Set();
         try {
             // Step 1: find the open IFs (mainline=T returns one row per IF).
             // `orderline` isn't exposed as a search column, so we can't get
@@ -2159,12 +2205,39 @@ define([
                         const receive = ifRec.getSublistValue({ sublistId: 'item', fieldId: 'itemreceive', line: li });
                         // Skip unchecked lines (they're not actually being fulfilled by this IF).
                         if (receive === false || receive === 'F') continue;
-                        const qty       = Math.abs(parseFloat(ifRec.getSublistValue({ sublistId: 'item', fieldId: 'quantity',  line: li })) || 0);
-                        const orderLine = parseFloat(ifRec.getSublistValue({ sublistId: 'item', fieldId: 'orderline', line: li }));
-                        if (qty <= 0 || isNaN(orderLine)) continue;
+                        const qty        = Math.abs(parseFloat(ifRec.getSublistValue({ sublistId: 'item', fieldId: 'quantity',  line: li })) || 0);
+                        const orderLine  = parseFloat(ifRec.getSublistValue({ sublistId: 'item', fieldId: 'orderline', line: li }));
+                        const lineItemId = String(ifRec.getSublistValue({ sublistId: 'item', fieldId: 'item', line: li }) || '');
                         // orderline on the IF sublist is 1-based; SO sublist is 0-based.
-                        const idx = orderLine - 1;
-                        openIFByLine[idx] = (openIFByLine[idx] || 0) + qty;
+                        const idx = (!isNaN(orderLine)) ? (orderLine - 1) : null;
+                        if (qty > 0 && idx !== null) {
+                            openIFByLine[idx] = (openIFByLine[idx] || 0) + qty;
+                        }
+
+                        // Pull the actual serial numbers committed on this IF line.
+                        let _pkInv = null;
+                        try { _pkInv = ifRec.getSublistSubrecord({ sublistId: 'item', fieldId: 'inventorydetail', line: li }); }
+                        catch (sdErr) { _pkInv = null; }
+                        if (_pkInv) {
+                            const _aCount = _pkInv.getLineCount({ sublistId: 'inventoryassignment' });
+                            for (let a = 0; a < _aCount; a++) {
+                                let sn = '';
+                                try { sn = _pkInv.getSublistText({ sublistId: 'inventoryassignment', fieldId: 'issueinventorynumber', line: a }); } catch (e1) {}
+                                if (!sn) { try { sn = _pkInv.getSublistText({ sublistId: 'inventoryassignment', fieldId: 'receiveinventorynumber', line: a }); } catch (e2) {} }
+                                const _t = (sn || '').trim();
+                                if (!_t) continue;
+                                if (idx !== null) {
+                                    if (!pickedSerialsByLine[idx]) pickedSerialsByLine[idx] = [];
+                                    pickedSerialsByLine[idx].push(_t);
+                                }
+                                if (lineItemId) {
+                                    if (!pickedSerialsByItem[lineItemId]) pickedSerialsByItem[lineItemId] = [];
+                                    pickedSerialsByItem[lineItemId].push(_t);
+                                }
+                                const _k = _t.toUpperCase();
+                                if (!_pickedSeen.has(_k)) { _pickedSeen.add(_k); allPickedSerials.push(_t); }
+                            }
+                        }
                     }
                 } catch (le) {
                     log.debug('loadSOForPicking: IF load failed for ' + info.id, le.message);
@@ -2191,7 +2264,8 @@ define([
                 lineNum: i, itemId, itemText, description,
                 quantity, quantityFulfilled, quantityOnOpenIF, quantityRemaining,
                 isSerialized: !!(itemMeta[itemId] && itemMeta[itemId].isSerialized),
-                isFullyFulfilled, isKit
+                isFullyFulfilled, isKit,
+                pickedSerials: pickedSerialsByLine[i] || []
             };
 
             if (isKit && kitComponents[itemId]) {
@@ -2200,14 +2274,15 @@ define([
                     itemText: comp.itemText,
                     quantityPerKit: comp.quantityPerKit,
                     totalQuantity: quantityRemaining * comp.quantityPerKit,
-                    isSerialized: comp.isSerialized
+                    isSerialized: comp.isSerialized,
+                    pickedSerials: pickedSerialsByItem[comp.itemId] || []
                 }));
             }
 
             lines.push(lineData);
         }
 
-        return { success: true, soId, soTranId, soStatus: soStatusText, soCustomer, soDate, lines, openFulfillments };
+        return { success: true, soId, soTranId, soStatus: soStatusText, soCustomer, soDate, lines, openFulfillments, pickedSerials: allPickedSerials };
     };
 
     // ═══════════════════════════════════════════════════════════
@@ -2332,11 +2407,84 @@ define([
     };
 
     // ═══════════════════════════════════════════════════════════
+    //  ALREADY-PICKED SERIAL GUARD
+    //  Returns a Set of (uppercased) serial numbers already committed on
+    //  this SO's open (Picked/Packed, not yet Shipped) Item Fulfillments.
+    //  Used as a submit-time safety net so a serial sitting on an open IF
+    //  can never be picked a second time (which would double-fulfill or
+    //  throw NetSuite's generic inventory-detail error).
+    // ═══════════════════════════════════════════════════════════
+    const getOpenIFPickedSerialSet = (soId) => {
+        const set = new Set();
+        if (!soId) return set;
+        try {
+            const ifIds = [];
+            search.create({
+                type: search.Type.ITEM_FULFILLMENT,
+                filters: [
+                    ['createdfrom', 'anyof', soId], 'AND',
+                    ['mainline', 'is', 'T'], 'AND',
+                    ['status', 'anyof', ['ItemShip:A', 'ItemShip:B']]
+                ],
+                columns: [search.createColumn({ name: 'internalid' })]
+            }).run().each(r => { ifIds.push(r.getValue({ name: 'internalid' })); return true; });
+
+            ifIds.forEach(id => {
+                try {
+                    const ifRec = record.load({ type: record.Type.ITEM_FULFILLMENT, id: parseInt(id) });
+                    const lc = ifRec.getLineCount({ sublistId: 'item' });
+                    for (let li = 0; li < lc; li++) {
+                        const receive = ifRec.getSublistValue({ sublistId: 'item', fieldId: 'itemreceive', line: li });
+                        if (receive === false || receive === 'F') continue;
+                        let inv = null;
+                        try { inv = ifRec.getSublistSubrecord({ sublistId: 'item', fieldId: 'inventorydetail', line: li }); }
+                        catch (e) { inv = null; }
+                        if (!inv) continue;
+                        const ac = inv.getLineCount({ sublistId: 'inventoryassignment' });
+                        for (let a = 0; a < ac; a++) {
+                            let sn = '';
+                            try { sn = inv.getSublistText({ sublistId: 'inventoryassignment', fieldId: 'issueinventorynumber', line: a }); } catch (e1) {}
+                            if (!sn) { try { sn = inv.getSublistText({ sublistId: 'inventoryassignment', fieldId: 'receiveinventorynumber', line: a }); } catch (e2) {} }
+                            const t = (sn || '').trim();
+                            if (t) set.add(t.toUpperCase());
+                        }
+                    }
+                } catch (le) { log.debug('getOpenIFPickedSerialSet: IF load failed for ' + id, le.message); }
+            });
+        } catch (e) { log.debug('getOpenIFPickedSerialSet: search failed', e.message); }
+        return set;
+    };
+
+    // ═══════════════════════════════════════════════════════════
     //  PICK / FULFILL SALES ORDER ITEMS
     // ═══════════════════════════════════════════════════════════
     const pickSOItems = (data) => {
         if (!data.soId) return { success: false, message: 'Sales Order ID is required.' };
         if (!data.lines || !data.lines.length) return { success: false, message: 'No lines selected for picking.' };
+
+        // ── Guard: never re-pick a serial already committed on an open IF ──
+        // The client strips these at scan time, but this is the authoritative
+        // backstop (e.g. two pickers on the same SO, or a stale page).
+        try {
+            const _pickedSet = getOpenIFPickedSerialSet(data.soId);
+            if (_pickedSet && _pickedSet.size) {
+                const _hit = [];
+                const _scan = (arr) => { (arr || []).forEach(s => { const t = (s || '').trim(); if (t && _pickedSet.has(t.toUpperCase())) _hit.push(t); }); };
+                data.lines.forEach(l => {
+                    if (l.isKit && l.components) l.components.forEach(c => { if (c.isSerialized) _scan(c.serialNumbers); });
+                    else if (l.isSerialized) _scan(l.serialNumbers);
+                });
+                if (_hit.length) {
+                    const _uniq = Array.from(new Set(_hit));
+                    const _shown = _uniq.slice(0, 15).join(', ') + (_uniq.length > 15 ? ' (+' + (_uniq.length - 15) + ' more)' : '');
+                    return {
+                        success: false,
+                        alreadyPicked: _uniq,
+                        message: 'These serial(s) are already picked on an open fulfillment and can\'t be picked again: ' + _shown + '. Reload the SO to refresh.'
+                    };
+                }
+            }
+        } catch (pkErr) { log.debug('pickSOItems: already-picked guard failed', pkErr.message); }
 
         // ── Pre-flight: verify every submitted serial actually has on-hand stock ──
         // Catches typos, already-shipped serials, and depleted serials so the user
@@ -2682,6 +2830,117 @@ define([
         });
 
         return { success: true, items: items, invalid: serialData.invalid || [] };
+    };
+
+    // Lightweight pre-submit check for Bin Putaway: takes a list of serials
+    // and returns which ones don't exist in NetSuite stock. No bin lookup,
+    // no per-item aggregation — just a fast "do these exist?" verdict so
+    // the operator can see the bad ones before committing the transfer.
+    const validateSerialsExist = (params) => {
+        const serialsRaw = params.serials || '';
+        if (!serialsRaw) return { success: false, message: 'Serials are required.' };
+        const serialTexts = cleanSerialInput(serialsRaw);
+        if (!serialTexts.length) return { success: false, message: 'No serials provided.' };
+        const serialData = lookupSerialDetails(serialTexts);
+        return {
+            success: true,
+            validCount: (serialData.valid || []).length,
+            invalidCount: (serialData.invalid || []).length,
+            invalid: serialData.invalid || []
+        };
+    };
+
+    // Return the actual serial numbers in stock for an item, grouped by bin.
+    // Used by the SO-picking "Pick All" button so the operator can pull every
+    // serial from a bin into the scan textarea in one tap. Only returns serials
+    // with on-hand quantity (i.e. actually pickable). For kits, expands to the
+    // member items and tags each bin group with its component name.
+    const getSerialsInBins = (params) => {
+        const itemId = params.itemId;
+        const locationId = params.locationId;
+        if (!itemId || !locationId) return { success: false, message: 'Item and location are required.' };
+
+        // Detect kit and expand to components, mirroring getBinInventory.
+        let itemType = '';
+        try {
+            const meta = search.lookupFields({ type: search.Type.ITEM, id: itemId, columns: ['type'] });
+            itemType = (meta && meta.type && meta.type[0] && meta.type[0].value) || '';
+        } catch (e) { /* treat as regular item */ }
+        const isKit = (itemType === 'Kit' || itemType === 'kit');
+
+        const lookupItems = [];
+        const itemLabel = {};
+        if (isKit) {
+            try {
+                const kitRec = record.load({ type: 'kititem', id: parseInt(itemId) });
+                const memberCount = kitRec.getLineCount({ sublistId: 'member' });
+                for (let m = 0; m < memberCount; m++) {
+                    const compId = String(kitRec.getSublistValue({ sublistId: 'member', fieldId: 'item', line: m }));
+                    const compText = kitRec.getSublistText({ sublistId: 'member', fieldId: 'item', line: m }) || compId;
+                    if (!lookupItems.includes(compId)) lookupItems.push(compId);
+                    itemLabel[compId] = compText;
+                }
+            } catch (e) {
+                return { success: false, message: 'Could not load kit components: ' + e.message };
+            }
+            if (!lookupItems.length) return { success: true, bins: [], isKit: true };
+        } else {
+            lookupItems.push(String(itemId));
+        }
+
+        // binName -> { bin, component, serials: [] }
+        const binMap = {};
+        try {
+            const srch = search.create({
+                type: 'inventorybalance',
+                filters: [
+                    ['item', 'anyof', lookupItems], 'AND',
+                    ['location', 'anyof', [locationId]], 'AND',
+                    ['onhand', 'greaterthan', 0]
+                ],
+                columns: [
+                    search.createColumn({ name: 'item' }),
+                    search.createColumn({ name: 'inventorynumber' }),
+                    search.createColumn({ name: 'binnumber' }),
+                    search.createColumn({ name: 'onhand' }),
+                    search.createColumn({ name: 'available' })
+                ]
+            });
+            const paged = srch.runPaged({ pageSize: 1000 });
+            paged.pageRanges.forEach(pr => {
+                paged.fetch({ index: pr.index }).data.forEach(r => {
+                    const serial = (r.getText({ name: 'inventorynumber' }) || '').trim();
+                    const binName = r.getText({ name: 'binnumber' }) || r.getValue({ name: 'binnumber' }) || '(No Bin)';
+                    const availRaw = r.getValue({ name: 'available' });
+                    const avail = parseFloat(availRaw);
+                    const onhand = parseFloat(r.getValue({ name: 'onhand' })) || 0;
+                    if (!serial) return; // skip non-serialized rows
+                    // Only offer serials that are actually AVAILABLE to pick (not
+                    // committed/reserved elsewhere). If the available column is
+                    // populated, it's the source of truth. Only fall back to
+                    // on-hand when available is genuinely absent (rare).
+                    const availIsKnown = (availRaw !== '' && availRaw !== null && !isNaN(avail));
+                    if (availIsKnown) {
+                        if (avail <= 0) return;        // committed/reserved -> not pickable
+                    } else {
+                        if (onhand <= 0) return;       // no availability data; require on-hand
+                    }
+                    const rowItemId = String(r.getValue({ name: 'item' }));
+                    if (!binMap[binName]) {
+                        binMap[binName] = { bin: binName, component: itemLabel[rowItemId] || '', serials: [] };
+                    }
+                    if (binMap[binName].serials.indexOf(serial) === -1) {
+                        binMap[binName].serials.push(serial);
+                    }
+                });
+            });
+        } catch (e) {
+            log.debug('getSerialsInBins error', e.message);
+            return { success: false, message: 'Could not retrieve serials: ' + e.message };
+        }
+
+        const bins = Object.keys(binMap).map(b => binMap[b]);
+        return { success: true, bins: bins, isKit: isKit };
     };
 
     // ═══════════════════════════════════════════════════════════
@@ -4239,6 +4498,8 @@ define([
                             + '<td><button type="button" onclick="removeNsGridRow(' + nsGridRowId + ')" style="background:none;border:none;color:#ef4444;cursor:pointer;font-size:20px;padding:6px 10px;min-height:44px;min-width:44px;" title="Remove">&times;</button></td>';
                         tbody.appendChild(tr);
                         updateNsRowCount();
+                        var iEl = tr.querySelector('.ns-item-input'); if (iEl && window.WAAC) WAAC.attach(iEl, { type: 'item', apiUrl: nsBinsApiUrl });
+                        var bEl = tr.querySelector('.ns-bin-input');  if (bEl && window.WAAC) WAAC.attach(bEl, { type: 'bin', datalistId: 'ns-bin-datalist' });
                         var newInput = tr.querySelector('.ns-item-input');
                         if (newInput) newInput.focus();
                     }
@@ -4656,7 +4917,7 @@ define([
             const suiteletUrl = url.resolveScript({ scriptId: runtime.getCurrentScript().id, deploymentId: runtime.getCurrentScript().deploymentId });
 
             const styleField = form.addField({ id: 'custpage_styles', type: serverWidget.FieldType.INLINEHTML, label: ' ' });
-            styleField.defaultValue = getStyles() + getEntryFormScript(suiteletUrl);
+            styleField.defaultValue = getStyles() + getEntryFormScript(suiteletUrl) + getAutocompleteJs();
 
             let msgHtml = '';
             if (message) {
@@ -5558,7 +5819,7 @@ define([
                                 <div class="input-group">
                                     <label class="custom-label">Destination Bin</label>
                                     <div style="display:flex;gap:6px;align-items:center;">
-                                        <input type="text" id="bp_to_bin" list="bp-bin-datalist" autocomplete="off" placeholder="Type or scan bin" style="flex:1;min-width:0;padding:14px 16px;border:2px solid #d1d5db;border-radius:10px;font-size:16px;background:#f9fafb;min-height:48px;">
+                                        <input type="text" id="bp_to_bin" autocomplete="off" placeholder="Type or scan bin" style="flex:1;min-width:0;padding:14px 16px;border:2px solid #d1d5db;border-radius:10px;font-size:16px;background:#f9fafb;min-height:48px;">
                                         <button type="button" title="Where are these serials' items currently stored?" onclick="openBpSerialStockLookup()" style="background:#f3f4f6;border:1.5px solid #d1d5db;border-radius:10px;cursor:pointer;padding:0;width:48px;height:48px;flex-shrink:0;display:flex;align-items:center;justify-content:center;color:#374151;">
                                             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.3-4.3"></path></svg>
                                         </button>
@@ -5604,6 +5865,24 @@ define([
                         <div class="bp-modal-body" id="bp-modal-body"></div>
                     </div>
                 </div>
+
+                <!-- ▼ Invalid-serial confirmation modal (only appears when there are unknown serials at submit time) -->
+                <div class="bp-modal-overlay" id="bp-confirm-overlay" onclick="if(event.target===this)closeBpConfirmModal()">
+                    <div class="bp-modal" role="dialog" aria-modal="true" aria-labelledby="bp-confirm-title">
+                        <div class="bp-modal-head" style="background:#fef3c7;">
+                            <div class="bp-modal-head-text">
+                                <div class="bp-modal-title" id="bp-confirm-title">&#9888; Some serials were not found</div>
+                                <div class="bp-modal-sub" id="bp-confirm-sub"></div>
+                            </div>
+                            <button type="button" class="bp-modal-close" aria-label="Close" onclick="closeBpConfirmModal()">&times;</button>
+                        </div>
+                        <div class="bp-modal-body" id="bp-confirm-body"></div>
+                        <div style="padding:14px 18px;border-top:1px solid #e5e7eb;display:flex;gap:10px;flex-shrink:0;background:#fff;">
+                            <button type="button" class="custom-btn btn-outline" style="flex:1;margin:0;" onclick="closeBpConfirmModal()">Cancel</button>
+                            <button type="button" class="custom-btn btn-success" style="flex:1;margin:0;" onclick="bpConfirmAndSubmit()">Continue with valid only</button>
+                        </div>
+                    </div>
+                </div>
                 <div style="display:none;">
             `;
 
@@ -5639,6 +5918,8 @@ define([
                     if (bw && bl) bw.appendChild(bl.parentNode);
                     updateBpCount();
                     await loadBpBins();
+                    var btb = document.getElementById('bp_to_bin');
+                    if (btb && typeof bpAttachAutocomplete === 'function') bpAttachAutocomplete(btb, 'bin');
                     addBpNsGridRow();
                     var bf = document.getElementById('custpage_bp_serials');
                     if (bf) { bf.addEventListener('input', updateBpCount); bf.addEventListener('paste', function() { setTimeout(updateBpCount, 50); }); }
@@ -5647,6 +5928,116 @@ define([
             </script>`;
 
             context.response.writePage(form);
+        }
+
+        // ════════════════════════════════════════════════════════════════
+        //  SHARED SKU / BIN TYPEAHEAD  (window.WAAC)
+        //  Document-agnostic: works in the main SPA and in every iframe
+        //  Suitelet form. Injects its own CSS once. Attach with:
+        //    WAAC.attach(inputEl, { type:'item', apiUrl: <suiteletUrl> })
+        //    WAAC.attach(inputEl, { type:'bin',  datalistId:'some-datalist' })
+        //  Bin mode reads its options live from the named <datalist> (so all
+        //  existing bin-loading code keeps working untouched); item mode hits
+        //  the existing getItems endpoint (debounced). One shared dropdown is
+        //  appended to <body> with fixed positioning so it never gets clipped.
+        // ════════════════════════════════════════════════════════════════
+        function getAutocompleteJs() {
+            return `<script>
+            (function(){
+                if (window.WAAC) return;
+                function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c];});}
+                var dd=null, st=null, timer=null, seq=0;
+                function ensureStyles(){
+                    if (document.getElementById('wa-ac-styles')) return;
+                    var s=document.createElement('style'); s.id='wa-ac-styles';
+                    s.textContent='.wa-ac-dd{position:fixed;z-index:2147483600;display:none;background:#fff;border:1px solid #d1d5db;border-radius:10px;box-shadow:0 12px 32px rgba(0,0,0,.18);max-height:280px;overflow-y:auto;-webkit-overflow-scrolling:touch;font-size:14px;padding:4px 0;}'
+                        +'.wa-ac-dd.open{display:block;}'
+                        +'.wa-ac-it{padding:10px 14px;cursor:pointer;display:flex;flex-direction:column;gap:2px;justify-content:center;border-bottom:1px solid #f1f3f5;min-height:44px;box-sizing:border-box;}'
+                        +'.wa-ac-it:last-child{border-bottom:none;}'
+                        +'.wa-ac-it.active,.wa-ac-it:hover{background:#eff6ff;}'
+                        +'.wa-ac-nm{font-weight:600;color:#111827;word-break:break-word;}'
+                        +'.wa-ac-nm mark{background:#fde68a;color:inherit;padding:0;border-radius:2px;}'
+                        +'.wa-ac-sub{font-size:12px;color:#6b7280;word-break:break-word;}'
+                        +'.wa-ac-msg{padding:14px;text-align:center;color:#6b7280;font-size:13px;}';
+                    (document.head||document.documentElement).appendChild(s);
+                }
+                function ensureEl(){
+                    if (dd) return dd;
+                    ensureStyles();
+                    dd=document.createElement('div'); dd.className='wa-ac-dd';
+                    dd.addEventListener('mousedown',function(e){
+                        var row=e.target&&e.target.closest?e.target.closest('.wa-ac-it'):null;
+                        if(!row)return; e.preventDefault(); choose(parseInt(row.getAttribute('data-i'),10));
+                    });
+                    document.body.appendChild(dd);
+                    window.addEventListener('resize',function(){if(st)position();});
+                    window.addEventListener('scroll',function(){if(st)position();},true);
+                    return dd;
+                }
+                function position(){ if(!st||!dd)return; var r=st.input.getBoundingClientRect();
+                    dd.style.left=r.left+'px'; dd.style.top=(r.bottom+4)+'px'; dd.style.width=Math.max(r.width,200)+'px'; }
+                function close(){ if(dd){dd.classList.remove('open');dd.innerHTML='';} st=null; }
+                function hl(name,q){ var sf=esc(name); if(!q)return sf; var p=String(name).toLowerCase().indexOf(q.toLowerCase()); if(p<0)return sf;
+                    return esc(name.substring(0,p))+'<mark>'+esc(name.substring(p,p+q.length))+'</mark>'+esc(name.substring(p+q.length)); }
+                function render(items,q){ ensureEl(); if(!st)return; st.items=items; st.idx=items.length?0:-1;
+                    if(!items.length){ dd.innerHTML='<div class="wa-ac-msg">No matches</div>'; }
+                    else { var h=''; for(var i=0;i<items.length;i++){ var it=items[i];
+                        var sub=(st.type==='item'&&it.display)?'<div class="wa-ac-sub">'+esc(it.display)+'</div>':'';
+                        h+='<div class="wa-ac-it'+(i===0?' active':'')+'" data-i="'+i+'"><div class="wa-ac-nm">'+hl(it.name,q)+'</div>'+sub+'</div>'; }
+                        dd.innerHTML=h; }
+                    dd.classList.add('open'); position(); }
+                function loading(){ ensureEl(); dd.innerHTML='<div class="wa-ac-msg">Searching\\u2026</div>'; dd.classList.add('open'); position(); }
+                function choose(i){ if(!st||isNaN(i)||i<0||i>=st.items.length)return; var it=st.items[i]; var inp=st.input; var ty=st.type;
+                    inp.value=it.name; if(ty==='item'&&it.id!=null)inp.setAttribute('data-item-id',it.id);
+                    close();
+                    inp.setAttribute('data-wa-skip','1');
+                    inp.dispatchEvent(new Event('input',{bubbles:true}));
+                    inp.dispatchEvent(new Event('change',{bubbles:true}));
+                    inp.removeAttribute('data-wa-skip');
+                    inp.focus(); }
+                function move(d){ if(!st||!st.items.length)return; var n=st.items.length; st.idx=(st.idx+d+n)%n;
+                    var rows=dd.querySelectorAll('.wa-ac-it'); for(var i=0;i<rows.length;i++)rows[i].classList.toggle('active',i===st.idx);
+                    var a=rows[st.idx]; if(a&&a.scrollIntoView)a.scrollIntoView({block:'nearest'}); }
+                function binSource(opts){
+                    if (typeof opts.bins==='function'){ try{return opts.bins()||[];}catch(e){return [];} }
+                    if (Object.prototype.toString.call(opts.bins)==='[object Array]') return opts.bins;
+                    if (opts.datalistId){ var dl=document.getElementById(opts.datalistId); if(!dl)return [];
+                        var out=[]; var os=dl.querySelectorAll('option');
+                        for(var i=0;i<os.length;i++){ var v=os[i].value||os[i].getAttribute('value')||os[i].textContent; if(v)out.push({name:v}); }
+                        return out; }
+                    return [];
+                }
+                function query(inp,opts){
+                    var q=(inp.value||'').trim();
+                    if(opts.type==='bin'){
+                        if(!q){close();return;}
+                        var lc=q.toLowerCase(); var src=binSource(opts); var m=[];
+                        for(var i=0;i<src.length&&m.length<50;i++){ if((src[i].name||'').toLowerCase().indexOf(lc)!==-1)m.push(src[i]); }
+                        render(m,q);
+                    } else {
+                        var min=opts.minItem||2; if(q.length<min){close();return;}
+                        if(timer)clearTimeout(timer); var my=++seq; loading();
+                        timer=setTimeout(async function(){
+                            try{ var resp=await fetch(opts.apiUrl+'&action=getItems&q='+encodeURIComponent(q)); var data=await resp.json();
+                                if(my!==seq)return; if(!st||st.input!==inp)return; render((data&&data.results)?data.results:[],q);
+                            }catch(e){ if(my===seq&&st&&st.input===inp)close(); }
+                        },200);
+                    }
+                }
+                function attach(inp,opts){
+                    if(!inp||inp.getAttribute('data-wa-ac'))return;
+                    opts=opts||{}; var type=opts.type||'bin'; opts.type=type;
+                    inp.setAttribute('data-wa-ac',type); inp.setAttribute('autocomplete','off'); inp.removeAttribute('list');
+                    inp.addEventListener('input',function(){ if(inp.getAttribute('data-wa-skip'))return; st={input:inp,type:type,items:[],idx:-1}; query(inp,opts); });
+                    inp.addEventListener('focus',function(){ if(!(inp.value||'').trim())return; st={input:inp,type:type,items:[],idx:-1}; query(inp,opts); });
+                    inp.addEventListener('keydown',function(e){ if(!st||st.input!==inp||!dd||!dd.classList.contains('open'))return;
+                        if(e.key==='ArrowDown'){e.preventDefault();move(1);} else if(e.key==='ArrowUp'){e.preventDefault();move(-1);}
+                        else if(e.key==='Enter'){ if(st.idx>=0){e.preventDefault();choose(st.idx);} } else if(e.key==='Escape'){close();} });
+                    inp.addEventListener('blur',function(){ setTimeout(function(){ if(st&&st.input===inp)close(); },150); });
+                }
+                window.WAAC={ attach:attach };
+            })();
+            </script>`;
         }
 
         function getBinPutawayFormScript(bpSuiteletUrl) {
@@ -5743,6 +6134,27 @@ define([
                         .bp-modal-row { padding:14px; }
                         .bp-modal-section, .bp-modal-banner { padding:10px 14px; }
                     }
+
+                    /* ─── SKU / Bin typeahead dropdown ─── */
+                    .bp-ac-dropdown {
+                        position:fixed; z-index:100000; display:none;
+                        background:#fff; border:1px solid #d1d5db; border-radius:10px;
+                        box-shadow:0 12px 32px rgba(0,0,0,.18);
+                        max-height:280px; overflow-y:auto; -webkit-overflow-scrolling:touch;
+                        font-size:14px; padding:4px 0;
+                    }
+                    .bp-ac-dropdown.open { display:block; }
+                    .bp-ac-item {
+                        padding:10px 14px; cursor:pointer;
+                        display:flex; flex-direction:column; gap:2px; justify-content:center;
+                        border-bottom:1px solid #f1f3f5; min-height:44px;
+                    }
+                    .bp-ac-item:last-child { border-bottom:none; }
+                    .bp-ac-item.active, .bp-ac-item:hover { background:#eff6ff; }
+                    .bp-ac-item-name { font-weight:600; color:#111827; word-break:break-word; }
+                    .bp-ac-item-name mark { background:#fde68a; color:inherit; padding:0; border-radius:2px; }
+                    .bp-ac-item-sub { font-size:12px; color:#6b7280; word-break:break-word; }
+                    .bp-ac-empty, .bp-ac-loading { padding:14px; text-align:center; color:#6b7280; font-size:13px; }
                 </style>
                 <script>
                     window.onbeforeunload = null;
@@ -5767,6 +6179,7 @@ define([
                             var resp = await fetch(bpBinsApiUrl + '&action=getBins&location=1');
                             var data = await resp.json();
                             if (data.results && data.results.length) {
+                                bpBinList = data.results;
                                 var dl = document.getElementById('bp-bin-datalist');
                                 if (dl) {
                                     dl.innerHTML = '';
@@ -5778,6 +6191,172 @@ define([
                                 }
                             }
                         } catch(e) { console.error('Failed to load bins for putaway:', e); }
+                    }
+
+                    // ═══════════════════════════════════════════════════════
+                    //  SKU / BIN TYPEAHEAD
+                    //  One shared dropdown (appended to <body>, position:fixed so
+                    //  it never gets clipped by the grid's overflow). Item lookups
+                    //  hit the server (getItems, debounced); bin lookups filter the
+                    //  already-loaded bin list client-side. Attach with
+                    //  bpAttachAutocomplete(inputEl, 'item' | 'bin').
+                    // ═══════════════════════════════════════════════════════
+                    var bpBinList = [];   // [{id,name}] cached bins for client-side filtering
+                    var _bpAcEl = null;   // shared dropdown node
+                    var _bpAc = null;     // active state { input, type, items, activeIndex }
+                    var _bpAcTimer = null;
+                    var _bpAcSeq = 0;     // guards against out-of-order async item results
+
+                    function _bpAcEnsureEl() {
+                        if (_bpAcEl) return _bpAcEl;
+                        _bpAcEl = document.createElement('div');
+                        _bpAcEl.className = 'bp-ac-dropdown';
+                        // mousedown (not click) so the pick lands before the input blurs.
+                        _bpAcEl.addEventListener('mousedown', function(e) {
+                            var row = e.target && e.target.closest ? e.target.closest('.bp-ac-item') : null;
+                            if (!row) return;
+                            e.preventDefault();
+                            _bpAcChoose(parseInt(row.getAttribute('data-idx'), 10));
+                        });
+                        document.body.appendChild(_bpAcEl);
+                        window.addEventListener('resize', function() { if (_bpAc) _bpAcPosition(); });
+                        window.addEventListener('scroll', function() { if (_bpAc) _bpAcPosition(); }, true);
+                        return _bpAcEl;
+                    }
+
+                    function _bpAcPosition() {
+                        if (!_bpAc || !_bpAcEl) return;
+                        var r = _bpAc.input.getBoundingClientRect();
+                        _bpAcEl.style.left = r.left + 'px';
+                        _bpAcEl.style.top = (r.bottom + 4) + 'px';
+                        _bpAcEl.style.width = Math.max(r.width, 200) + 'px';
+                    }
+
+                    function _bpAcClose() {
+                        if (_bpAcEl) { _bpAcEl.classList.remove('open'); _bpAcEl.innerHTML = ''; }
+                        _bpAc = null;
+                    }
+
+                    function _bpAcHighlight(name, q) {
+                        var safe = _bpEscHtml(name);
+                        if (!q) return safe;
+                        var pos = name.toLowerCase().indexOf(q.toLowerCase());
+                        if (pos < 0) return safe;
+                        return _bpEscHtml(name.substring(0, pos))
+                            + '<mark>' + _bpEscHtml(name.substring(pos, pos + q.length)) + '</mark>'
+                            + _bpEscHtml(name.substring(pos + q.length));
+                    }
+
+                    function _bpAcRender(items, q) {
+                        _bpAcEnsureEl();
+                        if (!_bpAc) return;
+                        _bpAc.items = items;
+                        _bpAc.activeIndex = items.length ? 0 : -1;
+                        if (!items.length) {
+                            _bpAcEl.innerHTML = '<div class="bp-ac-empty">No matches</div>';
+                        } else {
+                            var html = '';
+                            for (var i = 0; i < items.length; i++) {
+                                var it = items[i];
+                                var sub = (_bpAc.type === 'item' && it.display)
+                                    ? '<div class="bp-ac-item-sub">' + _bpEscHtml(it.display) + '</div>' : '';
+                                html += '<div class="bp-ac-item' + (i === 0 ? ' active' : '') + '" data-idx="' + i + '">'
+                                    + '<div class="bp-ac-item-name">' + _bpAcHighlight(it.name, q) + '</div>' + sub + '</div>';
+                            }
+                            _bpAcEl.innerHTML = html;
+                        }
+                        _bpAcEl.classList.add('open');
+                        _bpAcPosition();
+                    }
+
+                    function _bpAcLoading() {
+                        _bpAcEnsureEl();
+                        _bpAcEl.innerHTML = '<div class="bp-ac-loading">Searching\u2026</div>';
+                        _bpAcEl.classList.add('open');
+                        _bpAcPosition();
+                    }
+
+                    function _bpAcChoose(idx) {
+                        if (!_bpAc || isNaN(idx) || idx < 0 || idx >= _bpAc.items.length) return;
+                        var it = _bpAc.items[idx];
+                        var input = _bpAc.input;
+                        var type = _bpAc.type;
+                        input.value = it.name;
+                        if (type === 'item' && it.id != null) input.setAttribute('data-item-id', it.id);
+                        _bpAcClose();
+                        // Let any existing listeners (counts, etc.) react, but don't reopen.
+                        input.setAttribute('data-bp-ac-skip', '1');
+                        input.dispatchEvent(new Event('input', { bubbles: true }));
+                        input.removeAttribute('data-bp-ac-skip');
+                        input.focus();
+                    }
+
+                    function _bpAcSetActive(delta) {
+                        if (!_bpAc || !_bpAc.items.length) return;
+                        var n = _bpAc.items.length;
+                        _bpAc.activeIndex = (_bpAc.activeIndex + delta + n) % n;
+                        var rows = _bpAcEl.querySelectorAll('.bp-ac-item');
+                        for (var i = 0; i < rows.length; i++) rows[i].classList.toggle('active', i === _bpAc.activeIndex);
+                        var active = rows[_bpAc.activeIndex];
+                        if (active && active.scrollIntoView) active.scrollIntoView({ block: 'nearest' });
+                    }
+
+                    function _bpAcQuery(input, type) {
+                        var q = (input.value || '').trim();
+                        if (type === 'bin') {
+                            if (!q) { _bpAcClose(); return; }
+                            var lc = q.toLowerCase();
+                            var matches = [];
+                            for (var i = 0; i < bpBinList.length && matches.length < 50; i++) {
+                                if ((bpBinList[i].name || '').toLowerCase().indexOf(lc) !== -1) matches.push(bpBinList[i]);
+                            }
+                            _bpAcRender(matches, q);
+                        } else {
+                            if (q.length < 2) { _bpAcClose(); return; }
+                            if (_bpAcTimer) clearTimeout(_bpAcTimer);
+                            var mySeq = ++_bpAcSeq;
+                            _bpAcLoading();
+                            _bpAcTimer = setTimeout(async function() {
+                                try {
+                                    var resp = await fetch(bpBinsApiUrl + '&action=getItems&q=' + encodeURIComponent(q));
+                                    var data = await resp.json();
+                                    if (mySeq !== _bpAcSeq) return;                 // stale response
+                                    if (!_bpAc || _bpAc.input !== input) return;     // focus moved on
+                                    _bpAcRender((data && data.results) ? data.results : [], q);
+                                } catch (e) {
+                                    if (mySeq === _bpAcSeq && _bpAc && _bpAc.input === input) _bpAcClose();
+                                }
+                            }, 200);
+                        }
+                    }
+
+                    function bpAttachAutocomplete(input, type) {
+                        if (!input || input.getAttribute('data-bp-ac')) return;
+                        input.setAttribute('data-bp-ac', type);
+                        input.setAttribute('autocomplete', 'off');
+                        input.removeAttribute('list');   // drop native datalist to avoid a double dropdown
+
+                        input.addEventListener('input', function() {
+                            if (input.getAttribute('data-bp-ac-skip')) return;
+                            _bpAc = { input: input, type: type, items: [], activeIndex: -1 };
+                            _bpAcQuery(input, type);
+                        });
+                        input.addEventListener('focus', function() {
+                            if (type === 'bin') return;               // bins: only open on typing, never on focus
+                            if (!(input.value || '').trim()) return;
+                            _bpAc = { input: input, type: type, items: [], activeIndex: -1 };
+                            _bpAcQuery(input, type);
+                        });
+                        input.addEventListener('keydown', function(e) {
+                            if (!_bpAc || _bpAc.input !== input || !_bpAcEl || !_bpAcEl.classList.contains('open')) return;
+                            if (e.key === 'ArrowDown')      { e.preventDefault(); _bpAcSetActive(1); }
+                            else if (e.key === 'ArrowUp')   { e.preventDefault(); _bpAcSetActive(-1); }
+                            else if (e.key === 'Enter')     { if (_bpAc.activeIndex >= 0) { e.preventDefault(); _bpAcChoose(_bpAc.activeIndex); } }
+                            else if (e.key === 'Escape')    { _bpAcClose(); }
+                        });
+                        input.addEventListener('blur', function() {
+                            setTimeout(function() { if (_bpAc && _bpAc.input === input) _bpAcClose(); }, 150);
+                        });
                     }
 
                     function switchBpMode(mode) {
@@ -5833,12 +6412,15 @@ define([
                                 + '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.3-4.3"></path></svg>'
                                 + '</button>'
                                 + '</div></td>'
-                            + '<td data-label="From Bin"><input type="text" class="bp-ns-frombin-input" id="bp-ns-frombin-' + bpNsGridRowId + '" data-row="' + bpNsGridRowId + '" list="bp-bin-datalist" autocomplete="off" placeholder="From" style="min-width:100px;padding:10px;border:1.5px solid #d1d5db;border-radius:6px;font-size:16px;min-height:44px;"></td>'
-                            + '<td data-label="To Bin"><input type="text" class="bp-ns-tobin-input" id="bp-ns-tobin-' + bpNsGridRowId + '" data-row="' + bpNsGridRowId + '" list="bp-bin-datalist" autocomplete="off" placeholder="To" style="min-width:100px;padding:10px;border:1.5px solid #d1d5db;border-radius:6px;font-size:16px;min-height:44px;"></td>'
+                            + '<td data-label="From Bin"><input type="text" class="bp-ns-frombin-input" id="bp-ns-frombin-' + bpNsGridRowId + '" data-row="' + bpNsGridRowId + '" autocomplete="off" placeholder="From" style="min-width:100px;padding:10px;border:1.5px solid #d1d5db;border-radius:6px;font-size:16px;min-height:44px;"></td>'
+                            + '<td data-label="To Bin"><input type="text" class="bp-ns-tobin-input" id="bp-ns-tobin-' + bpNsGridRowId + '" data-row="' + bpNsGridRowId + '" autocomplete="off" placeholder="To" style="min-width:100px;padding:10px;border:1.5px solid #d1d5db;border-radius:6px;font-size:16px;min-height:44px;"></td>'
                             + '<td data-label="Qty"><input type="number" class="bp-ns-qty-input" id="bp-ns-qty-' + bpNsGridRowId + '" data-row="' + bpNsGridRowId + '" placeholder="Qty" min="1" style="width:70px;padding:10px;border:1.5px solid #d1d5db;border-radius:6px;font-size:16px;min-height:44px;"></td>'
                             + '<td><button type="button" onclick="removeBpNsGridRow(' + bpNsGridRowId + ')" style="background:none;border:none;color:#ef4444;cursor:pointer;font-size:20px;padding:6px 10px;min-height:44px;min-width:44px;">&times;</button></td>';
                         tbody.appendChild(tr);
                         updateBpNsRowCount();
+                        var itEl = tr.querySelector('.bp-ns-item-input');    if (itEl) bpAttachAutocomplete(itEl, 'item');
+                        var fbEl = tr.querySelector('.bp-ns-frombin-input'); if (fbEl) bpAttachAutocomplete(fbEl, 'bin');
+                        var tbEl = tr.querySelector('.bp-ns-tobin-input');   if (tbEl) bpAttachAutocomplete(tbEl, 'bin');
                         var ni = tr.querySelector('.bp-ns-item-input'); if (ni) ni.focus();
                     }
 
@@ -5858,19 +6440,31 @@ define([
 
                     function clearBpNsGrid() { var tbody = document.getElementById('bp-ns-grid-body'); if (tbody) tbody.innerHTML = ''; bpNsGridRowId = 0; addBpNsGridRow(); }
 
-                    function submitBinPutaway() {
+                    async function submitBinPutaway() {
                         if (bpCurrentMode === 'serialized') {
                             var toBinSelect = document.getElementById('bp_to_bin');
                             var toBinValue = toBinSelect ? toBinSelect.value : '';
                             if (!toBinValue) { alert('Please select a destination bin.'); return; }
                             var serialField = document.getElementById('custpage_bp_serials');
                             if (!serialField || !serialField.value.trim()) { alert('Scan or enter at least one serial number.'); return; }
-                            window.onbeforeunload = null;
-                            var form = document.forms[0];
-                            var h1 = document.getElementById('custpage_bp_to_bin'); if (h1) h1.value = toBinValue;
-                            var h2 = document.getElementById('custpage_bp_mode'); if (h2) h2.value = 'serialized';
-                            var ai = document.createElement('input'); ai.type='hidden'; ai.name='custpage_action'; ai.value='process_bin_putaway';
-                            form.appendChild(ai); _disableAllBtns(); form.submit();
+
+                            // Pre-submit validation: catch unknown serials BEFORE they're silently
+                            // dropped server-side. If any are bad, show a confirmation modal listing
+                            // them so the operator can cancel and fix or proceed with valid only.
+                            try {
+                                var resp = await fetch(bpBinsApiUrl + '&action=validateSerialsExist&serials=' + encodeURIComponent(serialField.value));
+                                var data = await resp.json();
+                                if (data && data.success && data.invalidCount > 0) {
+                                    _bpShowConfirmModal(data.validCount, data.invalidCount, data.invalid || []);
+                                    return;
+                                }
+                            } catch (e) {
+                                // Validation call failed (network / server). Don't block — proceed
+                                // and let server-side handle whatever it can. Worst case it silently
+                                // drops the same unknown serials as today.
+                            }
+
+                            _bpActuallySubmit();
                         } else {
                             var rows = document.querySelectorAll('#bp-ns-grid-body tr');
                             var gridData = []; var hasError = false;
@@ -5895,6 +6489,59 @@ define([
                             var ai = document.createElement('input'); ai.type='hidden'; ai.name='custpage_action'; ai.value='process_bin_putaway';
                             form.appendChild(ai); _disableAllBtns(); form.submit();
                         }
+                    }
+
+                    // Actual form submission for serialized putaway. Extracted so the
+                    // confirmation modal can call it after the user accepts the invalid-serial summary.
+                    function _bpActuallySubmit() {
+                        var toBinSelect = document.getElementById('bp_to_bin');
+                        var toBinValue = toBinSelect ? toBinSelect.value : '';
+                        window.onbeforeunload = null;
+                        var form = document.forms[0];
+                        var h1 = document.getElementById('custpage_bp_to_bin'); if (h1) h1.value = toBinValue;
+                        var h2 = document.getElementById('custpage_bp_mode'); if (h2) h2.value = 'serialized';
+                        var ai = document.createElement('input'); ai.type='hidden'; ai.name='custpage_action'; ai.value='process_bin_putaway';
+                        form.appendChild(ai); _disableAllBtns(); form.submit();
+                    }
+
+                    function _bpShowConfirmModal(validCount, invalidCount, invalidList) {
+                        var overlay = document.getElementById('bp-confirm-overlay');
+                        var sub = document.getElementById('bp-confirm-sub');
+                        var body = document.getElementById('bp-confirm-body');
+                        if (!overlay || !sub || !body) {
+                            // Fallback if modal markup somehow missing
+                            if (confirm(invalidCount + ' serial(s) not found in NetSuite. Continue with ' + validCount + ' valid serial(s)?')) _bpActuallySubmit();
+                            return;
+                        }
+                        sub.textContent = validCount + ' will be transferred \u00b7 ' + invalidCount + ' will be skipped';
+                        var listHtml = '';
+                        if (invalidList && invalidList.length) {
+                            listHtml = invalidList.map(function(s) {
+                                return '<div style="font-family:monospace;font-size:13px;padding:8px 14px;border-bottom:1px solid #f1f3f5;color:#991b1b;word-break:break-all;">'
+                                     + _bpEscHtml(s) + '</div>';
+                            }).join('');
+                        }
+                        body.innerHTML = '<div style="padding:12px 18px;font-size:13px;color:#374151;background:#fefce8;border-bottom:1px solid #fef3c7;">'
+                              + 'These serials were not found in NetSuite inventory and will be <b>skipped</b>. '
+                              + 'You can cancel to investigate, or continue and only the valid ones will be transferred.'
+                              + '</div>'
+                              + '<div style="padding:8px 0;">'
+                              + '<div style="padding:8px 18px;font-size:11px;font-weight:700;color:#991b1b;text-transform:uppercase;letter-spacing:0.4px;background:#fef2f2;border-bottom:1px solid #fecaca;">'
+                              +   invalidCount + ' Invalid Serial' + (invalidCount === 1 ? '' : 's')
+                              + '</div>'
+                              + listHtml
+                              + '</div>';
+                        overlay.classList.add('open');
+                    }
+
+                    function closeBpConfirmModal() {
+                        var overlay = document.getElementById('bp-confirm-overlay');
+                        if (overlay) overlay.classList.remove('open');
+                    }
+
+                    function bpConfirmAndSubmit() {
+                        closeBpConfirmModal();
+                        _bpActuallySubmit();
                     }
 
                     function clearBpForm() {
@@ -6140,10 +6787,13 @@ define([
                         return { itemId: g.itemId, itemText: g.itemText, description: '', action: 'bin_putaway', serialNumbers: g.serials.map(function(s) { return s.serialNumber; }) };
                     });
 
-                    let invalidMsg = '';
-                    if (serialData.invalid.length > 0) invalidMsg = 'Note: ' + serialData.invalid.length + ' serial(s) not found and skipped.';
+                    // Surface skipped serials on the success page as a red "FAILED" box.
+                    // Same data shape failedGroups expects: { serialNumber, itemText, action, error }
+                    const failedGroups = (serialData.invalid || []).map(function(sn) {
+                        return { serialNumber: sn, itemText: '(unknown item)', action: 'bin_putaway', error: 'Not found in NetSuite inventory' };
+                    });
 
-                    createSuccessPage(context, null, tranId, labelGroups, null, null, null, null, null, null, 'bp_go_home');
+                    createSuccessPage(context, null, tranId, labelGroups, null, null, null, null, null, failedGroups, 'bp_go_home');
                 } catch (e) {
                     log.error('Bin Putaway Error', e.message);
                     createBinPutawayForm(context, 'Bin putaway failed: ' + e.message, 'error', { bpToBin: toBinNumber });
@@ -6193,6 +6843,834 @@ define([
                 }
             }
         }
+
+        // ═══════════════════════════════════════════════════════════════
+        //  BIN PUTAWAY — JSON endpoints for the native SPA view
+        //  Same logic as handleBinPutaway, but return JSON instead of
+        //  rendering a Suitelet form. The legacy form path above is left
+        //  intact as a fallback.
+        // ═══════════════════════════════════════════════════════════════
+        function apiBinPutawaySerialized(body) {
+            try {
+                body = body || {};
+                var toBinNumber = (body.toBinNumber || '').trim();
+                var serialsRaw = body.serials;
+                if (Array.isArray(serialsRaw)) serialsRaw = serialsRaw.join('\n');
+                serialsRaw = serialsRaw || '';
+                if (!toBinNumber) return { success: false, message: 'Destination bin is required.' };
+
+                var serialTexts = cleanSerialInput(serialsRaw);
+                if (serialTexts.length === 0) return { success: false, message: 'Enter or scan at least one serial number.' };
+
+                var toBin = findBinByNumber(toBinNumber, '1');
+                if (!toBin) return { success: false, message: 'Bin not found: ' + toBinNumber };
+
+                var serialData = lookupSerialDetails(serialTexts);
+                if (serialData.valid.length === 0) {
+                    var invalidMsg = serialData.invalid.length > 0 ? 'Not found: ' + serialData.invalid.join(', ') : 'None of the serials were found in stock.';
+                    return { success: false, message: invalidMsg, failed: (serialData.invalid || []) };
+                }
+
+                var groupMap = {};
+                serialData.valid.forEach(function(s) {
+                    var key = s.itemId + '_' + s.locationId;
+                    if (!groupMap[key]) groupMap[key] = { itemId: s.itemId, itemText: s.itemText, locationId: s.locationId, serials: [] };
+                    groupMap[key].serials.push({ serialNumber: s.serialNumber, serialId: s.serialId, binId: s.binId });
+                });
+                var groups = Object.keys(groupMap).map(function(k) { return groupMap[k]; });
+
+                var transferRecord = record.create({ type: record.Type.BIN_TRANSFER, isDynamic: true });
+                transferRecord.setValue({ fieldId: 'subsidiary', value: '1' });
+                transferRecord.setValue({ fieldId: 'memo', value: 'Bin Putaway via WH Assistant' });
+                if (groups.length > 0) transferRecord.setValue({ fieldId: 'location', value: groups[0].locationId });
+
+                groups.forEach(function(group) {
+                    transferRecord.selectNewLine({ sublistId: 'inventory' });
+                    transferRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'item', value: group.itemId });
+                    transferRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'quantity', value: group.serials.length });
+                    var invDetail = transferRecord.getCurrentSublistSubrecord({ sublistId: 'inventory', fieldId: 'inventorydetail' });
+                    group.serials.forEach(function(serial) {
+                        invDetail.selectNewLine({ sublistId: 'inventoryassignment' });
+                        invDetail.setCurrentSublistText({ sublistId: 'inventoryassignment', fieldId: 'issueinventorynumber', text: serial.serialNumber });
+                        invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity', value: 1 });
+                        if (serial.binId) invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', value: serial.binId });
+                        invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'tobinnumber', value: toBin.id });
+                        invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'toinventorystatus', value: BACK_TO_STOCK_STATUS_ID });
+                        invDetail.commitLine({ sublistId: 'inventoryassignment' });
+                    });
+                    transferRecord.commitLine({ sublistId: 'inventory' });
+                });
+
+                var transferId = transferRecord.save({ enableSourcing: true, ignoreMandatoryFields: false });
+                var tranId = String(transferId);
+                try { var l = search.lookupFields({ type: record.Type.BIN_TRANSFER, id: transferId, columns: ['tranid'] }); tranId = l.tranid || String(transferId); } catch (e) {}
+
+                var labelGroups = groups.map(function(g) {
+                    return { itemId: g.itemId, itemText: g.itemText, description: '', action: 'bin_putaway', serialNumbers: g.serials.map(function(s) { return s.serialNumber; }) };
+                });
+                var totalSerials = groups.reduce(function(sum, g) { return sum + g.serials.length; }, 0);
+
+                return {
+                    success: true,
+                    tranId: tranId,
+                    toBinName: toBin.name || toBinNumber,
+                    labelGroups: labelGroups,
+                    failed: (serialData.invalid || []),
+                    message: 'Put away ' + totalSerials + ' serial(s) into ' + (toBin.name || toBinNumber) + '.'
+                };
+            } catch (e) {
+                log.error('apiBinPutawaySerialized', e.message + '\n' + (e.stack || ''));
+                return { success: false, message: 'Bin putaway failed: ' + e.message };
+            }
+        }
+
+        function apiBinPutawayNonSerialized(body) {
+            try {
+                body = body || {};
+                var cartRows = body.rows || body.cartRows || [];
+                if (!cartRows.length) return { success: false, message: 'No items in the grid.' };
+
+                var locationId = '1';
+                var errors = [];
+                var transferRows = [];
+                var itemCache = {}, binCache = {};
+
+                cartRows.forEach(function(row, idx) {
+                    var itemName = (row.itemName || '').trim();
+                    var fromBinNumber = (row.fromBinNumber || '').trim();
+                    var toBinNumber = (row.toBinNumber || '').trim();
+                    var quantity = parseInt(row.quantity, 10) || 0;
+                    var rowLabel = 'Row ' + (idx + 1);
+
+                    if (!itemName || !fromBinNumber || !toBinNumber || quantity <= 0) { errors.push(rowLabel + ': missing fields'); return; }
+                    if (!itemCache[itemName]) { var it = findItemByName(itemName); if (it) itemCache[itemName] = it; else { errors.push(rowLabel + ': item not found "' + itemName + '"'); return; } }
+                    if (!binCache[fromBinNumber]) { var fb = findBinByNumber(fromBinNumber, locationId); if (fb) binCache[fromBinNumber] = fb; else { errors.push(rowLabel + ': from bin not found "' + fromBinNumber + '"'); return; } }
+                    if (!binCache[toBinNumber]) { var tb = findBinByNumber(toBinNumber, locationId); if (tb) binCache[toBinNumber] = tb; else { errors.push(rowLabel + ': to bin not found "' + toBinNumber + '"'); return; } }
+
+                    transferRows.push({
+                        itemId: itemCache[itemName].id, itemText: itemCache[itemName].displayname || itemCache[itemName].itemid,
+                        description: itemCache[itemName].description, locationId: locationId, quantity: quantity,
+                        fromBinId: binCache[fromBinNumber].id, toBinId: binCache[toBinNumber].id,
+                        toStatusId: BACK_TO_STOCK_STATUS_ID, action: 'bin_putaway'
+                    });
+                });
+
+                if (transferRows.length === 0) return { success: false, message: errors.length > 0 ? 'Errors: ' + errors.join('; ') : 'No valid items.', errors: errors };
+
+                var r = createNonSerializedBinTransferMulti(transferRows, 'Bin Putaway via WH Assistant');
+                var processedItems = transferRows.map(function(row) { return { itemText: row.itemText, description: row.description, quantity: row.quantity, action: 'bin_putaway' }; });
+
+                return {
+                    success: true,
+                    tranId: r.tranId,
+                    processedItems: processedItems,
+                    errors: errors,
+                    message: 'Bin transfer ' + (r.tranId || '') + ' created \u2014 ' + processedItems.length + ' item(s) moved.'
+                };
+            } catch (e) {
+                log.error('apiBinPutawayNonSerialized', e.message + '\n' + (e.stack || ''));
+                return { success: false, message: 'Bin putaway failed: ' + e.message };
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        //  INVENTORY STATUS CHANGE — JSON endpoints for the native SPA view
+        //  Mirrors the Bin Putaway endpoints, but instead of a Bin Transfer
+        //  it creates Inventory Status Change record(s) that flip the
+        //  inventory status of the scanned serials (serialized) or the
+        //  item/bin/qty rows (non-serialized) to a single target status.
+        //
+        //  IMPORTANT — record shape: on an Inventory Status Change the "from"
+        //  status ("Status") and the "to" status ("Revised Status") are
+        //  HEADER fields and must be set BEFORE the inventory detail can be
+        //  created. They are NOT per-assignment fields. Because of that, each
+        //  record carries a single (fromStatus -> toStatus) pair, so we group
+        //  input by current status and create one record per group.
+        //
+        //  The only field IDs not already proven elsewhere in this script are
+        //  the two header status fields. They're resolved with getField()
+        //  against candidate IDs and the winners are logged as "ISC field map".
+        //    - revised/new status: 'tostatus' | 'revisedstatus' | 'toinventorystatus'
+        //    - previous/from status: 'previousstatus' | 'status'
+        // ═══════════════════════════════════════════════════════════════
+        const _ISC_REVISED_STATUS_FIELDS = ['tostatus', 'revisedstatus', 'toinventorystatus'];
+        const _ISC_PREVIOUS_STATUS_FIELDS = ['previousstatus', 'status'];
+        const _ISC_SERIAL_FIELDS = ['issueinventorynumber', 'inventorynumber', 'receiptinventorynumber'];
+        let _iscRevisedFieldUsed = '';
+        let _iscPreviousFieldUsed = '';
+        let _iscSerialFieldUsed = '';
+
+        // Set a header status field (kind = 'revised' | 'previous'), detecting
+        // the correct field id via getField(). 'revised' is required (throws if
+        // none of the candidates exist); 'previous' is best-effort.
+        function _iscSetHeaderStatus(rec, kind, statusId) {
+            const remembered = kind === 'revised' ? _iscRevisedFieldUsed : _iscPreviousFieldUsed;
+            const candidates = kind === 'revised' ? _ISC_REVISED_STATUS_FIELDS : _ISC_PREVIOUS_STATUS_FIELDS;
+            if (remembered) { rec.setValue({ fieldId: remembered, value: statusId }); return remembered; }
+            for (let i = 0; i < candidates.length; i++) {
+                let fld = null;
+                try { fld = rec.getField({ fieldId: candidates[i] }); } catch (e) { fld = null; }
+                if (fld) {
+                    rec.setValue({ fieldId: candidates[i], value: statusId });
+                    if (kind === 'revised') _iscRevisedFieldUsed = candidates[i]; else _iscPreviousFieldUsed = candidates[i];
+                    return candidates[i];
+                }
+            }
+            if (kind === 'revised') throw new Error('Could not find the "Revised Status" header field (tried: ' + candidates.join(', ') + ').');
+            return '';
+        }
+
+        // Identify the existing serial on an inventoryassignment line, trying
+        // each candidate field id until one sticks.
+        function _iscSetSerial(invDetail, serialNumber) {
+            if (_iscSerialFieldUsed) {
+                invDetail.setCurrentSublistText({ sublistId: 'inventoryassignment', fieldId: _iscSerialFieldUsed, text: serialNumber });
+                return _iscSerialFieldUsed;
+            }
+            for (let i = 0; i < _ISC_SERIAL_FIELDS.length; i++) {
+                try {
+                    invDetail.setCurrentSublistText({ sublistId: 'inventoryassignment', fieldId: _ISC_SERIAL_FIELDS[i], text: serialNumber });
+                    _iscSerialFieldUsed = _ISC_SERIAL_FIELDS[i];
+                    return _iscSerialFieldUsed;
+                } catch (e) { /* try the next candidate */ }
+            }
+            throw new Error('Could not set serial on status change (tried: ' + _ISC_SERIAL_FIELDS.join(', ') + ').');
+        }
+
+        // Resolve the current (from) inventory status of a non-serialized
+        // item sitting in a specific bin. Prefers a status different from the
+        // target, and the one with the most on-hand. Returns a status id or null.
+        function _iscResolveFromStatus(itemId, locationId, binId, excludeStatusId) {
+            try {
+                const rows = [];
+                search.create({
+                    type: 'inventorybalance',
+                    filters: [
+                        ['item', 'anyof', [itemId]], 'AND',
+                        ['location', 'anyof', [locationId]], 'AND',
+                        ['binnumber', 'anyof', [binId]]
+                    ],
+                    columns: [
+                        search.createColumn({ name: 'status', summary: search.Summary.GROUP }),
+                        search.createColumn({ name: 'onhand', summary: search.Summary.SUM })
+                    ]
+                }).run().each(function (r) {
+                    const st = r.getValue({ name: 'status', summary: search.Summary.GROUP });
+                    const oh = parseFloat(r.getValue({ name: 'onhand', summary: search.Summary.SUM })) || 0;
+                    if (st && oh > 0) rows.push({ statusId: String(st), onhand: oh });
+                    return true;
+                });
+                if (!rows.length) return null;
+                const pref = rows.filter(function (x) { return String(x.statusId) !== String(excludeStatusId); });
+                const pick = (pref.length ? pref : rows).sort(function (a, b) { return b.onhand - a.onhand; })[0];
+                return pick ? pick.statusId : null;
+            } catch (e) {
+                log.debug('_iscResolveFromStatus', e.message);
+                return null;
+            }
+        }
+
+        function _iscStatusName(statusId) {
+            try {
+                const l = search.lookupFields({ type: 'inventorystatus', id: statusId, columns: ['name'] });
+                return (l && l.name) || String(statusId);
+            } catch (e) { return String(statusId); }
+        }
+
+        // Build + save ONE Inventory Status Change record for a single
+        // (previousStatusId -> toStatusId) pair at one location.
+        //   itemGroups: [{ itemId, assignments: [{ serialNumber?, binId, quantity }] }]
+        function _iscBuildAndSave(previousStatusId, toStatusId, locationId, itemGroups) {
+            const rec = record.create({ type: record.Type.INVENTORY_STATUS_CHANGE, isDynamic: true });
+            rec.setValue({ fieldId: 'subsidiary', value: '1' });
+            rec.setValue({ fieldId: 'memo', value: 'Inventory Status Change via WH Assistant' });
+            rec.setValue({ fieldId: 'location', value: locationId });
+            // Header statuses MUST be set before the inventory detail can be created.
+            if (previousStatusId) _iscSetHeaderStatus(rec, 'previous', previousStatusId);
+            _iscSetHeaderStatus(rec, 'revised', toStatusId);
+
+            itemGroups.forEach(function (g) {
+                rec.selectNewLine({ sublistId: 'inventory' });
+                rec.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'item', value: g.itemId });
+                const totalQty = g.assignments.reduce(function (s, a) { return s + (a.quantity || 0); }, 0);
+                rec.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'quantity', value: totalQty });
+                const invDetail = rec.getCurrentSublistSubrecord({ sublistId: 'inventory', fieldId: 'inventorydetail' });
+                g.assignments.forEach(function (a) {
+                    invDetail.selectNewLine({ sublistId: 'inventoryassignment' });
+                    if (a.serialNumber) _iscSetSerial(invDetail, a.serialNumber);
+                    invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity', value: a.quantity });
+                    if (a.binId) invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', value: a.binId });
+                    if (previousStatusId) {
+                        try { invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'inventorystatus', value: previousStatusId }); } catch (e) { /* sourced from header */ }
+                    }
+                    invDetail.commitLine({ sublistId: 'inventoryassignment' });
+                });
+                rec.commitLine({ sublistId: 'inventory' });
+            });
+
+            const recId = rec.save({ enableSourcing: true, ignoreMandatoryFields: false });
+            let tranId = String(recId);
+            try { const l = search.lookupFields({ type: record.Type.INVENTORY_STATUS_CHANGE, id: recId, columns: ['tranid'] }); tranId = l.tranid || String(recId); } catch (e) {}
+            return { recId: recId, tranId: tranId };
+        }
+
+        function apiInventoryStatusChangeSerialized(body) {
+            try {
+                body = body || {};
+                const toStatusId = (body.toStatusId != null ? String(body.toStatusId) : '').trim();
+                let serialsRaw = body.serials;
+                if (Array.isArray(serialsRaw)) serialsRaw = serialsRaw.join('\n');
+                serialsRaw = serialsRaw || '';
+                if (!toStatusId) return { success: false, message: 'Select a target status.' };
+
+                const serialTexts = cleanSerialInput(serialsRaw);
+                if (serialTexts.length === 0) return { success: false, message: 'Enter or scan at least one serial number.' };
+
+                const serialData = lookupSerialDetails(serialTexts);
+                if (serialData.valid.length === 0) {
+                    const invalidMsg = serialData.invalid.length > 0 ? 'Not found: ' + serialData.invalid.join(', ') : 'None of the serials were found in stock.';
+                    return { success: false, message: invalidMsg, failed: (serialData.invalid || []) };
+                }
+
+                const already = [];          // already in the target status (no-op)
+                const noStatus = [];         // current status couldn't be determined
+                const toChange = [];
+                serialData.valid.forEach(function (s) {
+                    const cur = String(s.statusId || '');
+                    if (!cur) { noStatus.push(s.serialNumber); return; }
+                    if (cur === toStatusId) { already.push(s.serialNumber); return; }
+                    toChange.push(s);
+                });
+                if (toChange.length === 0) {
+                    let m = 'No serials to change.';
+                    if (already.length) m = 'All scanned serials are already in that status.';
+                    return { success: false, message: m, failed: (serialData.invalid || []).concat(noStatus), alreadyInStatus: already };
+                }
+
+                // Group by current status + location (one record per group),
+                // then by item within each group.
+                const groups = {};   // key -> { previousStatusId, locationId, items: { itemId -> {itemId,itemText,assignments[]} } }
+                toChange.forEach(function (s) {
+                    const key = s.statusId + '_' + s.locationId;
+                    if (!groups[key]) groups[key] = { previousStatusId: String(s.statusId), locationId: s.locationId, items: {} };
+                    const g = groups[key];
+                    if (!g.items[s.itemId]) g.items[s.itemId] = { itemId: s.itemId, itemText: s.itemText, assignments: [] };
+                    g.items[s.itemId].assignments.push({ serialNumber: s.serialNumber, binId: s.binId, quantity: 1 });
+                });
+
+                const tranIds = [];
+                const labelGroups = [];
+                let totalSerials = 0;
+                const groupErrors = [];
+                Object.keys(groups).forEach(function (key) {
+                    const g = groups[key];
+                    const itemGroups = Object.keys(g.items).map(function (k) { return g.items[k]; });
+                    try {
+                        const r = _iscBuildAndSave(g.previousStatusId, toStatusId, g.locationId, itemGroups);
+                        tranIds.push(r.tranId);
+                        itemGroups.forEach(function (ig) {
+                            labelGroups.push({ itemId: ig.itemId, itemText: ig.itemText, description: '', action: 'status_change', serialNumbers: ig.assignments.map(function (a) { return a.serialNumber; }) });
+                            totalSerials += ig.assignments.length;
+                        });
+                    } catch (e) {
+                        log.error('ISC serialized group save', e.message + '\n' + (e.stack || ''));
+                        groupErrors.push(e.message);
+                    }
+                });
+
+                if (tranIds.length === 0) {
+                    return { success: false, message: 'Inventory status change failed: ' + (groupErrors[0] || 'no records created') };
+                }
+                log.audit('ISC field map', 'revised=' + _iscRevisedFieldUsed + ' previous=' + _iscPreviousFieldUsed + ' serial=' + _iscSerialFieldUsed);
+
+                const statusName = _iscStatusName(toStatusId);
+                const skipped = (serialData.invalid || []).concat(noStatus);
+                let msg = 'Changed ' + totalSerials + ' serial(s) to "' + statusName + '".';
+                if (tranIds.length > 1) msg += ' Created ' + tranIds.length + ' records.';
+                if (already.length) msg += ' ' + already.length + ' already in that status (skipped).';
+                if (noStatus.length) msg += ' ' + noStatus.length + ' had no determinable status (skipped).';
+                if (groupErrors.length) msg += ' ' + groupErrors.length + ' group(s) failed.';
+
+                return {
+                    success: true,
+                    tranId: tranIds.join(', '),
+                    tranIds: tranIds,
+                    statusName: statusName,
+                    labelGroups: labelGroups,
+                    failed: skipped,
+                    alreadyInStatus: already,
+                    message: msg
+                };
+            } catch (e) {
+                log.error('apiInventoryStatusChangeSerialized', e.message + '\n' + (e.stack || ''));
+                return { success: false, message: 'Inventory status change failed: ' + e.message };
+            }
+        }
+
+        function apiInventoryStatusChangeNonSerialized(body) {
+            try {
+                body = body || {};
+                const toStatusId = (body.toStatusId != null ? String(body.toStatusId) : '').trim();
+                const cartRows = body.rows || body.cartRows || [];
+                if (!toStatusId) return { success: false, message: 'Select a target status.' };
+                if (!cartRows.length) return { success: false, message: 'No items in the grid.' };
+
+                const locationId = '1';
+                const errors = [];
+                const itemCache = {}, binCache = {};
+
+                // Resolve each row, then group by resolved current status (one
+                // record per status), then by item within each group.
+                const groups = {};   // statusId -> { previousStatusId, locationId, items: { itemId -> {itemId,itemText,assignments[]} } }
+                let validCount = 0;
+
+                cartRows.forEach(function (row, idx) {
+                    const itemName = (row.itemName || '').trim();
+                    const binNumber = (row.binNumber || '').trim();
+                    const quantity = parseInt(row.quantity, 10) || 0;
+                    const rowLabel = 'Row ' + (idx + 1);
+
+                    if (!itemName || !binNumber || quantity <= 0) { errors.push(rowLabel + ': missing fields'); return; }
+                    if (!itemCache[itemName]) { const it = findItemByName(itemName); if (it) itemCache[itemName] = it; else { errors.push(rowLabel + ': item not found "' + itemName + '"'); return; } }
+                    if (!binCache[binNumber]) { const b = findBinByNumber(binNumber, locationId); if (b) binCache[binNumber] = b; else { errors.push(rowLabel + ': bin not found "' + binNumber + '"'); return; } }
+
+                    const item = itemCache[itemName];
+                    const binId = binCache[binNumber].id;
+                    const fromStatusId = _iscResolveFromStatus(item.id, locationId, binId, toStatusId);
+                    if (!fromStatusId) { errors.push(rowLabel + ': could not determine current status for "' + itemName + '" in bin "' + binNumber + '"'); return; }
+                    if (String(fromStatusId) === toStatusId) { errors.push(rowLabel + ': already in target status'); return; }
+
+                    const key = String(fromStatusId);
+                    if (!groups[key]) groups[key] = { previousStatusId: key, locationId: locationId, items: {} };
+                    const g = groups[key];
+                    if (!g.items[item.id]) g.items[item.id] = { itemId: item.id, itemText: item.displayname || item.itemid, description: item.description, assignments: [] };
+                    g.items[item.id].assignments.push({ binId: binId, quantity: quantity });
+                    validCount++;
+                });
+
+                if (validCount === 0) return { success: false, message: errors.length > 0 ? 'Errors: ' + errors.join('; ') : 'No valid rows.', errors: errors };
+
+                const tranIds = [];
+                const processedItems = [];
+                const groupErrors = [];
+                Object.keys(groups).forEach(function (key) {
+                    const g = groups[key];
+                    const itemGroups = Object.keys(g.items).map(function (k) { return g.items[k]; });
+                    try {
+                        const r = _iscBuildAndSave(g.previousStatusId, toStatusId, g.locationId, itemGroups);
+                        tranIds.push(r.tranId);
+                        itemGroups.forEach(function (ig) {
+                            const qty = ig.assignments.reduce(function (s, a) { return s + (a.quantity || 0); }, 0);
+                            processedItems.push({ itemText: ig.itemText, description: ig.description, quantity: qty, action: 'status_change' });
+                        });
+                    } catch (e) {
+                        log.error('ISC non-serialized group save', e.message + '\n' + (e.stack || ''));
+                        groupErrors.push(e.message);
+                    }
+                });
+
+                if (tranIds.length === 0) {
+                    return { success: false, message: 'Inventory status change failed: ' + (groupErrors[0] || 'no records created'), errors: errors };
+                }
+                log.audit('ISC field map', 'revised=' + _iscRevisedFieldUsed + ' previous=' + _iscPreviousFieldUsed);
+
+                const statusName = _iscStatusName(toStatusId);
+                let msg = 'Inventory Status Change ' + tranIds.join(', ') + ' created \u2014 ' + processedItems.length + ' line(s) set to "' + statusName + '".';
+                if (errors.length) msg += ' ' + errors.length + ' row(s) skipped.';
+                if (groupErrors.length) msg += ' ' + groupErrors.length + ' group(s) failed.';
+
+                return {
+                    success: true,
+                    tranId: tranIds.join(', '),
+                    tranIds: tranIds,
+                    statusName: statusName,
+                    processedItems: processedItems,
+                    errors: errors,
+                    message: msg
+                };
+            } catch (e) {
+                log.error('apiInventoryStatusChangeNonSerialized', e.message + '\n' + (e.stack || ''));
+                return { success: false, message: 'Inventory status change failed: ' + e.message };
+            }
+        }
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  ITEM LOOKUP — read-only "where is it?" page (RF-Smart style)
+    //  Reuses existing AJAX endpoints (getBinInventory and
+    //  getBinInventoryForSerials). All real work is client-side.
+    // ═══════════════════════════════════════════════════════════════════
+    function createItemLookupForm(context) {
+        const form = serverWidget.createForm({ title: 'Item Lookup' });
+        const styleField = form.addField({ id: 'custpage_il_style', type: serverWidget.FieldType.INLINEHTML, label: ' ' });
+        styleField.defaultValue = getStyles();
+
+        const suiteletUrl = url.resolveScript({ scriptId: runtime.getCurrentScript().id, deploymentId: runtime.getCurrentScript().deploymentId, returnExternalUrl: false });
+
+        const bodyField = form.addField({ id: 'custpage_il_body', type: serverWidget.FieldType.INLINEHTML, label: ' ' });
+        bodyField.defaultValue = `
+            <div class="app-container">
+                <div class="main-card">
+                    <div class="card-header">
+                        <h1>Item Lookup</h1>
+                        <p>Find where items and serials live in the warehouse</p>
+                    </div>
+                    <div class="form-body">
+                        <div class="mode-toggle" style="display:flex;background:#eef2f7;border-radius:10px;padding:4px;margin-bottom:14px;">
+                            <button type="button" class="mode-btn active" id="il-mode-item-btn" onclick="ilSetMode('item')" style="flex:1;padding:12px;border:none;background:transparent;border-radius:8px;cursor:pointer;font-weight:600;font-size:14px;color:#374151;transition:all .18s;">By Item</button>
+                            <button type="button" class="mode-btn" id="il-mode-serial-btn" onclick="ilSetMode('serial')" style="flex:1;padding:12px;border:none;background:transparent;border-radius:8px;cursor:pointer;font-weight:600;font-size:14px;color:#374151;transition:all .18s;">By Serial(s)</button>
+                        </div>
+
+                        <div id="il-mode-item" class="il-mode-section">
+                            <div class="input-group">
+                                <label class="custom-label">Item SKU / Part Number</label>
+                                <input type="text" id="il-item-input" placeholder="Scan or type a SKU then press Enter" autocomplete="off" style="width:100%;padding:14px 16px;border:2px solid #d1d5db;border-radius:10px;font-size:16px;background:#f9fafb;min-height:48px;">
+                                <div style="font-size:11px;color:#6b7280;margin-top:4px;">Tip: press Enter to look up</div>
+                            </div>
+                        </div>
+
+                        <div id="il-mode-serial" class="il-mode-section" style="display:none;">
+                            <div class="input-group">
+                                <label class="custom-label">Serial Numbers <span class="badge-count"><span id="il_serial_count">0</span> scanned</span></label>
+                                <textarea id="il-serial-input" rows="5" placeholder="Scan or paste serials, one per line" style="width:100%;padding:14px 16px;border:2px solid #d1d5db;border-radius:10px;font-size:15px;background:#f9fafb;font-family:monospace;resize:vertical;" oninput="ilUpdateSerialCount()"></textarea>
+                                <div class="serial-dupe-msg" id="il_serial_dupe_msg"></div>
+                            </div>
+                        </div>
+
+                        <div class="btn-area">
+                            <button type="button" class="custom-btn btn-success" onclick="ilLookup()">Look Up</button>
+                            <button type="button" class="custom-btn btn-outline" onclick="ilClear()">Clear</button>
+                        </div>
+
+                        <div id="il-results" style="margin-top:18px;"></div>
+                    </div>
+                </div>
+            </div>
+        `;
+
+        const scriptField = form.addField({ id: 'custpage_il_script', type: serverWidget.FieldType.INLINEHTML, label: ' ' });
+        scriptField.defaultValue = getItemLookupScript(suiteletUrl);
+
+        context.response.writePage(form);
+    }
+
+    function getItemLookupScript(suiteletUrl) {
+        return getDupeCheckHelperJs() + `
+            <style>
+                .mode-btn.active {
+                    background: #fff !important;
+                    color: #0D1F4E !important;
+                    box-shadow: 0 1px 3px rgba(0,0,0,.08);
+                }
+                .il-card {
+                    background: #fff;
+                    border: 1px solid #e5e7eb;
+                    border-radius: 12px;
+                    padding: 14px 16px;
+                    margin-bottom: 12px;
+                    box-shadow: 0 1px 2px rgba(0,0,0,.04);
+                }
+                .il-card-head {
+                    display: flex; align-items: flex-start; justify-content: space-between;
+                    gap: 10px; flex-wrap: wrap;
+                    padding-bottom: 10px; border-bottom: 1px solid #f1f3f5; margin-bottom: 10px;
+                }
+                .il-card-title { font-size: 15px; font-weight: 700; color: #111827; word-break: break-word; }
+                .il-card-sub   { font-size: 12px; color: #6b7280; margin-top: 2px; }
+                .il-card-total { font-size: 13px; color: #374151; font-weight: 600; white-space: nowrap; background: #f3f4f6; padding: 4px 10px; border-radius: 10px; }
+                .il-bin-table {
+                    width: 100%; border-collapse: collapse; font-size: 13px;
+                }
+                .il-bin-table th, .il-bin-table td {
+                    padding: 10px 8px; text-align: left;
+                    border-bottom: 1px solid #f1f3f5;
+                }
+                .il-bin-table th {
+                    font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px;
+                    color: #6b7280; font-weight: 700; background: #fafbfc;
+                }
+                .il-bin-table tr:last-child td { border-bottom: none; }
+                .il-bin-name { font-weight: 600; color: #111827; }
+                .il-empty {
+                    padding: 24px; text-align: center; color: #6b7280; font-size: 14px;
+                    background: #f9fafb; border-radius: 10px;
+                }
+                .il-error {
+                    padding: 14px 16px; color: #991b1b; background: #fef2f2;
+                    border: 1px solid #fecaca; border-radius: 10px; font-size: 14px;
+                }
+                .il-badge {
+                    display: inline-block; font-size: 10px; padding: 2px 6px;
+                    border-radius: 10px; margin-left: 6px; font-weight: 600; vertical-align: middle;
+                }
+                .il-badge.largest   { background: #fef3c7; color: #92400e; }
+                .il-badge.scattered { background: #fee2e2; color: #991b1b; }
+                .il-badge.scanned   { background: #dbeafe; color: #1e40af; }
+                .il-loading { padding: 24px; text-align: center; color: #6b7280; }
+                .il-serial-list {
+                    margin-top: 8px;
+                    background: #f9fafb;
+                    border: 1px solid #e5e7eb;
+                    border-radius: 8px;
+                    padding: 8px 12px;
+                    max-height: 200px;
+                    overflow-y: auto;
+                }
+                .il-serial-row {
+                    display: flex; justify-content: space-between; gap: 10px;
+                    font-family: monospace; font-size: 12px; padding: 4px 0;
+                    border-bottom: 1px dashed #e5e7eb;
+                }
+                .il-serial-row:last-child { border-bottom: none; }
+                .il-serial-row .sn { color: #111827; font-weight: 600; word-break: break-all; }
+                .il-serial-row .bin { color: #6b7280; white-space: nowrap; }
+                .il-toggle-serials {
+                    background: transparent; border: none; color: #1e5fad;
+                    font-size: 12px; cursor: pointer; padding: 6px 0; text-decoration: underline;
+                }
+
+                /* ── Mobile: bin tables → compact label/value rows (consistent with the rest of the app) ── */
+                @media screen and (max-width:768px) {
+                    .il-bin-table, .il-bin-table tbody, .il-bin-table tr, .il-bin-table td { display:block; width:100%; }
+                    .il-bin-table thead { display:none; }
+                    .il-bin-table tr {
+                        border:1px solid #e5e7eb; border-radius:8px;
+                        padding:8px 10px; margin-bottom:8px; background:#fff;
+                    }
+                    .il-bin-table td {
+                        border-bottom:none; padding:4px 0;
+                        display:flex; align-items:center; justify-content:space-between;
+                        gap:12px; text-align:right; font-size:14px;
+                    }
+                    .il-bin-table td[data-label]::before {
+                        content:attr(data-label); margin-right:auto; text-align:left;
+                        font-size:10px; font-weight:700; text-transform:uppercase;
+                        letter-spacing:.3px; color:#6b7280;
+                    }
+                    /* Bin name line reads as the card heading */
+                    .il-bin-table td.il-bin-name {
+                        font-size:15px; padding-bottom:6px; margin-bottom:4px;
+                        border-bottom:1px solid #f1f3f5; flex-wrap:wrap; gap:6px;
+                    }
+                }
+            </style>
+            <script>
+                var ilApiUrl = '${(suiteletUrl || '').replace(/'/g, "\\\\'")}';
+                var ilMode = 'item';
+
+                function ilSetMode(mode) {
+                    ilMode = mode;
+                    document.getElementById('il-mode-item').style.display = (mode === 'item') ? 'block' : 'none';
+                    document.getElementById('il-mode-serial').style.display = (mode === 'serial') ? 'block' : 'none';
+                    document.getElementById('il-mode-item-btn').classList.toggle('active', mode === 'item');
+                    document.getElementById('il-mode-serial-btn').classList.toggle('active', mode === 'serial');
+                    document.getElementById('il-results').innerHTML = '';
+                    setTimeout(function() {
+                        var f = (mode === 'item') ? document.getElementById('il-item-input') : document.getElementById('il-serial-input');
+                        if (f) f.focus();
+                    }, 50);
+                }
+
+                function ilUpdateSerialCount() {
+                    var field = document.getElementById('il-serial-input');
+                    var display = document.getElementById('il_serial_count');
+                    var msgEl = document.getElementById('il_serial_dupe_msg');
+                    if (!field || !display) return;
+                    if (typeof window._dedupeSerialTextarea !== 'function') {
+                        display.textContent = field.value.split(/[\\r\\n]+/).filter(function(s){return s.trim()!=='';}).length;
+                        return;
+                    }
+                    window._dedupeSerialTextarea({
+                        textarea: field,
+                        onDupesFound: function(r) {
+                            display.textContent = r.deduped.length;
+                            display.classList.add('has-dupe-count');
+                            if (msgEl) {
+                                msgEl.innerHTML = '<span class="icon">\u26A0</span>Duplicate rejected: ' + [...new Set(r.dupes)].join(', ');
+                                msgEl.classList.add('show');
+                            }
+                        },
+                        onClean: function(r) {
+                            display.textContent = r.deduped.length;
+                            display.classList.remove('has-dupe-count');
+                            if (msgEl) msgEl.classList.remove('show');
+                        }
+                    });
+                }
+
+                function _ilEsc(s) {
+                    return String(s == null ? '' : s).replace(/[&<>"']/g, function(c) {
+                        return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c];
+                    });
+                }
+
+                function ilClear() {
+                    document.getElementById('il-item-input').value = '';
+                    document.getElementById('il-serial-input').value = '';
+                    document.getElementById('il_serial_count').textContent = '0';
+                    document.getElementById('il-results').innerHTML = '';
+                    var msgEl = document.getElementById('il_serial_dupe_msg');
+                    if (msgEl) msgEl.classList.remove('show');
+                    var f = (ilMode === 'item') ? document.getElementById('il-item-input') : document.getElementById('il-serial-input');
+                    if (f) f.focus();
+                }
+
+                function ilLookup() {
+                    if (ilMode === 'item') return ilLookupItem();
+                    return ilLookupSerials();
+                }
+
+                async function ilLookupItem() {
+                    var input = document.getElementById('il-item-input');
+                    var results = document.getElementById('il-results');
+                    var sku = (input.value || '').trim();
+                    if (!sku) { input.focus(); return; }
+                    results.innerHTML = '<div class="il-loading">Looking up\u2026</div>';
+                    try {
+                        // Resolve SKU -> itemId via existing getItems endpoint
+                        var itemResp = await fetch(ilApiUrl + '&action=getItems&q=' + encodeURIComponent(sku));
+                        var itemData = await itemResp.json();
+                        var match = null;
+                        if (itemData.results && itemData.results.length) {
+                            for (var i = 0; i < itemData.results.length; i++) {
+                                if ((itemData.results[i].name || '').toLowerCase() === sku.toLowerCase()) {
+                                    match = itemData.results[i]; break;
+                                }
+                            }
+                            if (!match) match = itemData.results[0];
+                        }
+                        if (!match) {
+                            results.innerHTML = '<div class="il-error">Item not found: ' + _ilEsc(sku) + '</div>';
+                            return;
+                        }
+                        // Pull bin balances at the warehouse
+                        var binResp = await fetch(ilApiUrl + '&action=getBinInventory&itemId=' + encodeURIComponent(match.id) + '&locationId=1');
+                        var binData = await binResp.json();
+                        if (!binData.success) {
+                            results.innerHTML = '<div class="il-error">' + _ilEsc(binData.message || 'Error loading inventory.') + '</div>';
+                            return;
+                        }
+                        results.innerHTML = _ilRenderItemCard(match, binData.results || []);
+                    } catch (e) {
+                        results.innerHTML = '<div class="il-error">Error: ' + _ilEsc(e.message) + '</div>';
+                    }
+                }
+
+                async function ilLookupSerials() {
+                    var field = document.getElementById('il-serial-input');
+                    var results = document.getElementById('il-results');
+                    var raw = (field.value || '').trim();
+                    if (!raw) { field.focus(); return; }
+                    results.innerHTML = '<div class="il-loading">Resolving serials\u2026</div>';
+                    try {
+                        var resp = await fetch(ilApiUrl + '&action=getBinInventoryForSerials&serials=' + encodeURIComponent(raw));
+                        var data = await resp.json();
+                        if (!data.success) {
+                            results.innerHTML = '<div class="il-error">' + _ilEsc(data.message || 'Error.') + '</div>';
+                            return;
+                        }
+                        if (!data.items || !data.items.length) {
+                            var msg = 'None of the scanned serials were found in stock.';
+                            if (data.invalid && data.invalid.length) msg += ' (' + data.invalid.length + ' invalid)';
+                            results.innerHTML = '<div class="il-empty">' + _ilEsc(msg) + '</div>';
+                            return;
+                        }
+                        var html = '';
+                        if (data.invalid && data.invalid.length) {
+                            html += '<div class="il-error" style="margin-bottom:12px;">\u26a0 ' + data.invalid.length + ' serial(s) not found and skipped: '
+                                  + data.invalid.map(_ilEsc).join(', ') + '</div>';
+                        }
+                        data.items.forEach(function(item) {
+                            html += _ilRenderSerialItemCard(item);
+                        });
+                        results.innerHTML = html;
+                    } catch (e) {
+                        results.innerHTML = '<div class="il-error">Error: ' + _ilEsc(e.message) + '</div>';
+                    }
+                }
+
+                function _ilRenderItemCard(itemMeta, bins) {
+                    var totalOH = bins.reduce(function(a, b) { return a + (b.qtyOH || 0); }, 0);
+                    var totalAv = bins.reduce(function(a, b) { return a + (b.qtyAvail || 0); }, 0);
+                    bins = bins.slice().sort(function(a, b) { return (b.qtyOH || 0) - (a.qtyOH || 0); });
+                    var head = '<div class="il-card"><div class="il-card-head">'
+                             + '<div><div class="il-card-title">' + _ilEsc(itemMeta.name) + (itemMeta.display && itemMeta.display !== itemMeta.name ? ' \u2014 ' + _ilEsc(itemMeta.display) : '') + '</div>'
+                             + '<div class="il-card-sub">Across ' + bins.length + ' bin' + (bins.length === 1 ? '' : 's') + '</div></div>'
+                             + '<div class="il-card-total">' + totalOH + ' OH \u00b7 ' + totalAv + ' Avail</div>'
+                             + '</div>';
+                    if (!bins.length) {
+                        return head + '<div class="il-empty">No bin inventory for this item.</div></div>';
+                    }
+                    var rows = bins.map(function(b, idx) {
+                        var badge = idx === 0 && bins.length > 1 ? '<span class="il-badge largest">LARGEST PILE</span>' : '';
+                        return '<tr>'
+                             + '<td class="il-bin-name" data-label="Bin">' + _ilEsc(b.bin) + badge + '</td>'
+                             + '<td data-label="On Hand" style="text-align:right;font-weight:700;">' + b.qtyOH + '</td>'
+                             + '<td data-label="Avail" style="text-align:right;color:#6b7280;">' + b.qtyAvail + '</td>'
+                             + '</tr>';
+                    }).join('');
+                    return head
+                         + '<table class="il-bin-table">'
+                         + '<thead><tr><th>Bin</th><th style="text-align:right;">On Hand</th><th style="text-align:right;">Available</th></tr></thead>'
+                         + '<tbody>' + rows + '</tbody>'
+                         + '</table></div>';
+                }
+
+                function _ilRenderSerialItemCard(item) {
+                    // Item-level "where are the SCANNED serials" + full bin balances of the item
+                    var scatteredBadge = (item.currentBins && item.currentBins.length > 1)
+                        ? '<span class="il-badge scattered">SCATTERED \u00d7' + item.currentBins.length + '</span>' : '';
+                    var head = '<div class="il-card"><div class="il-card-head">'
+                             + '<div><div class="il-card-title">' + _ilEsc(item.itemName) + ' ' + scatteredBadge + '</div>'
+                             + '<div class="il-card-sub">' + item.scannedCount + ' scanned serial(s)</div></div>'
+                             + '</div>';
+
+                    // Where are the scanned serials sitting right now?
+                    var scannedHtml = '';
+                    if (item.currentBins && item.currentBins.length) {
+                        scannedHtml += '<div style="font-size:12px;font-weight:700;color:#374151;margin-bottom:6px;">Where the scanned serials live:</div>'
+                                     + '<table class="il-bin-table" style="margin-bottom:14px;">'
+                                     + '<thead><tr><th>Bin</th><th style="text-align:right;">Scanned Serials Here</th></tr></thead>'
+                                     + '<tbody>'
+                                     + item.currentBins.map(function(b) {
+                                         return '<tr><td class="il-bin-name" data-label="Bin">' + _ilEsc(b.bin) + ' <span class="il-badge scanned">SCANNED</span></td>'
+                                              + '<td data-label="Scanned Here" style="text-align:right;font-weight:700;">' + b.count + '</td></tr>';
+                                       }).join('')
+                                     + '</tbody></table>';
+                    }
+
+                    // Full bin picture for the item
+                    var allHtml = '';
+                    if (item.bins && item.bins.length) {
+                        var bins = item.bins.slice().sort(function(a, b) { return (b.qtyOH || 0) - (a.qtyOH || 0); });
+                        allHtml += '<div style="font-size:12px;font-weight:700;color:#374151;margin-bottom:6px;">All bin locations for this item:</div>'
+                                + '<table class="il-bin-table">'
+                                + '<thead><tr><th>Bin</th><th style="text-align:right;">On Hand</th><th style="text-align:right;">Available</th></tr></thead>'
+                                + '<tbody>'
+                                + bins.map(function(b, idx) {
+                                    var badge = idx === 0 && bins.length > 1 ? '<span class="il-badge largest">LARGEST PILE</span>' : '';
+                                    return '<tr><td class="il-bin-name" data-label="Bin">' + _ilEsc(b.bin) + badge + '</td>'
+                                         + '<td data-label="On Hand" style="text-align:right;font-weight:700;">' + b.qtyOH + '</td>'
+                                         + '<td data-label="Avail" style="text-align:right;color:#6b7280;">' + b.qtyAvail + '</td></tr>';
+                                  }).join('')
+                                + '</tbody></table>';
+                    } else {
+                        allHtml = '<div class="il-empty">No bin inventory for this item.</div>';
+                    }
+
+                    return head + scannedHtml + allHtml + '</div>';
+                }
+
+                document.addEventListener('DOMContentLoaded', function() {
+                    var ii = document.getElementById('il-item-input');
+                    if (ii) {
+                        ii.addEventListener('keydown', function(e) { if (e.key === 'Enter') { e.preventDefault(); ilLookup(); } });
+                        ii.focus();
+                    }
+                });
+            </script>
+        `;
+    }
+
 
     // ═══════════════════════════════════════════════════════════════════
     //  PRINT LABEL DASHBOARD — Server-side code (embedded, pl-prefixed)
@@ -7487,7 +8965,7 @@ setTimeout(doPrint, 2000);
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>License Plate Manager</title>
+<title>Warehouse Assistant</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/html5-qrcode/2.3.8/html5-qrcode.min.js"><\/script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"><\/script>
 <style>
@@ -7596,9 +9074,9 @@ body {
 .view.active { display:block; }
 
 /* ─── IFRAME VIEWS ─── */
-#view-warehouse, #view-printlabel, #view-binputaway { padding:0; margin:0; overflow:hidden; }
-#view-warehouse.active, #view-printlabel.active, #view-binputaway.active { display:flex; }
-#view-warehouse iframe, #view-printlabel iframe, #view-binputaway iframe { flex:1; }
+#view-warehouse, #view-printlabel { padding:0; margin:0; overflow:hidden; }
+#view-warehouse.active, #view-printlabel.active { display:flex; }
+#view-warehouse iframe, #view-printlabel iframe { flex:1; }
 
 /* ─── PAGE HEADER ─── */
 .page-header {
@@ -7734,7 +9212,7 @@ tr:hover td { background:var(--surface-hover); }
 .porcv-line-input { padding-left:30px; }
 .porcv-line-input textarea { font-family:var(--mono); font-size:13px; width:100%; }
 .porcv-line-input input[type="number"] { max-width:140px; }
-.porcv-serial-count { font-size:11px; color:var(--text-dim); margin-top:4px; }
+.porcv-serial-count { font-size:15px; font-weight:600; color:var(--text); margin-top:8px; }
 .porcv-serial-count.has-dupe { color:#dc2626; font-weight:600; }
 .porcv-line-input textarea.has-dupe { border-color:#dc2626 !important; box-shadow:0 0 0 3px rgba(220,38,38,.35); }
 @keyframes porcvShake { 0%,100%{transform:translateX(0)} 15%{transform:translateX(-6px)} 30%{transform:translateX(6px)} 45%{transform:translateX(-5px)} 60%{transform:translateX(5px)} 75%{transform:translateX(-3px)} 90%{transform:translateX(3px)} }
@@ -7776,7 +9254,7 @@ textarea.dupe-shake { animation:porcvShake .45s ease; }
 .sopick-line-input textarea { font-family:var(--mono); font-size:13px; width:100%; }
 .sopick-line-input input[type="number"] { max-width:140px; }
 .sopick-line-input select { max-width:280px; }
-.sopick-serial-count { font-size:11px; color:var(--text-dim); margin-top:4px; }
+.sopick-serial-count { font-size:15px; font-weight:600; color:var(--text); margin-top:8px; }
 .sopick-serial-count.has-dupe { color:#dc2626; font-weight:600; }
 .sopick-serial-count.validating { color:var(--accent, #1866c2); }
 .sopick-serial-count.validating::after {
@@ -7801,6 +9279,9 @@ textarea.dupe-shake { animation:porcvShake .45s ease; }
 .sopick-serial-issues-clear { background:transparent; border:none; color:#7a1414; cursor:pointer; font-size:11px; padding:2px 6px; text-decoration:underline; }
 .sopick-serial-issue { font-family:var(--mono,monospace); font-size:11.5px; line-height:1.4; }
 .sopick-serial-issue code { background:rgba(220,38,38,.15); padding:0 4px; border-radius:3px; font-weight:700; }
+.sopick-picked-list { margin:8px 0; padding:8px 10px; background:rgba(22,163,74,.07); border:1px solid rgba(22,163,74,.32); border-radius:8px; }
+.sopick-picked-head { font-size:11.5px; font-weight:700; color:var(--success, #16a34a); display:flex; align-items:center; gap:6px; margin-bottom:4px; }
+.sopick-picked-serials { font-family:var(--mono, monospace); font-size:11.5px; line-height:1.55; color:var(--text-dim); max-height:96px; overflow-y:auto; word-break:break-all; }
 .sopick-bin-row { display:flex; gap:10px; align-items:end; flex-wrap:wrap; margin-top:8px; }
 .sopick-bin-row .form-group { margin:0; flex:1; min-width:120px; }
 .sopick-kit-components { display:flex; flex-direction:column; gap:12px; margin-top:4px; }
@@ -7964,7 +9445,7 @@ button.stock-sheet-row-pick:active { background:var(--primary-soft, #e3edff); }
     border-radius:12px; padding:16px; cursor:pointer;
     transition:transform .12s, box-shadow .12s, border-color .12s;
     -webkit-tap-highlight-color:transparent; touch-action:manipulation;
-    text-align:left; min-height:104px;
+    text-align:left; min-height:0;
 }
 .home-tile:hover { border-color:var(--accent); box-shadow:0 4px 14px rgba(59,130,246,.12); transform:translateY(-1px); }
 .home-tile:active { transform:translateY(0); }
@@ -8069,11 +9550,21 @@ button.stock-sheet-row-pick:active { background:var(--primary-soft, #e3edff); }
 
     /* ── Main content ── */
     .layout { min-height:calc(100dvh - 48px); }
-    .main { padding:10px; padding-bottom:calc(64px + env(safe-area-inset-bottom, 0)); max-height:none; }
+    /* .main is the scroll container on mobile: full height minus topbar(48) + bottom nav(56).
+       Generous bottom padding guarantees the final tile clears the fixed bottom nav. */
+    .main {
+        padding:10px;
+        padding-bottom:calc(72px + env(safe-area-inset-bottom, 0));
+        height:calc(100dvh - 48px - 56px);
+        max-height:calc(100dvh - 48px - 56px);
+        overflow-y:auto; -webkit-overflow-scrolling:touch;
+    }
     .main:has(#view-warehouse.active),
-    .main:has(#view-printlabel.active),
-    .main:has(#view-binputaway.active) { padding:0 0 calc(56px + env(safe-area-inset-bottom, 0)) 0; }
-    #view-warehouse iframe, #view-printlabel iframe, #view-binputaway iframe {
+    .main:has(#view-printlabel.active) {
+        padding:0 0 calc(56px + env(safe-area-inset-bottom, 0)) 0;
+        height:calc(100dvh - 48px - 56px); max-height:calc(100dvh - 48px - 56px);
+    }
+    #view-warehouse iframe, #view-printlabel iframe {
         height:calc(100dvh - 48px - 56px); display:block;
     }
 
@@ -8105,18 +9596,17 @@ button.stock-sheet-row-pick:active { background:var(--primary-soft, #e3edff); }
     .btn { min-height:44px; font-size:14px; padding:0 16px; border-radius:8px; }
     .btn-group { gap:8px; }
 
-    /* ── Home tiles ── */
-    .home-hero { padding:16px 16px; margin-bottom:12px; border-radius:12px; }
-    .home-hero-title { font-size:17px; }
-    .home-hero-sub { font-size:12px; }
+    /* ── Home tiles → stacked full-width rows (RF-Smart style) ── */
     .home-section { margin-bottom:14px; }
     .home-section-title { font-size:10px; margin:0 2px 8px; }
-    .home-tiles { grid-template-columns:repeat(2, 1fr); gap:10px; }
-    .home-tile { padding:12px; min-height:96px; border-radius:10px; }
-    .home-tile-icon { width:32px; height:32px; margin-bottom:8px; border-radius:8px; }
-    .home-tile-icon svg { width:18px; height:18px; }
-    .home-tile-title { font-size:13px; }
-    .home-tile-sub { font-size:11px; }
+    .home-tiles { display:flex; flex-direction:column; gap:8px; }
+    .home-tile {
+        flex-direction:row; align-items:center; gap:14px;
+        padding:14px 16px; min-height:0; border-radius:10px;
+    }
+    .home-tile-icon { width:38px; height:38px; margin-bottom:0; border-radius:9px; flex-shrink:0; }
+    .home-tile-icon svg { width:20px; height:20px; }
+    .home-tile-title { font-size:15px; }
 
     /* ── Layout helpers ── */
     .plate-detail { grid-template-columns:1fr; }
@@ -8177,6 +9667,46 @@ button.stock-sheet-row-pick:active { background:var(--primary-soft, #e3edff); }
     .sopick-bin-row .form-group { min-width:0; }
     .sopick-line-input input[type="number"] { max-width:90px; min-width:72px; }
     .sopick-kit-component { padding:8px 10px; }
+
+    /* ── Stock Count tables → card rows on mobile ──
+       Same field-work feel as PO Receiving / SO Picking line cards:
+       each row becomes a self-contained card, no horizontal scroll. */
+    table.sc-table { border:none; font-size:13px; }
+    table.sc-table thead { display:none; } /* header labels move onto each cell */
+    table.sc-table, table.sc-table tbody, table.sc-table tr, table.sc-table td { display:block; width:100%; }
+    table.sc-table tr {
+        background:var(--surface); border:1px solid var(--border);
+        border-radius:10px; margin-bottom:8px; padding:6px 4px;
+        box-shadow:0 1px 3px rgba(0,0,0,.04);
+    }
+    table.sc-table tr:hover td { background:transparent; } /* kill desktop row hover */
+    table.sc-table td {
+        border:none; border-top:none; padding:7px 12px;
+        display:flex; align-items:center; justify-content:space-between;
+        gap:12px; white-space:normal; text-align:right;
+    }
+    /* label pulled from data-label, sits on the left of each line */
+    table.sc-table td[data-label]:not([data-label=""])::before {
+        content:attr(data-label); flex:0 0 auto; margin-right:auto;
+        font-size:10px; font-weight:700; text-transform:uppercase;
+        letter-spacing:.04em; color:var(--text-dim); text-align:left;
+    }
+    /* action / checkbox cells go full-width, centered, with a divider */
+    table.sc-table td.sc-cell-action {
+        justify-content:center; text-align:center;
+        border-top:1px solid var(--border); margin-top:4px; padding-top:10px;
+        flex-wrap:wrap; gap:8px;
+    }
+    table.sc-table td.sc-cell-action::before { content:none; }
+    table.sc-table td.sc-cell-cb { justify-content:flex-start; }
+    table.sc-table td.sc-cell-cb::before { content:"Select"; margin-right:10px; font-size:10px; font-weight:700; text-transform:uppercase; letter-spacing:.04em; color:var(--text-dim); }
+    table.sc-table td.sc-cell-cb input[type="checkbox"] { width:22px; height:22px; accent-color:var(--accent); }
+    /* loading / empty placeholder rows (single full-width cell) */
+    table.sc-table td[colspan] { justify-content:center; text-align:center; }
+    table.sc-table td[colspan]::before { content:none; }
+    /* action buttons inside cards are tap-friendly */
+    table.sc-table td.sc-cell-action .btn { min-height:38px; padding:0 16px; }
+    .table-wrap:has(table.sc-table) { overflow-x:visible; border:none; border-radius:0; }
 }
 </style>
 </head>
@@ -8236,6 +9766,14 @@ button.stock-sheet-row-pick:active { background:var(--primary-soft, #e3edff); }
     <div class="mob-more-item" data-view="bintransferall" onclick="mobNavTo('bintransferall')">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/><rect x="9" y="9" width="6" height="6" rx="1"/></svg>
         Bin Transfer (All)
+    </div>
+    <div class="mob-more-item" data-view="itemlookup" onclick="mobNavTo('itemlookup')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="11" y1="8" x2="11" y2="14"/><line x1="8" y1="11" x2="14" y2="11"/></svg>
+        Item Lookup
+    </div>
+    <div class="mob-more-item" data-view="inventorystatuschange" onclick="mobNavTo('inventorystatuschange')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/><path d="M3 21v-5h5"/></svg>
+        Inventory Status Change
     </div>
     <div class="mob-more-section">TQ License Plates</div>
     <div class="mob-more-item" data-view="dashboard" onclick="mobNavTo('dashboard')">
@@ -8307,19 +9845,27 @@ button.stock-sheet-row-pick:active { background:var(--primary-soft, #e3edff); }
     </div>
     <div class="nav-item" data-view="poreceive">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg>
-        PO Receiving
+        Purchase Order Receiving
     </div>
     <div class="nav-item" data-view="sopick">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 5H7a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-2"/><rect x="9" y="3" width="6" height="4" rx="1"/><path d="M9 14l2 2 4-4"/></svg>
-        SO Picking
+        Sales Order Picking
     </div>
     <div class="nav-item" data-view="binputaway">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12"/><path d="M8 11l4 4 4-4"/><rect x="3" y="17" width="18" height="4" rx="1"/></svg>
         Bin Putaway
     </div>
+    <div class="nav-item" data-view="inventorystatuschange">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/><path d="M3 21v-5h5"/></svg>
+        Inventory Status Change
+    </div>
     <div class="nav-item" data-view="bintransferall">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/><rect x="9" y="9" width="6" height="6" rx="1"/></svg>
         Bin Transfer (All)
+    </div>
+    <div class="nav-item" data-view="itemlookup">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="11" y1="8" x2="11" y2="14"/><line x1="8" y1="11" x2="14" y2="11"/></svg>
+        Item Lookup
     </div>
     <div class="nav-group">
         <div class="nav-group-toggle" onclick="toggleNavGroup(this)">
@@ -8394,43 +9940,40 @@ button.stock-sheet-row-pick:active { background:var(--primary-soft, #e3edff); }
 
 <!-- ═══════ HOME / LAUNCHER VIEW ═══════ -->
 <div class="view active" id="view-home">
-    <div class="home-hero">
-        <div class="home-hero-title">Welcome back</div>
-        <div class="home-hero-sub">Pick a workflow to get started</div>
-    </div>
-
     <div class="home-section">
         <div class="home-section-title">Warehouse Operations</div>
         <div class="home-tiles">
             <button class="home-tile tile-warehouse" onclick="navigateTo('warehouse')">
                 <div class="home-tile-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7V5a2 2 0 0 1 2-2h2"/><path d="M17 3h2a2 2 0 0 1 2 2v2"/><path d="M21 17v2a2 2 0 0 1-2 2h-2"/><path d="M7 21H5a2 2 0 0 1-2-2v-2"/><line x1="7" y1="12" x2="17" y2="12"/></svg></div>
                 <div class="home-tile-title">Assistant</div>
-                <div class="home-tile-sub">Serial actions &amp; transfers</div>
             </button>
             <button class="home-tile tile-print" onclick="navigateTo('printlabel')">
                 <div class="home-tile-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 6 2 18 2 18 9"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8"/></svg></div>
                 <div class="home-tile-title">Print Label</div>
-                <div class="home-tile-sub">Reprint item labels</div>
             </button>
             <button class="home-tile tile-receive" onclick="navigateTo('poreceive')">
                 <div class="home-tile-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg></div>
-                <div class="home-tile-title">PO Receiving</div>
-                <div class="home-tile-sub">Receive items from POs</div>
+                <div class="home-tile-title">Purchase Order Receiving</div>
             </button>
             <button class="home-tile tile-pick" onclick="navigateTo('sopick')">
                 <div class="home-tile-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 5H7a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-2"/><rect x="9" y="3" width="6" height="4" rx="1"/><path d="M9 14l2 2 4-4"/></svg></div>
-                <div class="home-tile-title">SO Picking</div>
-                <div class="home-tile-sub">Pick and fulfill orders</div>
+                <div class="home-tile-title">Sales Order Picking</div>
             </button>
             <button class="home-tile tile-putaway" onclick="navigateTo('binputaway')">
                 <div class="home-tile-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12"/><path d="M8 11l4 4 4-4"/><rect x="3" y="17" width="18" height="4" rx="1"/></svg></div>
                 <div class="home-tile-title">Bin Putaway</div>
-                <div class="home-tile-sub">Move stock between bins</div>
+            </button>
+            <button class="home-tile" onclick="navigateTo('inventorystatuschange')">
+                <div class="home-tile-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/><path d="M3 21v-5h5"/></svg></div>
+                <div class="home-tile-title">Inventory Status Change</div>
             </button>
             <button class="home-tile" onclick="navigateTo('bintransferall')">
                 <div class="home-tile-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/><rect x="9" y="9" width="6" height="6" rx="1"/></svg></div>
                 <div class="home-tile-title">Bin Transfer (All)</div>
-                <div class="home-tile-sub">Empty a bin into another bin</div>
+            </button>
+            <button class="home-tile" onclick="navigateTo('itemlookup')">
+                <div class="home-tile-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="11" y1="8" x2="11" y2="14"/><line x1="8" y1="11" x2="14" y2="11"/></svg></div>
+                <div class="home-tile-title">Item Lookup</div>
             </button>
         </div>
     </div>
@@ -8441,42 +9984,34 @@ button.stock-sheet-row-pick:active { background:var(--primary-soft, #e3edff); }
             <button class="home-tile" onclick="navigateTo('dashboard')">
                 <div class="home-tile-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg></div>
                 <div class="home-tile-title">Dashboard</div>
-                <div class="home-tile-sub">All plates overview</div>
             </button>
             <button class="home-tile" onclick="navigateTo('scan')">
                 <div class="home-tile-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7V5a2 2 0 0 1 2-2h2"/><path d="M17 3h2a2 2 0 0 1 2 2v2"/><path d="M21 17v2a2 2 0 0 1-2 2h-2"/><path d="M7 21H5a2 2 0 0 1-2-2v-2"/><rect x="9" y="9" width="6" height="6" rx="1"/></svg></div>
                 <div class="home-tile-title">Scan &amp; Lookup</div>
-                <div class="home-tile-sub">Find a plate by QR</div>
             </button>
             <button class="home-tile" onclick="navigateTo('create')">
                 <div class="home-tile-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="16"/><line x1="8" y1="12" x2="16" y2="12"/></svg></div>
                 <div class="home-tile-title">Create Plate</div>
-                <div class="home-tile-sub">New license plate</div>
             </button>
             <button class="home-tile" onclick="navigateTo('search')">
                 <div class="home-tile-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg></div>
                 <div class="home-tile-title">Search</div>
-                <div class="home-tile-sub">Filter &amp; list plates</div>
             </button>
             <button class="home-tile" onclick="navigateTo('transfer')">
                 <div class="home-tile-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg></div>
                 <div class="home-tile-title">Bin Transfer</div>
-                <div class="home-tile-sub">Move a whole plate</div>
             </button>
             <button class="home-tile" onclick="navigateTo('fulfill')">
                 <div class="home-tile-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg></div>
                 <div class="home-tile-title">Fulfill SO</div>
-                <div class="home-tile-sub">Plate-based SO fulfill</div>
             </button>
             <button class="home-tile" onclick="navigateTo('poimport')">
                 <div class="home-tile-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><line x1="9" y1="15" x2="15" y2="15"/></svg></div>
                 <div class="home-tile-title">Create from PO</div>
-                <div class="home-tile-sub">Plate from PO serials</div>
             </button>
             <button class="home-tile" onclick="navigateTo('irimport')">
                 <div class="home-tile-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg></div>
                 <div class="home-tile-title">Create from IR</div>
-                <div class="home-tile-sub">Plate from receipt</div>
             </button>
         </div>
     </div>
@@ -8487,17 +10022,14 @@ button.stock-sheet-row-pick:active { background:var(--primary-soft, #e3edff); }
             <button class="home-tile tile-count" onclick="navigateTo('sc-dashboard')">
                 <div class="home-tile-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="9" y1="21" x2="9" y2="9"/></svg></div>
                 <div class="home-tile-title">Dashboard</div>
-                <div class="home-tile-sub">All counts</div>
             </button>
             <button class="home-tile tile-count" onclick="navigateTo('sc-pending-review')">
                 <div class="home-tile-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg></div>
                 <div class="home-tile-title">Pending Review</div>
-                <div class="home-tile-sub">Approve counts</div>
             </button>
             <button class="home-tile tile-count" onclick="navigateTo('sc-create')">
                 <div class="home-tile-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 5H7a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-2"/><rect x="9" y="3" width="6" height="4" rx="1"/><line x1="9" y1="12" x2="15" y2="12"/><line x1="9" y1="16" x2="12" y2="16"/></svg></div>
                 <div class="home-tile-title">Create Count</div>
-                <div class="home-tile-sub">Start a stock count</div>
             </button>
         </div>
     </div>
@@ -8515,7 +10047,147 @@ button.stock-sheet-row-pick:active { background:var(--primary-soft, #e3edff); }
 
 <!-- ═══════ BIN PUTAWAY VIEW ═══════ -->
 <div class="view" id="view-binputaway">
-    <iframe id="bp-iframe" src="${apiUrl}&action=binputaway" style="width:100%;height:calc(100dvh - 56px);border:none;display:block;"></iframe>
+    <div class="page-header">
+        <div><div class="page-title">Bin Putaway</div><div class="page-subtitle">Move stock into a destination bin</div></div>
+    </div>
+
+    <datalist id="bpaw-bin-datalist"></datalist>
+
+    <!-- Mode toggle -->
+    <div class="card" id="bpaw-mode-card" style="margin-top:8px;padding:10px;">
+        <div style="display:flex;gap:8px;">
+            <button type="button" id="bpaw-mode-serialized-btn" class="btn btn-primary" style="flex:1;justify-content:center;" onclick="bpawSwitchMode('serialized')">Serialized</button>
+            <button type="button" id="bpaw-mode-nonserialized-btn" class="btn" style="flex:1;justify-content:center;" onclick="bpawSwitchMode('nonserialized')">Non-Serialized</button>
+        </div>
+    </div>
+
+    <!-- ── SERIALIZED ── -->
+    <div id="bpaw-serialized-section">
+        <div class="card" style="margin-top:12px;">
+            <div class="form-group">
+                <label class="form-label">Destination Bin</label>
+                <div style="display:flex;gap:8px;align-items:center;">
+                    <input type="text" id="bpaw-to-bin" list="bpaw-bin-datalist" autocomplete="off" placeholder="Type or scan destination bin\u2026" style="flex:1;min-width:0;" oninput="bpawSyncSubmit()">
+                    <button type="button" class="btn" title="Where are these items currently stored?" onclick="bpawLookupSerialBins()" style="flex-shrink:0;width:48px;justify-content:center;padding:0;">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.3-4.3"></path></svg>
+                    </button>
+                </div>
+            </div>
+            <div class="form-group" style="margin-bottom:0;">
+                <label class="form-label">Serial Numbers
+                    <span class="porcv-serial-count" id="bpaw-serial-count" style="font-weight:600;margin-left:6px;">0 scanned</span>
+                </label>
+                <textarea id="bpaw-serials" rows="6" placeholder="Scan serial numbers, one per line\u2026" oninput="bpawSerialCount()" style="font-family:var(--mono);font-size:13px;width:100%;"></textarea>
+                <div class="porcv-serial-count" id="bpaw-serial-dupe" style="display:none;color:#dc2626;margin-top:4px;"></div>
+            </div>
+        </div>
+        <button class="btn btn-success" id="bpaw-ser-submit-btn" onclick="bpawSubmit()" style="width:100%;justify-content:center;padding:14px;margin-top:12px;" disabled>
+            Put Away (<span id="bpaw-ser-count-badge">0</span>)
+        </button>
+    </div>
+
+    <!-- ── NON-SERIALIZED ── -->
+    <div id="bpaw-nonserialized-section" style="display:none;">
+        <div class="card" style="margin-top:12px;">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+                <label class="form-label" style="margin-bottom:0;">Items &middot; <span id="bpaw-ns-row-count" style="color:var(--text-muted);font-weight:600;">1</span> row(s)</label>
+                <button type="button" class="btn" style="padding:6px 12px;" onclick="bpawAddRow()">+ Add Row</button>
+            </div>
+            <div id="bpaw-ns-rows"></div>
+        </div>
+        <button class="btn btn-success" id="bpaw-ns-submit-btn" onclick="bpawSubmit()" style="width:100%;justify-content:center;padding:14px;margin-top:12px;">
+            Put Away
+        </button>
+    </div>
+
+    <!-- ── SUCCESS ── -->
+    <div class="card" id="bpaw-success" style="display:none;margin-top:12px;">
+        <div style="text-align:center;padding:8px;">
+            <div style="font-size:18px;font-weight:700;margin-bottom:4px;">Bin Transfer Created</div>
+            <div style="font-size:22px;font-weight:800;color:var(--primary);margin:8px 0;" id="bpaw-success-num"></div>
+            <div style="color:var(--text-muted);font-size:14px;" id="bpaw-success-msg"></div>
+            <div id="bpaw-success-failed" style="display:none;margin-top:12px;"></div>
+            <div style="display:flex;gap:10px;justify-content:center;margin-top:16px;flex-wrap:wrap;">
+                <button class="btn btn-success" id="bpaw-print-btn" onclick="bpawPrintLabels()" style="min-width:150px;display:none;">Print Labels</button>
+                <button class="btn btn-primary" onclick="bpawReset()" style="min-width:150px;">New Putaway</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- ═══════ INVENTORY STATUS CHANGE VIEW ═══════ -->
+<div class="view" id="view-inventorystatuschange">
+    <div class="page-header">
+        <div><div class="page-title">Inventory Status Change</div><div class="page-subtitle">Change the inventory status of stock</div></div>
+    </div>
+
+    <datalist id="isc-bin-datalist"></datalist>
+
+    <!-- Target status (applies to the whole submission, both modes) -->
+    <div class="card" style="margin-top:8px;">
+        <div class="form-group" style="margin-bottom:0;">
+            <label class="form-label">New Status</label>
+            <select id="isc-to-status" onchange="iscSyncSubmit()" style="width:100%;">
+                <option value="">\u2014 Select status \u2014</option>
+            </select>
+        </div>
+    </div>
+
+    <!-- Mode toggle -->
+    <div class="card" id="isc-mode-card" style="margin-top:12px;padding:10px;">
+        <div style="display:flex;gap:8px;">
+            <button type="button" id="isc-mode-serialized-btn" class="btn btn-primary" style="flex:1;justify-content:center;" onclick="iscSwitchMode('serialized')">Serialized</button>
+            <button type="button" id="isc-mode-nonserialized-btn" class="btn" style="flex:1;justify-content:center;" onclick="iscSwitchMode('nonserialized')">Non-Serialized</button>
+        </div>
+    </div>
+
+    <!-- ── SERIALIZED ── -->
+    <div id="isc-serialized-section">
+        <div class="card" style="margin-top:12px;">
+            <div class="form-group" style="margin-bottom:0;">
+                <label class="form-label">Serial Numbers
+                    <span class="porcv-serial-count" id="isc-serial-count" style="font-weight:600;margin-left:6px;">0 scanned</span>
+                </label>
+                <textarea id="isc-serials" rows="6" placeholder="Scan serial numbers, one per line\u2026" oninput="iscSerialCount()" style="font-family:var(--mono);font-size:13px;width:100%;"></textarea>
+                <div class="porcv-serial-count" id="isc-serial-dupe" style="display:none;color:#dc2626;margin-top:4px;"></div>
+            </div>
+        </div>
+        <button class="btn btn-success" id="isc-ser-submit-btn" onclick="iscSubmit()" style="width:100%;justify-content:center;padding:14px;margin-top:12px;" disabled>
+            Change Status (<span id="isc-ser-count-badge">0</span>)
+        </button>
+    </div>
+
+    <!-- ── NON-SERIALIZED ── -->
+    <div id="isc-nonserialized-section" style="display:none;">
+        <div class="card" style="margin-top:12px;">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+                <label class="form-label" style="margin-bottom:0;">Items &middot; <span id="isc-ns-row-count" style="color:var(--text-muted);font-weight:600;">1</span> row(s)</label>
+                <button type="button" class="btn" style="padding:6px 12px;" onclick="iscAddRow()">+ Add Row</button>
+            </div>
+            <div id="isc-ns-rows"></div>
+        </div>
+        <button class="btn btn-success" id="isc-ns-submit-btn" onclick="iscSubmit()" style="width:100%;justify-content:center;padding:14px;margin-top:12px;">
+            Change Status
+        </button>
+    </div>
+
+    <!-- ── SUCCESS ── -->
+    <div class="card" id="isc-success" style="display:none;margin-top:12px;">
+        <div style="text-align:center;padding:8px;">
+            <div style="font-size:18px;font-weight:700;margin-bottom:4px;">Inventory Status Change Created</div>
+            <div style="font-size:22px;font-weight:800;color:var(--primary);margin:8px 0;" id="isc-success-num"></div>
+            <div style="color:var(--text-muted);font-size:14px;" id="isc-success-msg"></div>
+            <div id="isc-success-failed" style="display:none;margin-top:12px;"></div>
+            <div style="display:flex;gap:10px;justify-content:center;margin-top:16px;flex-wrap:wrap;">
+                <button class="btn btn-primary" onclick="iscReset()" style="min-width:150px;">New Status Change</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- ═══════ ITEM LOOKUP VIEW ═══════ -->
+<div class="view" id="view-itemlookup">
+    <iframe id="il-iframe" src="${apiUrl}&action=itemlookup" style="width:100%;height:calc(100dvh - 56px);border:none;display:block;"></iframe>
 </div>
 
 <!-- ═══════ DASHBOARD VIEW ═══════ -->
@@ -8943,12 +10615,8 @@ button.stock-sheet-row-pick:active { background:var(--primary-soft, #e3edff); }
 
 <!-- ═══════ PO RECEIVING VIEW ═══════ -->
 <div class="view" id="view-poreceive">
-    <div class="page-header">
-        <div><div class="page-title">PO Receiving</div><div class="page-subtitle">Receive items from purchase orders</div></div>
-    </div>
 
-    <div class="card" id="porcv-load-card">
-        <div class="card-title">Load Purchase Order</div>
+    <div class="card" id="porcv-load-card" style="margin-top:8px;">
         <div class="form-grid" style="grid-template-columns:1fr auto;align-items:end;">
             <div class="form-group">
                 <label class="form-label">PO Number</label>
@@ -8959,35 +10627,73 @@ button.stock-sheet-row-pick:active { background:var(--primary-soft, #e3edff); }
     </div>
 
     <div id="porcv-lines-section" style="display:none;">
-        <div class="card">
-            <div class="card-title" style="display:flex;align-items:center;gap:8px;">
-                PO: <span id="porcv-po-tranid" style="font-weight:700;"></span>
-                <span id="porcv-po-status" class="badge badge-info" style="font-size:11px;"></span>
+
+        <!-- Session header: PO + location/bin set once for the whole PO -->
+        <div class="card" id="porcv-session-card">
+            <div class="card-title" style="display:flex;align-items:center;gap:8px;justify-content:space-between;flex-wrap:wrap;">
+                <span>PO: <span id="porcv-po-tranid" style="font-weight:700;"></span>
+                <span id="porcv-po-status" class="badge badge-info" style="font-size:11px;"></span></span>
+                <button class="btn" style="padding:6px 12px;" onclick="porcvReset()">New PO</button>
             </div>
-            <div class="form-grid">
+            <div class="form-grid" style="grid-template-columns:1fr 1fr;gap:10px;">
                 <div class="form-group">
-                    <label class="form-label">Warehouse (Location) *</label>
-                    <select id="porcv-location"></select>
+                    <label class="form-label">Warehouse *</label>
+                    <select id="porcv-location" style="padding:7px 9px;font-size:13px;"></select>
                 </div>
                 <div class="form-group">
                     <label class="form-label">Bin</label>
-                    <select id="porcv-bin"><option value="">Default Receiving Bin</option></select>
-                </div>
-                <div class="form-group">
-                    <label class="form-label">Inventory Status *</label>
-                    <select id="porcv-status"></select>
+                    <select id="porcv-bin" style="padding:7px 9px;font-size:13px;"><option value="">Default Receiving Bin</option></select>
                 </div>
             </div>
         </div>
 
-        <div id="porcv-lines-container"></div>
-
-        <div class="card" style="text-align:center;">
-            <button class="btn btn-success" onclick="porcvSubmit()" id="porcv-submit-btn" style="width:100%;justify-content:center;padding:14px;">
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
-                Receive Selected Items
-            </button>
+        <!-- SCREEN 2: lean item list (scan or tap a line to open it) -->
+        <div id="porcv-list-screen">
+            <div class="card">
+                <div class="card-title" style="font-size:18px;">Items to Receive</div>
+                <div class="form-group" style="margin-bottom:0;">
+                    <label class="form-label">Scan Item</label>
+                    <input type="text" id="porcv-item-scan" placeholder="Scan or type item, then Enter…" autocomplete="off" style="padding:13px;font-size:15px;">
+                </div>
+                <div id="porcv-list" style="margin-top:22px;"></div>
+                <button class="btn btn-success" onclick="porcvSubmit()" id="porcv-submit-btn" style="width:100%;justify-content:center;padding:14px;margin-top:12px;" disabled>
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+                    Receive Items (<span id="porcv-staged-count">0</span>)
+                </button>
+            </div>
         </div>
+
+        <!-- SCREEN 3: single item (status + serial/qty + done/print) -->
+        <div id="porcv-item-screen" style="display:none;">
+            <div class="card">
+                <button class="btn" style="padding:6px 12px;margin-bottom:12px;" onclick="porcvBackToList()">‹ Back to list</button>
+                <div id="porcv-item-name" style="font-size:16px;font-weight:700;line-height:1.3;"></div>
+                <div id="porcv-item-desc" class="porcv-line-desc" style="padding-left:0;"></div>
+                <div class="porcv-line-meta" style="margin:14px 0;">
+                    <div><div>Remaining</div><div class="value" id="porcv-item-remaining">0</div></div>
+                    <div><div>Received</div><div class="value" id="porcv-item-received">0</div></div>
+                    <div><div>Ordered</div><div class="value" id="porcv-item-ordered">0</div></div>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Status *</label>
+                    <select id="porcv-item-status"></select>
+                </div>
+                <div class="form-group" id="porcv-item-serial-group">
+                    <label class="form-label">Serial Numbers (one per line)</label>
+                    <textarea id="porcv-item-serials" rows="5" placeholder="Scan serial numbers, one per line…" oninput="porcvItemSerialCount()"></textarea>
+                    <div class="porcv-serial-count" id="porcv-item-serial-count">0 of 0 serials entered</div>
+                </div>
+                <div class="form-group" id="porcv-item-qty-group" style="display:none;">
+                    <label class="form-label">Quantity to Receive</label>
+                    <input type="number" id="porcv-item-qty" min="1" value="1">
+                </div>
+                <div style="display:flex;gap:10px;flex-wrap:wrap;">
+                    <button class="btn btn-success" onclick="porcvDoneItem()" style="flex:1 1 120px;justify-content:center;padding:13px;">Done</button>
+                    <button class="btn btn-primary" onclick="porcvPrintItemLabels()" style="flex:1 1 120px;justify-content:center;padding:13px;">Print labels</button>
+                </div>
+            </div>
+        </div>
+
     </div>
 
     <div class="card" id="porcv-success" style="display:none;">
@@ -9010,12 +10716,8 @@ button.stock-sheet-row-pick:active { background:var(--primary-soft, #e3edff); }
 
 <!-- ======= SO PICKING VIEW ======= -->
 <div class="view" id="view-sopick">
-    <div class="page-header">
-        <div><div class="page-title">SO Picking</div><div class="page-subtitle">Pick and fulfill sales order items</div></div>
-    </div>
 
-    <div class="card" id="sopick-load-card">
-        <div class="card-title">Load Sales Order</div>
+    <div class="card" id="sopick-load-card" style="margin-top:8px;">
         <div class="form-grid" style="grid-template-columns:1fr auto;align-items:end;">
             <div class="form-group">
                 <label class="form-label">SO Number</label>
@@ -9027,31 +10729,44 @@ button.stock-sheet-row-pick:active { background:var(--primary-soft, #e3edff); }
 
     <div id="sopick-lines-section" style="display:none;">
         <datalist id="sopick-bin-datalist"></datalist>
-        <div class="card">
-            <div class="card-title" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
-                SO: <span id="sopick-so-tranid" style="font-weight:700;"></span>
-                <span id="sopick-so-status" class="badge badge-info" style="font-size:11px;"></span>
+        <div class="card" id="sopick-session-card">
+            <div class="card-title" style="display:flex;align-items:center;gap:8px;justify-content:space-between;flex-wrap:wrap;">
+                <span>SO: <span id="sopick-so-tranid" style="font-weight:700;"></span>
+                <span id="sopick-so-status" class="badge badge-info" style="font-size:11px;"></span></span>
+                <button class="btn" style="padding:6px 12px;" onclick="sopickReset()">New SO</button>
             </div>
-            <div style="font-size:13px;color:var(--text-muted);margin-bottom:12px;">
-                Customer: <span id="sopick-so-customer" style="font-weight:600;color:var(--text);"></span>
+            <div style="font-size:12px;color:var(--text-muted);margin-bottom:10px;">
+                <span id="sopick-so-customer" style="font-weight:600;color:var(--text);"></span>
                 &nbsp;&bull;&nbsp;
-                Date: <span id="sopick-so-date" style="font-weight:600;color:var(--text);"></span>
+                <span id="sopick-so-date" style="font-weight:600;color:var(--text);"></span>
             </div>
-            <div class="form-grid">
-                <div class="form-group">
-                    <label class="form-label">Warehouse (Location)</label>
-                    <select id="sopick-location"></select>
-                </div>
+            <div class="form-group" style="margin-bottom:0;max-width:240px;">
+                <label class="form-label">Warehouse</label>
+                <select id="sopick-location" style="padding:7px 9px;font-size:13px;"></select>
             </div>
         </div>
 
         <div id="sopick-open-if-banner" style="display:none;"></div>
-        <div id="sopick-lines-container"></div>
 
-        <div class="card" style="text-align:center;">
-            <button class="btn btn-success" onclick="sopickSubmit()" id="sopick-submit-btn" style="width:100%;justify-content:center;padding:14px;">
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
-                Fulfill Selected Items
+        <!-- LIST screen: lean one row per line, scan/tap to open -->
+        <div id="sopick-list-screen">
+            <div class="card">
+                <div class="card-title" style="font-size:18px;">Items to Pick</div>
+                <div id="sopick-list" style="margin-top:8px;"></div>
+                <button class="btn btn-success" onclick="sopickSubmit()" id="sopick-submit-btn" style="width:100%;justify-content:center;padding:14px;margin-top:12px;">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+                    Fulfill Items
+                </button>
+            </div>
+        </div>
+
+        <!-- DETAIL screen: one line at a time (reuses the existing rendered inputs) -->
+        <div id="sopick-detail-screen" style="display:none;">
+            <button class="btn" style="padding:6px 12px;margin:8px 0 12px;" onclick="sopickBackToList()">‹ Back to list</button>
+            <div id="sopick-lines-container"></div>
+            <button class="btn btn-success" onclick="sopickBackToList()" style="width:100%;justify-content:center;padding:14px;margin-top:12px;">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>
+                Done
             </button>
         </div>
     </div>
@@ -9105,7 +10820,7 @@ button.stock-sheet-row-pick:active { background:var(--primary-soft, #e3edff); }
         <div class="card-title" id="sc-items-title">Items in Bin</div>
         <div id="sc-items-msg" style="display:none; margin-bottom:12px;"></div>
         <div class="table-wrap">
-            <table>
+            <table class="sc-table">
                 <thead>
                     <tr>
                         <th style="width:40px;"><input type="checkbox" id="sc-select-all" onchange="scToggleAll(this)" title="Select all"></th>
@@ -9158,7 +10873,7 @@ button.stock-sheet-row-pick:active { background:var(--primary-soft, #e3edff); }
     <div class="card" style="max-width:1100px; margin-top:16px;">
         <div class="card-title">Stock Counts</div>
         <div class="table-wrap">
-            <table>
+            <table class="sc-table">
                 <thead>
                     <tr>
                         <th style="width:70px;">ID</th>
@@ -9189,7 +10904,7 @@ button.stock-sheet-row-pick:active { background:var(--primary-soft, #e3edff); }
     <div class="card" style="max-width:1100px;">
         <div class="card-title">Counts Pending Review</div>
         <div class="table-wrap">
-            <table>
+            <table class="sc-table">
                 <thead>
                     <tr>
                         <th style="width:70px;">ID</th>
@@ -9276,7 +10991,7 @@ button.stock-sheet-row-pick:active { background:var(--primary-soft, #e3edff); }
     <div class="card" style="max-width:900px; margin-top:16px;">
         <div class="card-title">Counted Items</div>
         <div class="table-wrap">
-            <table>
+            <table class="sc-table">
                 <thead>
                     <tr>
                         <th>Item</th>
@@ -9337,7 +11052,7 @@ button.stock-sheet-row-pick:active { background:var(--primary-soft, #e3edff); }
     <div class="card" style="max-width:1200px; margin-top:16px;">
         <div class="card-title">Item Comparison</div>
         <div class="table-wrap">
-            <table>
+            <table class="sc-table">
                 <thead>
                     <tr>
                         <th>Item</th>
@@ -9404,6 +11119,21 @@ button.stock-sheet-row-pick:active { background:var(--primary-soft, #e3edff); }
     </div>
 </div>
 
+<!-- ═══ PO RECEIVING: SERIAL PATTERN WARNING SHEET ═══ -->
+<div class="stock-sheet-overlay" id="porcv-anomaly-overlay" onclick="closePorcvAnomaly()"></div>
+<div class="stock-sheet" id="porcv-anomaly-sheet">
+    <div class="mob-more-handle"></div>
+    <div class="stock-sheet-head">
+        <div class="stock-sheet-title" style="color:var(--warning);">\u26A0 Unusual serial numbers</div>
+        <div class="stock-sheet-sub" id="porcv-anomaly-sub"></div>
+    </div>
+    <div class="stock-sheet-body" id="porcv-anomaly-body"></div>
+    <div class="stock-sheet-foot" style="display:flex;gap:10px;">
+        <button class="btn" onclick="closePorcvAnomaly()" style="flex:1;justify-content:center;">Go back &amp; fix</button>
+        <button class="btn" onclick="porcvAnomalyConfirm()" style="flex:1;justify-content:center;background:var(--warning);border-color:var(--warning);color:#fff;">Receive anyway</button>
+    </div>
+</div>
+
 <!-- ═══ SO PICK: LOAD FROM LP SHEET ═══ -->
 <div class="stock-sheet-overlay" id="sopick-lp-overlay" onclick="closeSopickLPSheet()"></div>
 <div class="stock-sheet" id="sopick-lp-sheet">
@@ -9440,6 +11170,7 @@ button.stock-sheet-row-pick:active { background:var(--primary-soft, #e3edff); }
 </div>
 
 ${getDupeCheckHelperJs()}
+${getAutocompleteJs()}
 <script>
 // ═══════════════════════════════════════════════════════════
 //  APP STATE & CONFIG
@@ -9453,6 +11184,9 @@ let currentFulfillSO = null;
 let currentPORcvData = null;
 let lastPORcvLabelData = [];
 let lastPORcvReceiptTranId = '';
+let porcvStatusCodes = [];      // cached inventory status options
+let porcvLastStatusId = '';     // remembered status, carried to the next item
+let porcvActiveIdx = null;      // line index currently open on the item screen
 
 // Dropdown data caches
 let _locations = null;
@@ -9515,10 +11249,14 @@ function stockLookupBtn(btn) {
     // Click-to-pick: data-bin-target (and optionally data-qty-target) make
     // each bin row in the sheet clickable, filling the bin/qty inputs.
     // Only wired up for non-serialized lines.
+    // Pick-all: data-serial-target makes each bin row show a "Pick All" button
+    // that appends that bin's serials into the textarea (serialized lines).
     const opts = {
         binTarget: btn.dataset.binTarget || '',
         qtyTarget: btn.dataset.qtyTarget || '',
-        pickable:  btn.dataset.binTarget ? true : false
+        pickable:  btn.dataset.binTarget ? true : false,
+        serialTarget: btn.dataset.serialTarget || '',
+        serialMax: parseInt(btn.dataset.serialMax) || 0
     };
     openStockLookup(itemId, itemName, locationId, opts);
 }
@@ -9548,9 +11286,12 @@ async function openStockLookup(itemId, itemName, locationId, opts) {
     // subheader each time the component changes. Regular items render flat.
     let html = '';
     let currentComponent = null;
+    const serialMode = !!opts.serialTarget;
     // Pickable header hint when the sheet is acting as a bin picker.
     if (opts.pickable) {
         html += '<div style="padding:8px 16px;font-size:11px;color:var(--text-muted);background:var(--bg-soft,#f5f7fa);border-bottom:1px solid var(--border);">Tap a bin to select it</div>';
+    } else if (serialMode) {
+        html += '<div style="padding:8px 16px;font-size:11px;color:var(--text-muted);background:var(--bg-soft,#f5f7fa);border-bottom:1px solid var(--border);">Tap <b>Pick All</b> to pull available serials from a bin into the scan box</div>';
     }
     data.results.forEach(r => {
         if (r.component && r.component !== currentComponent) {
@@ -9567,6 +11308,23 @@ async function openStockLookup(itemId, itemName, locationId, opts) {
                 '<div class="stock-sheet-qty"><span class="stock-sheet-oh">' + r.qtyOH + ' on hand</span>' +
                 '<span class="stock-sheet-avail">' + r.qtyAvail + ' avail</span></div>' +
                 '</button>';
+        } else if (serialMode) {
+            // Each bin row gets a "Pick All" button that appends that bin's
+            // AVAILABLE serials into the line's scan textarea. Lead with the
+            // available count since that's what Pick All will actually grab.
+            const hasAvail = (r.qtyAvail || 0) > 0;
+            const pickBtn = hasAvail
+                ? '<button type="button" class="btn btn-primary sopick-pickall-btn" data-bin-name="' + escHtml(String(r.bin)) + '" style="font-size:11px;padding:4px 12px;height:30px;white-space:nowrap;" onclick="_sopickPickAllFromBin(this)">Pick All</button>'
+                : '<button type="button" class="btn" disabled style="font-size:11px;padding:4px 12px;height:30px;white-space:nowrap;opacity:.5;cursor:not-allowed;">None avail</button>';
+            html +=
+                '<div class="stock-sheet-row" style="align-items:center;">' +
+                '<div class="stock-sheet-bin">' + escHtml(r.bin) + '</div>' +
+                '<div style="display:flex;align-items:center;gap:10px;">' +
+                '<div class="stock-sheet-qty" style="text-align:right;"><span class="stock-sheet-oh">' + r.qtyAvail + ' available</span>' +
+                (r.qtyOH !== r.qtyAvail ? '<span class="stock-sheet-avail">' + r.qtyOH + ' on hand</span>' : '') + '</div>' +
+                pickBtn +
+                '</div>' +
+                '</div>';
         } else {
             html +=
                 '<div class="stock-sheet-row">' +
@@ -9583,6 +11341,97 @@ async function openStockLookup(itemId, itemName, locationId, opts) {
     // simultaneous opens never trample each other.
     sheet.dataset.binTarget = opts.binTarget || '';
     sheet.dataset.qtyTarget = opts.qtyTarget || '';
+    sheet.dataset.serialTarget = opts.serialTarget || '';
+    sheet.dataset.serialMax = opts.serialMax || 0;
+    sheet.dataset.itemId = itemId || '';
+    sheet.dataset.locationId = locationId || '';
+}
+
+// "Pick All" handler. Fetches every serial in the chosen bin and APPENDS them
+// into the line's scan textarea, deduping against whatever is already there
+// (and across sibling textareas). The sheet stays open so the operator can
+// Pick All from several bins in a row; each adds on top of the last.
+async function _sopickPickAllFromBin(btn) {
+    const sheet = document.getElementById('stock-sheet');
+    if (!sheet) return;
+    const serialTargetId = sheet.dataset.serialTarget || '';
+    const itemId = sheet.dataset.itemId || '';
+    const locationId = sheet.dataset.locationId || '';
+    const serialMax = parseInt(sheet.dataset.serialMax) || 0;
+    const binName = btn.dataset.binName || '';
+    if (!serialTargetId || !itemId || !locationId) { closeStockLookup(); return; }
+
+    const ta = document.getElementById(serialTargetId);
+    if (!ta) { closeStockLookup(); return; }
+
+    const origLabel = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = 'Loading\u2026';
+
+    try {
+        const data = await apiGet('getSerialsInBins', { itemId, locationId });
+        if (!data.success) { toast(data.message || 'Could not load serials.', 'error'); return; }
+
+        // Find the serials for the chosen bin.
+        let binSerials = [];
+        (data.bins || []).forEach(b => { if (String(b.bin) === String(binName)) binSerials = b.serials || []; });
+        if (!binSerials.length) { toast('No serials found in ' + binName + '.', 'info'); return; }
+
+        // Existing serials in this textarea (so we append, not replace).
+        const existing = ta.value.split(/[\\r\\n]+/).map(s => s.trim()).filter(Boolean);
+        const existingSet = new Set(existing);
+
+        // Also avoid pulling serials already entered on sibling textareas.
+        let siblingSet = new Set();
+        if (window._collectSiblingTextareaIds) {
+            const sibIds = [].concat(
+                window._collectSiblingTextareaIds('[id^="sopick-serials-"]', ta.id),
+                window._collectSiblingTextareaIds('[id^="sopick-comp-serials-"]', ta.id)
+            );
+            sibIds.forEach(sid => {
+                const o = document.getElementById(sid);
+                if (!o) return;
+                o.value.split(/[\\r\\n]+/).forEach(s => { const t = s.trim(); if (t) siblingSet.add(t); });
+            });
+        }
+
+        // Respect the line's remaining qty: don't append past serialMax.
+        const room = serialMax > 0 ? Math.max(0, serialMax - existing.length) : Infinity;
+
+        const toAdd = [];
+        let skippedDupe = 0, cappedOut = 0;
+        for (let i = 0; i < binSerials.length; i++) {
+            const s = (binSerials[i] || '').trim();
+            if (!s) continue;
+            if (existingSet.has(s) || siblingSet.has(s)) { skippedDupe++; continue; }
+            if (toAdd.length >= room) { cappedOut++; continue; }
+            toAdd.push(s);
+            existingSet.add(s);
+        }
+
+        if (!toAdd.length) {
+            if (cappedOut > 0) toast('Line is already full (' + serialMax + ' max).', 'info');
+            else toast('All serials from ' + binName + ' are already entered.', 'info');
+            return;
+        }
+
+        const merged = existing.concat(toAdd);
+        ta.value = merged.join('\\n') + '\\n';
+        // Fire input so the count + dedupe + validation listeners react.
+        ta.dispatchEvent(new Event('input', { bubbles: true }));
+
+        let msg = 'Added ' + toAdd.length + ' serial' + (toAdd.length === 1 ? '' : 's') + ' from ' + binName;
+        const extras = [];
+        if (skippedDupe > 0) extras.push(skippedDupe + ' dupe' + (skippedDupe === 1 ? '' : 's') + ' skipped');
+        if (cappedOut > 0)  extras.push(cappedOut + ' over limit');
+        if (extras.length) msg += ' (' + extras.join(', ') + ')';
+        toast(msg, 'success');
+    } catch (e) {
+        toast('Error: ' + e.message, 'error');
+    } finally {
+        btn.disabled = false;
+        btn.textContent = origLabel;
+    }
 }
 
 // Click-to-pick handler. Called from rows rendered when opts.pickable.
@@ -9741,7 +11590,7 @@ document.querySelectorAll('.nav-item[data-view]').forEach(el => {
         // Adjust main padding for iframe vs regular views
         const main = document.querySelector('.main');
         const isMobile = window.innerWidth <= 768;
-        if (el.dataset.view === 'warehouse' || el.dataset.view === 'printlabel' || el.dataset.view === 'binputaway') {
+        if (el.dataset.view === 'warehouse' || el.dataset.view === 'printlabel' || el.dataset.view === 'itemlookup') {
             main.style.padding = isMobile ? '0 0 58px 0' : '0';
         } else {
             main.style.padding = '';
@@ -9774,6 +11623,8 @@ document.querySelectorAll('.nav-item[data-view]').forEach(el => {
         if (el.dataset.view === 'transfer') document.getElementById('transfer-plate-input').focus();
         if (el.dataset.view === 'poreceive') document.getElementById('porcv-po-input').focus();
         if (el.dataset.view === 'sopick') document.getElementById('sopick-so-input').focus();
+        if (el.dataset.view === 'binputaway') { bpawInit(); if (bpawMode === 'serialized') { const b = document.getElementById('bpaw-to-bin'); if (b) b.focus(); } }
+        if (el.dataset.view === 'inventorystatuschange') { iscInit(); }
         if (el.dataset.view === 'irimport') document.getElementById('ir-number-input').focus();
     });
 });
@@ -9861,6 +11712,14 @@ async function loadBins(locationId) {
     const results = data.results || [];
     if (results.length) _bins[locationId] = results;
     return results;
+}
+
+let _statusCodes = null;
+async function loadStatusCodes() {
+    if (_statusCodes) return _statusCodes;
+    const data = await apiGet('getStatusCodes');
+    _statusCodes = data.results || [];
+    return _statusCodes;
 }
 
 function populateSelect(selectEl, items, includeEmpty = true) {
@@ -10795,79 +12654,11 @@ function escHtml(str) {
 document.getElementById('porcv-po-input').addEventListener('keydown', e => {
     if (e.key === 'Enter') { e.preventDefault(); porcvLoadPO(); }
 });
+document.getElementById('porcv-item-scan').addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); porcvScanItem(); }
+});
 
-async function porcvLoadPO() {
-    const poNumber = document.getElementById('porcv-po-input').value.trim();
-    if (!poNumber) { toast('Please enter a PO number.', 'error'); return; }
-
-    showProcessing('Loading PO...', 'Fetching purchase order data');
-    try {
-        const data = await apiGet('loadPOForReceiving', { poNumber });
-        if (!data.success) { toast(data.message, 'error'); return; }
-
-        currentPORcvData = data;
-        document.getElementById('porcv-po-tranid').textContent = data.poTranId;
-        document.getElementById('porcv-po-status').textContent = data.poStatus || '';
-
-        const container = document.getElementById('porcv-lines-container');
-        container.innerHTML = '';
-        let hasReceivable = false;
-        data.lines.forEach((line, idx) => {
-            container.innerHTML += porcvRenderLine(line, idx);
-            if (line.quantityRemaining > 0) hasReceivable = true;
-        });
-
-        document.getElementById('porcv-lines-section').style.display = 'block';
-        document.getElementById('porcv-success').style.display = 'none';
-
-        if (!hasReceivable) toast('All items on this PO are fully received.', 'warning');
-        else toast(data.lines.length + ' line(s) loaded from PO ' + data.poTranId + '.', 'success');
-    } finally { hideProcessing(); }
-}
-
-function porcvRenderLine(line, idx) {
-    const pendingClass = line.isPendingReceipt ? ' pending-receipt' : '';
-    const checkedAttr = line.quantityRemaining > 0 ? 'checked' : '';
-    const disabledAttr = line.quantityRemaining <= 0 ? 'disabled' : '';
-
-    let statusBadge = '';
-    if (line.isPendingReceipt) statusBadge = '<span class="badge" style="background:#fca5a5;color:#991b1b;">Pending Receipt</span>';
-    else if (line.isFullyReceived) statusBadge = '<span class="badge badge-success">Received</span>';
-    else statusBadge = '<span class="badge badge-warning">' + line.quantityRemaining + ' remaining</span>';
-
-    let inputHtml = '';
-    if (line.quantityRemaining > 0) {
-        if (line.isSerialized) {
-            inputHtml = '<div class="porcv-line-input">' +
-                '<label class="form-label">Serial Numbers (one per line)</label>' +
-                '<textarea id="porcv-serials-' + idx + '" rows="4" placeholder="Scan serial numbers, one per line..." oninput="porcvUpdateSerialCount(' + idx + ',' + line.quantityRemaining + ')"></textarea>' +
-                '<div class="porcv-serial-count" id="porcv-serial-count-' + idx + '">0 of ' + line.quantityRemaining + ' serials entered</div></div>';
-        } else {
-            inputHtml = '<div class="porcv-line-input">' +
-                '<label class="form-label">Quantity to Receive</label>' +
-                '<input type="number" id="porcv-qty-' + idx + '" value="' + line.quantityRemaining + '" min="1" max="' + line.quantityRemaining + '"></div>';
-        }
-    }
-
-    const porcvLookupBtn = '<button class="stock-lookup-btn" data-iid="' + escHtml(String(line.itemId)) + '" data-iname="' + escHtml(line.itemText) + '" data-locfn="porcv-location" onclick="stockLookupBtn(this)" title="Check bin stock"><svg viewBox=\\"0 0 24 24\\" fill=\\"none\\" stroke=\\"currentColor\\" stroke-width=\\"2\\"><line x1=\\"18\\" y1=\\"20\\" x2=\\"18\\" y2=\\"10\\"/><line x1=\\"12\\" y1=\\"20\\" x2=\\"12\\" y2=\\"4\\"/><line x1=\\"6\\" y1=\\"20\\" x2=\\"6\\" y2=\\"14\\"/></svg></button>';
-    return '<div class="porcv-line' + pendingClass + (line.quantityRemaining > 0 ? ' selected' : '') + '" id="porcv-line-' + idx + '">' +
-        '<div class="porcv-line-header">' +
-        '<input type="checkbox" id="porcv-check-' + idx + '" ' + checkedAttr + ' ' + disabledAttr + ' onchange="porcvToggleLine(' + idx + ')">' +
-        '<div class="porcv-line-item">' + escHtml(line.itemText) + '</div>' + porcvLookupBtn + statusBadge + '</div>' +
-        (line.description ? '<div class="porcv-line-desc">' + escHtml(line.description) + '</div>' : '') +
-        '<div class="porcv-line-meta">' +
-        '<div><div>Ordered</div><div class="value">' + line.quantity + '</div></div>' +
-        '<div><div>Received</div><div class="value">' + line.quantityReceived + '</div></div>' +
-        '<div><div>Remaining</div><div class="value">' + line.quantityRemaining + '</div></div></div>' +
-        inputHtml + '</div>';
-}
-
-function porcvToggleLine(idx) {
-    const checked = document.getElementById('porcv-check-' + idx).checked;
-    const el = document.getElementById('porcv-line-' + idx);
-    if (checked) el.classList.add('selected'); else el.classList.remove('selected');
-}
-
+// Audible ding (also used by SO picking) - keep defined here.
 function porcvDing() {
     try {
         const ctx = new (window.AudioContext || window.webkitAudioContext)();
@@ -10885,75 +12676,421 @@ function porcvDing() {
     } catch(e) {}
 }
 
-function porcvUpdateSerialCount(idx, max) {
-    const ta = document.getElementById('porcv-serials-' + idx);
-    const countEl = document.getElementById('porcv-serial-count-' + idx);
-    if (!ta || !countEl) return;
+// ─── Load PO, then show the lean item list ───────────────────
+async function porcvLoadPO() {
+    const poNumber = document.getElementById('porcv-po-input').value.trim();
+    if (!poNumber) { toast('Please enter a PO number.', 'error'); return; }
 
-    // Cross-line dupe check: every other porcv serial textarea on this PO
-    const otherIds = window._collectSiblingTextareaIds
-        ? window._collectSiblingTextareaIds('[id^="porcv-serials-"]', ta.id)
-        : [];
+    showProcessing('Loading PO...', 'Fetching purchase order data');
+    try {
+        const data = await apiGet('loadPOForReceiving', { poNumber });
+        if (!data.success) { toast(data.message, 'error'); return; }
 
-    window._dedupeSerialTextarea({
-        textarea: ta,
-        otherTextareaIds: otherIds,
-        onDupesFound: function(r) {
-            countEl.textContent = '\u26A0 Duplicate rejected: ' + [...new Set(r.dupes)].join(', ');
-            countEl.classList.add('has-dupe');
-        },
-        onClean: function(r) {
-            countEl.textContent = r.deduped.length + ' of ' + max + ' serials entered';
-            countEl.classList.remove('has-dupe');
-        }
-    });
+        // reset any prior staging
+        data.lines.forEach(l => { l.staged = null; });
+        currentPORcvData = data;
+        porcvActiveIdx = null;
+
+        document.getElementById('porcv-po-tranid').textContent = data.poTranId;
+        document.getElementById('porcv-po-status').textContent = data.poStatus || '';
+
+        await porcvLoadBinsForCurrentLocation();
+        porcvRenderList();
+
+        document.getElementById('porcv-lines-section').style.display = 'block';
+        document.getElementById('porcv-load-card').style.display = 'none';
+        document.getElementById('porcv-item-screen').style.display = 'none';
+        document.getElementById('porcv-list-screen').style.display = 'block';
+        document.getElementById('porcv-success').style.display = 'none';
+
+        const receivable = data.lines.filter(l => l.quantityRemaining > 0).length;
+        if (!receivable) toast('All items on this PO are fully received.', 'warning');
+        else toast(receivable + ' line(s) ready to receive on PO ' + data.poTranId + '.', 'success');
+    } finally { hideProcessing(); }
 }
 
+async function porcvLoadBinsForCurrentLocation() {
+    const locSel = document.getElementById('porcv-location');
+    if (!locSel || !locSel.value) return;
+    const bins = await loadBins(locSel.value);
+    const binSelect = document.getElementById('porcv-bin');
+    populateSelect(binSelect, bins);
+    const def = document.createElement('option');
+    def.value = ''; def.textContent = 'Default Receiving Bin';
+    binSelect.insertBefore(def, binSelect.firstChild);
+    binSelect.value = '';
+}
+
+// ─── SCREEN 2: lean list ─────────────────────────────────────
+function porcvRenderList() {
+    const container = document.getElementById('porcv-list');
+    if (!currentPORcvData) { container.innerHTML = ''; return; }
+    let html = '';
+    currentPORcvData.lines.forEach((line, idx) => {
+        const staged = line.staged;
+        const receivable = line.quantityRemaining > 0;
+
+        let badge, cls = 'porcv-line';
+        if (staged) {
+            const n = line.isSerialized ? staged.serialNumbers.length : staged.quantity;
+            badge = '<span class="badge badge-success">Staged: ' + n + '</span>';
+            cls += ' selected';
+        } else if (line.isPendingReceipt) {
+            badge = '<span class="badge badge-danger">Pending Receipt</span>';
+        } else if (line.isFullyReceived) {
+            badge = '<span class="badge badge-success">Received</span>';
+        } else {
+            badge = '<span class="badge badge-warning">' + line.quantityRemaining + ' remaining</span>';
+        }
+
+        const clickable = receivable;
+        const onclick = clickable ? ' onclick="porcvOpenItem(' + idx + ')"' : '';
+        const baseStyle = 'padding:18px 14px;margin-bottom:10px;border-radius:10px;';
+        const style = clickable ? ' style="' + baseStyle + 'cursor:pointer;"' : ' style="' + baseStyle + 'opacity:.55;"';
+        const chevron = clickable ? '<span style="color:var(--text-dim);font-size:22px;line-height:1;">\u203A</span>' : '';
+
+        html += '<div class="' + cls + '" id="porcv-row-' + idx + '"' + onclick + style + '>' +
+            '<div class="porcv-line-header" style="margin-bottom:0;gap:10px;">' +
+            '<div class="porcv-line-item" style="font-size:16px;line-height:1.35;">' + escHtml(line.itemText) + '</div>' +
+            badge + chevron +
+            '</div></div>';
+    });
+    container.innerHTML = html || '<div style="color:var(--text-dim);font-size:13px;padding:8px;">No lines on this PO.</div>';
+    porcvRefreshSubmitBtn();
+}
+
+function porcvRefreshSubmitBtn() {
+    const staged = currentPORcvData ? currentPORcvData.lines.filter(l => l.staged).length : 0;
+    const btn = document.getElementById('porcv-submit-btn');
+    const cnt = document.getElementById('porcv-staged-count');
+    if (cnt) cnt.textContent = staged;
+    if (btn) btn.disabled = staged === 0;
+}
+
+// Scan box on the list screen: match a line and open it.
+function porcvScanItem() {
+    const box = document.getElementById('porcv-item-scan');
+    const q = (box.value || '').trim();
+    if (!q) return;
+    if (!currentPORcvData) { toast('Load a PO first.', 'error'); return; }
+    const ql = q.toLowerCase();
+
+    const lines = currentPORcvData.lines;
+    // exact name/sku match first, then contains; only receivable lines
+    let idx = lines.findIndex(l => l.quantityRemaining > 0 && (l.itemText || '').toLowerCase() === ql);
+    if (idx < 0) idx = lines.findIndex(l => l.quantityRemaining > 0 && (l.itemText || '').toLowerCase().indexOf(ql) >= 0);
+
+    if (idx < 0) { toast('No receivable line matches "' + q + '".', 'error'); return; }
+    box.value = '';
+    porcvDing();
+    porcvOpenItem(idx);
+}
+
+// ─── SCREEN 3: single item ───────────────────────────────────
+function porcvOpenItem(idx) {
+    if (!currentPORcvData) return;
+    const line = currentPORcvData.lines[idx];
+    if (!line || line.quantityRemaining <= 0) return;
+    porcvActiveIdx = idx;
+
+    document.getElementById('porcv-item-name').textContent = line.itemText;
+    const descEl = document.getElementById('porcv-item-desc');
+    descEl.textContent = line.description || '';
+    descEl.style.display = line.description ? 'block' : 'none';
+    document.getElementById('porcv-item-remaining').textContent = line.quantityRemaining;
+    document.getElementById('porcv-item-received').textContent = line.quantityReceived;
+    document.getElementById('porcv-item-ordered').textContent = line.quantity;
+
+    // Status select - cached options, default to staged status or last-used.
+    const statusSel = document.getElementById('porcv-item-status');
+    populateSelect(statusSel, porcvStatusCodes);
+    const wantStatus = (line.staged && line.staged.inventoryStatusId) || porcvLastStatusId || '';
+    if (wantStatus) statusSel.value = String(wantStatus);
+
+    const serialGroup = document.getElementById('porcv-item-serial-group');
+    const qtyGroup = document.getElementById('porcv-item-qty-group');
+    const ta = document.getElementById('porcv-item-serials');
+    const qtyInput = document.getElementById('porcv-item-qty');
+
+    if (line.isSerialized) {
+        serialGroup.style.display = 'block';
+        qtyGroup.style.display = 'none';
+        ta.style.textTransform = 'uppercase'; // serials are always uppercase on receipt
+        ta.value = line.staged ? line.staged.serialNumbers.join('\\n') : '';
+        porcvItemSerialCount();
+    } else {
+        serialGroup.style.display = 'none';
+        qtyGroup.style.display = 'block';
+        qtyInput.max = line.quantityRemaining;
+        qtyInput.value = line.staged ? line.staged.quantity : line.quantityRemaining;
+    }
+
+    document.getElementById('porcv-list-screen').style.display = 'none';
+    document.getElementById('porcv-item-screen').style.display = 'block';
+    window.scrollTo(0, 0);
+    setTimeout(() => { (line.isSerialized ? ta : qtyInput).focus(); }, 50);
+}
+
+function porcvBackToList() {
+    porcvActiveIdx = null;
+    document.getElementById('porcv-item-screen').style.display = 'none';
+    document.getElementById('porcv-list-screen').style.display = 'block';
+    porcvRenderList();
+    const box = document.getElementById('porcv-item-scan');
+    if (box) box.focus();
+}
+
+// Serial count + dedupe (within the box AND against serials staged on other lines)
+function porcvItemSerialCount() {
+    const ta = document.getElementById('porcv-item-serials');
+    const countEl = document.getElementById('porcv-item-serial-count');
+    if (!ta || !countEl || porcvActiveIdx === null || !currentPORcvData) return;
+    const line = currentPORcvData.lines[porcvActiveIdx];
+    const max = line.quantityRemaining;
+
+    // serials staged on OTHER lines
+    const taken = new Set();
+    currentPORcvData.lines.forEach((l, i) => {
+        if (i === porcvActiveIdx || !l.staged || !l.isSerialized) return;
+        l.staged.serialNumbers.forEach(s => taken.add(s.trim().toUpperCase()));
+    });
+
+    const raw = ta.value.split('\\n');
+    const seen = new Set();
+    const dupes = [];
+    const kept = [];
+    raw.forEach(s => {
+        const t = s.trim();
+        if (!t) return;
+        const u = t.toUpperCase();
+        if (seen.has(u) || taken.has(u)) { dupes.push(t); return; }
+        seen.add(u);
+        kept.push(u);
+    });
+
+    if (dupes.length) {
+        // strip dupes from the textarea, keep cursor sane
+        ta.value = kept.join('\\n');
+        ta.classList.add('has-dupe');
+        countEl.textContent = '\u26A0 Duplicate rejected: ' + [...new Set(dupes)].join(', ');
+        countEl.classList.add('has-dupe');
+        porcvDing();
+        setTimeout(() => { ta.classList.remove('has-dupe'); }, 600);
+    } else {
+        countEl.classList.remove('has-dupe');
+    }
+    countEl.textContent = (dupes.length ? countEl.textContent + '  \u2014  ' : '') + kept.length + ' of ' + max + ' serials entered';
+}
+
+// Detect serials that don't fit the rest of the batch's pattern (length / prefix).
+// Returns [{ serial, reasons:[] }] for the suspicious ones. Soft signal only.
+// Needs a few serials to establish a "normal" before it trusts the pattern, and
+// only flags deviations when the dominant pattern is a clear majority (>=70%),
+// so a legitimately mixed batch won't spam false alarms.
+function porcvDetectSerialAnomalies(serials) {
+    const list = (serials || []).map(s => (s || '').trim().toUpperCase()).filter(Boolean);
+    const n = list.length;
+    if (n < 4) return []; // too few to judge — easy to eyeball anyway
+    const MAJORITY = 0.7;
+    const PFX = 3;
+
+    const flags = {}; // serial -> Set(reason)
+    const addFlag = (s, reason) => { (flags[s] || (flags[s] = new Set())).add(reason); };
+    const modeOf = (counts) => {
+        let key = null, max = 0;
+        Object.keys(counts).forEach(k => { if (counts[k] > max) { max = counts[k]; key = k; } });
+        return { key: key, count: max };
+    };
+
+    // ── Length pattern ──
+    const lenCounts = {};
+    list.forEach(s => { lenCounts[s.length] = (lenCounts[s.length] || 0) + 1; });
+    const lenMode = modeOf(lenCounts);
+    const modeLen = lenMode.key === null ? null : parseInt(lenMode.key, 10);
+    if (modeLen !== null && (lenMode.count / n) >= MAJORITY) {
+        list.forEach(s => {
+            if (s.length !== modeLen) {
+                addFlag(s, 'length ' + s.length + ', most are ' + modeLen);
+            }
+        });
+    }
+
+    // ── Prefix pattern (first 3 chars) ──
+    const pfxCounts = {};
+    list.forEach(s => { if (s.length >= PFX) { const p = s.slice(0, PFX); pfxCounts[p] = (pfxCounts[p] || 0) + 1; } });
+    const pfxMode = modeOf(pfxCounts);
+    if (pfxMode.key !== null && (pfxMode.count / n) >= MAJORITY) {
+        list.forEach(s => {
+            if (s.length >= PFX && s.slice(0, PFX) !== pfxMode.key) {
+                addFlag(s, 'starts "' + s.slice(0, PFX) + '", most start "' + pfxMode.key + '"');
+            }
+        });
+    }
+
+    return Object.keys(flags).map(s => ({ serial: s, reasons: Array.from(flags[s]) }));
+}
+
+// Mobile-friendly bottom sheet replacing the browser confirm() for the
+// serial-pattern warning. Non-blocking: stashes the "proceed" action and
+// runs it only if the user taps "Receive anyway".
+var _porcvAnomalyConfirmFn = null;
+
+function porcvShowAnomalySheet(anomalies, itemText, onConfirm) {
+    _porcvAnomalyConfirmFn = onConfirm || null;
+    var sub     = document.getElementById('porcv-anomaly-sub');
+    var body    = document.getElementById('porcv-anomaly-body');
+    var overlay = document.getElementById('porcv-anomaly-overlay');
+    var sheet   = document.getElementById('porcv-anomaly-sheet');
+    if (!sub || !body || !overlay || !sheet) {
+        // Fallback to native confirm if the markup is somehow missing.
+        if (typeof onConfirm === 'function'
+            && confirm(anomalies.length + ' serial(s) look different from the rest of this batch. Receive anyway?')) onConfirm();
+        _porcvAnomalyConfirmFn = null;
+        return;
+    }
+    var n = anomalies.length;
+    sub.textContent = n + (n === 1 ? ' serial doesn' : ' serials don') + '\\'t match the rest of this batch for ' + itemText;
+    var rows = anomalies.map(function(a) {
+        return '<div class="stock-sheet-row" style="align-items:flex-start;">'
+             + '<div class="stock-sheet-bin" style="font-family:var(--mono);color:#991b1b;word-break:break-all;">' + escHtml(a.serial) + '</div>'
+             + '<div style="text-align:right;white-space:normal;font-size:11px;color:var(--text-muted);max-width:55%;">' + escHtml(a.reasons.join('; ')) + '</div>'
+             + '</div>';
+    }).join('');
+    body.innerHTML = '<div style="padding:12px 16px;font-size:12.5px;color:var(--text-muted);background:var(--warning-bg);border-bottom:1px solid var(--border);">'
+                   + 'This is usually a scan or typo error. Double-check them below, or receive anyway if they are correct.'
+                   + '</div>' + rows;
+    porcvDing();
+    overlay.classList.add('open');
+    sheet.classList.add('open');
+}
+
+function closePorcvAnomaly() {
+    var overlay = document.getElementById('porcv-anomaly-overlay');
+    var sheet   = document.getElementById('porcv-anomaly-sheet');
+    if (sheet)   sheet.classList.remove('open');
+    if (overlay) overlay.classList.remove('open');
+    _porcvAnomalyConfirmFn = null;
+}
+
+function porcvAnomalyConfirm() {
+    var fn = _porcvAnomalyConfirmFn;
+    closePorcvAnomaly();
+    if (typeof fn === 'function') fn();
+}
+
+// Shared tail once a line is staged.
+function _porcvFinishStage(line, statusId) {
+    porcvLastStatusId = statusId; // carry to next item
+    toast('Staged ' + line.itemText + '.', 'success');
+    porcvBackToList();
+}
+
+// Done: validate, stage (or un-stage if cleared), return to list.
+function porcvDoneItem() {
+    if (porcvActiveIdx === null || !currentPORcvData) { porcvBackToList(); return; }
+    const line = currentPORcvData.lines[porcvActiveIdx];
+    const statusId = document.getElementById('porcv-item-status').value;
+
+    if (line.isSerialized) {
+        const serials = document.getElementById('porcv-item-serials').value
+            .split('\\n').map(s => s.trim().toUpperCase()).filter(Boolean);
+        if (!serials.length) {
+            // cleared -> un-stage
+            if (line.staged) { line.staged = null; toast('Item un-staged.', 'info'); }
+            porcvBackToList();
+            return;
+        }
+        if (!statusId) { toast('Select a status.', 'error'); return; }
+        const dupe = new Set(); const d = serials.find(s => dupe.has(s) ? true : (dupe.add(s), false));
+        if (d) { toast('Duplicate serial "' + d + '". Remove it first.', 'error'); return; }
+        if (serials.length > line.quantityRemaining) {
+            toast('Serial count (' + serials.length + ') exceeds remaining (' + line.quantityRemaining + ').', 'error'); return;
+        }
+
+        const commit = function() {
+            line.staged = { serialNumbers: serials, quantity: serials.length, inventoryStatusId: statusId, statusText: porcvStatusText(statusId) };
+            _porcvFinishStage(line, statusId);
+        };
+
+        // Soft pattern check: warn (don't block) if some serials look unlike the rest.
+        const anomalies = porcvDetectSerialAnomalies(serials);
+        if (anomalies.length) {
+            porcvShowAnomalySheet(anomalies, line.itemText, commit); // commit only runs on "Receive anyway"
+            return;
+        }
+        commit();
+        return;
+    }
+
+    // Non-serialized
+    const qty = parseFloat(document.getElementById('porcv-item-qty').value) || 0;
+    if (qty <= 0) {
+        if (line.staged) { line.staged = null; toast('Item un-staged.', 'info'); }
+        porcvBackToList();
+        return;
+    }
+    if (!statusId) { toast('Select a status.', 'error'); return; }
+    if (qty > line.quantityRemaining) {
+        toast('Quantity (' + qty + ') exceeds remaining (' + line.quantityRemaining + ').', 'error'); return;
+    }
+    line.staged = { serialNumbers: [], quantity: qty, inventoryStatusId: statusId, statusText: porcvStatusText(statusId) };
+    _porcvFinishStage(line, statusId);
+}
+
+function porcvStatusText(id) {
+    const m = (porcvStatusCodes || []).find(s => String(s.id) === String(id));
+    return m ? (m.name || m.text || '') : '';
+}
+
+// Print labels for the item currently open (uses what's typed right now).
+function porcvPrintItemLabels() {
+    if (porcvActiveIdx === null || !currentPORcvData) { toast('Open an item first.', 'error'); return; }
+    const line = currentPORcvData.lines[porcvActiveIdx];
+    let serialNumbers = [], quantity = 0;
+    if (line.isSerialized) {
+        serialNumbers = document.getElementById('porcv-item-serials').value.split('\\n').map(s => s.trim().toUpperCase()).filter(Boolean);
+        if (!serialNumbers.length) { toast('Scan serials before printing labels.', 'error'); return; }
+    } else {
+        quantity = parseFloat(document.getElementById('porcv-item-qty').value) || 0;
+        if (quantity <= 0) { toast('Enter a quantity before printing labels.', 'error'); return; }
+    }
+    const labelData = [{ itemText: line.itemText || '', description: line.description || '', serialNumbers, quantity }];
+    const qs = new URLSearchParams({
+        action: 'printReceiptLabels',
+        labelData: JSON.stringify(labelData),
+        recordId: currentPORcvData.poTranId || ''
+    }).toString();
+    window.open(API + '&' + qs, '_blank');
+}
+
+// ─── Receive all staged lines in ONE Item Receipt ────────────
 async function porcvSubmit() {
     if (!currentPORcvData) { toast('No PO loaded.', 'error'); return; }
 
     const locationId = document.getElementById('porcv-location').value;
     const binId = document.getElementById('porcv-bin').value;
-    const inventoryStatusId = document.getElementById('porcv-status').value;
-
     if (!locationId) { toast('Please select a warehouse location.', 'error'); return; }
-    if (!inventoryStatusId) { toast('Please select an inventory status.', 'error'); return; }
 
     const selectedLines = [];
-    let validationFailed = false;
-    currentPORcvData.lines.forEach((line, idx) => {
-        if (validationFailed) return;
-        const cb = document.getElementById('porcv-check-' + idx);
-        if (!cb || !cb.checked || line.quantityRemaining <= 0) return;
-
-        if (line.isSerialized) {
-            const ta = document.getElementById('porcv-serials-' + idx);
-            const serialNumbers = ta.value.split('\\n').map(s => s.trim()).filter(s => s !== '');
-            if (!serialNumbers.length) { toast('Enter serial numbers for ' + line.itemText + '.', 'error'); validationFailed = true; return; }
-            const dupeCheck = new Set();
-            const dupeFound = serialNumbers.find(s => { if (dupeCheck.has(s)) return true; dupeCheck.add(s); return false; });
-            if (dupeFound) { toast('Duplicate serial number "' + dupeFound + '" in ' + line.itemText + '. Remove duplicates before submitting.', 'error'); validationFailed = true; return; }
-            if (serialNumbers.length > line.quantityRemaining) { toast('Serial count (' + serialNumbers.length + ') for ' + line.itemText + ' exceeds remaining (' + line.quantityRemaining + ').', 'error'); validationFailed = true; return; }
-            selectedLines.push({ lineNum: line.lineNum, itemId: line.itemId, itemText: line.itemText, description: line.description, isSerialized: true, serialNumbers, quantity: serialNumbers.length });
-        } else {
-            const qtyInput = document.getElementById('porcv-qty-' + idx);
-            const qty = parseFloat(qtyInput.value) || 0;
-            if (qty <= 0) { toast('Enter a quantity for ' + line.itemText + '.', 'error'); validationFailed = true; return; }
-            if (qty > line.quantityRemaining) { toast('Quantity for ' + line.itemText + ' exceeds remaining (' + line.quantityRemaining + ').', 'error'); validationFailed = true; return; }
-            selectedLines.push({ lineNum: line.lineNum, itemId: line.itemId, itemText: line.itemText, description: line.description, isSerialized: false, serialNumbers: [], quantity: qty });
-        }
+    currentPORcvData.lines.forEach(line => {
+        if (!line.staged) return;
+        selectedLines.push({
+            lineNum: line.lineNum, itemId: line.itemId, itemText: line.itemText, description: line.description,
+            isSerialized: line.isSerialized,
+            serialNumbers: line.staged.serialNumbers,
+            quantity: line.staged.quantity,
+            inventoryStatusId: line.staged.inventoryStatusId
+        });
     });
-
-    if (validationFailed) return;
-    if (!selectedLines.length) { toast('No items selected for receiving.', 'error'); return; }
+    if (!selectedLines.length) { toast('Stage at least one item before receiving.', 'error'); return; }
 
     document.getElementById('porcv-submit-btn').disabled = true;
-    showProcessing('Creating Item Receipt...', 'Receiving items into inventory');
-
+    showProcessing('Creating Item Receipt...', 'Receiving ' + selectedLines.length + ' item(s) into inventory');
     try {
         const result = await apiPost('receivePOItems', {
             poId: currentPORcvData.poId, locationId, binId: binId || null,
-            inventoryStatusId, lines: selectedLines
+            inventoryStatusId: porcvLastStatusId || (selectedLines[0] && selectedLines[0].inventoryStatusId) || '',
+            lines: selectedLines
         });
 
         if (result.success) {
@@ -10972,7 +13109,7 @@ async function porcvSubmit() {
     } catch (err) {
         toast('Error: ' + err.message, 'error');
     } finally { hideProcessing(); }
-    document.getElementById('porcv-submit-btn').disabled = false;
+    porcvRefreshSubmitBtn();
 }
 
 function porcvPrintLabels() {
@@ -10992,36 +13129,574 @@ function porcvReloadPO() {
 
 function porcvReset() {
     currentPORcvData = null;
+    porcvActiveIdx = null;
     document.getElementById('porcv-po-input').value = '';
     document.getElementById('porcv-lines-section').style.display = 'none';
     document.getElementById('porcv-success').style.display = 'none';
-    document.getElementById('porcv-lines-container').innerHTML = '';
+    document.getElementById('porcv-load-card').style.display = '';
+    document.getElementById('porcv-list').innerHTML = '';
     document.getElementById('porcv-po-input').focus();
 }
 
 async function initPORcvForm() {
     const locs = await loadLocations();
-    populateSelect(document.getElementById('porcv-location'), locs);
+    const locSel = document.getElementById('porcv-location');
+    populateSelect(locSel, locs);
+    // Default location to internal id 1 (TelQuest Fairfield); fall back to first.
+    if ([...locSel.options].some(o => o.value === '1')) locSel.value = '1';
+    else if (locs.length) locSel.value = String(locs[0].id);
+    await porcvLoadBinsForCurrentLocation();
 
     const scData = await apiGet('getStatusCodes');
-    if (scData.results) populateSelect(document.getElementById('porcv-status'), scData.results);
+    porcvStatusCodes = (scData && scData.results) ? scData.results : [];
+    // Default status to internal id 1; carried to each item until changed.
+    if (porcvStatusCodes.some(s => String(s.id) === '1')) porcvLastStatusId = '1';
 
-    document.getElementById('porcv-location').addEventListener('change', async function() {
-        const bins = await loadBins(this.value);
-        const binSelect = document.getElementById('porcv-bin');
-        populateSelect(binSelect, bins);
-        const defaultOpt = document.createElement('option');
-        defaultOpt.value = '';
-        defaultOpt.textContent = 'Default Receiving Bin';
-        binSelect.insertBefore(defaultOpt, binSelect.firstChild);
-        binSelect.value = '';
-    });
+    locSel.addEventListener('change', porcvLoadBinsForCurrentLocation);
 }
+
+
+// ═══════════════════════════════════════════════════════════
+//  BIN PUTAWAY  (native view — mirrors PO Receiving / SO Picking)
+//  Serialized: one destination bin for the whole scan.
+//  Non-serialized: item grid (from-bin / to-bin / qty rows).
+//  Backend logic unchanged — calls binPutawaySerialized /
+//  binPutawayNonSerialized JSON endpoints.
+// ═══════════════════════════════════════════════════════════
+let bpawMode = 'serialized';
+let bpawRowSeq = 0;
+let lastBpawLabelData = [];
+let lastBpawTranId = '';
+let _bpawBinsLoaded = false;
+
+async function bpawInit() {
+    if (!_bpawBinsLoaded) {
+        try {
+            const bins = await loadBins('1');
+            const dl = document.getElementById('bpaw-bin-datalist');
+            if (dl) { dl.innerHTML = ''; bins.forEach(b => { const o = document.createElement('option'); o.value = b.name; dl.appendChild(o); }); }
+            _bpawBinsLoaded = true;
+        } catch (e) { /* non-fatal */ }
+    }
+    const wrap = document.getElementById('bpaw-ns-rows');
+    if (wrap && !wrap.children.length) bpawAddRow();
+}
+
+function bpawSwitchMode(mode) {
+    bpawMode = mode;
+    document.getElementById('bpaw-serialized-section').style.display = (mode === 'serialized') ? 'block' : 'none';
+    document.getElementById('bpaw-nonserialized-section').style.display = (mode === 'nonserialized') ? 'block' : 'none';
+    const sBtn = document.getElementById('bpaw-mode-serialized-btn');
+    const nBtn = document.getElementById('bpaw-mode-nonserialized-btn');
+    if (sBtn) sBtn.className = 'btn' + (mode === 'serialized' ? ' btn-primary' : '');
+    if (nBtn) nBtn.className = 'btn' + (mode === 'nonserialized' ? ' btn-primary' : '');
+    if (mode === 'serialized') { const t = document.getElementById('bpaw-to-bin'); if (t) t.focus(); }
+    else { bpawInit(); }
+}
+
+// Dedupe within the textarea + live count (same UX as PO Receiving).
+function bpawSerialCount() {
+    const ta = document.getElementById('bpaw-serials');
+    const countEl = document.getElementById('bpaw-serial-count');
+    const dupeEl = document.getElementById('bpaw-serial-dupe');
+    if (!ta || !countEl) return;
+    const raw = ta.value.split(/\\r?\\n/);
+    const seen = new Set(); const dupes = []; const kept = [];
+    raw.forEach(s => { const t = s.trim(); if (!t) return; const u = t.toUpperCase(); if (seen.has(u)) { dupes.push(t); return; } seen.add(u); kept.push(t); });
+    if (dupes.length) {
+        ta.value = kept.join('\\n');
+        if (dupeEl) { dupeEl.textContent = '\u26A0 Duplicate rejected: ' + [...new Set(dupes)].join(', '); dupeEl.style.display = 'block'; }
+        ta.classList.add('has-dupe');
+        if (typeof porcvDing === 'function') porcvDing();
+        setTimeout(() => ta.classList.remove('has-dupe'), 600);
+    } else if (dupeEl) { dupeEl.style.display = 'none'; }
+    countEl.textContent = kept.length + ' scanned';
+    const badge = document.getElementById('bpaw-ser-count-badge'); if (badge) badge.textContent = kept.length;
+    bpawSyncSubmit();
+}
+
+function bpawSyncSubmit() {
+    const binEl = document.getElementById('bpaw-to-bin');
+    const taEl = document.getElementById('bpaw-serials');
+    const bin = binEl ? (binEl.value || '').trim() : '';
+    const n = taEl ? (taEl.value || '').split(/\\r?\\n/).map(s => s.trim()).filter(Boolean).length : 0;
+    const btn = document.getElementById('bpaw-ser-submit-btn');
+    if (btn) btn.disabled = !(bin && n > 0);
+}
+
+function bpawAddRow() {
+    const wrap = document.getElementById('bpaw-ns-rows');
+    if (!wrap) return;
+    bpawRowSeq++;
+    const id = bpawRowSeq;
+    const div = document.createElement('div');
+    div.className = 'card';
+    div.setAttribute('data-bpaw-row', id);
+    div.style.cssText = 'padding:12px;margin-bottom:10px;background:var(--surface);';
+    div.innerHTML =
+        '<div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;">' +
+            '<input type="text" id="bpaw-sku-' + id + '" autocomplete="off" placeholder="Part number / SKU" style="flex:1;min-width:0;">' +
+            '<button type="button" class="btn" title="Where else is this item?" onclick="bpawLookupItemBins(' + id + ')" style="flex-shrink:0;width:44px;justify-content:center;padding:0;">' +
+                '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.3-4.3"></path></svg>' +
+            '</button>' +
+            '<button type="button" class="btn" title="Remove row" onclick="bpawRemoveRow(' + id + ')" style="flex-shrink:0;width:44px;justify-content:center;padding:0;color:#ef4444;font-size:20px;">&times;</button>' +
+        '</div>' +
+        '<div style="display:flex;gap:8px;">' +
+            '<div style="flex:1;min-width:0;"><label class="form-label" style="font-size:11px;margin-bottom:2px;">From Bin</label><input type="text" id="bpaw-frombin-' + id + '" list="bpaw-bin-datalist" autocomplete="off" placeholder="From" style="width:100%;"></div>' +
+            '<div style="flex:1;min-width:0;"><label class="form-label" style="font-size:11px;margin-bottom:2px;">To Bin</label><input type="text" id="bpaw-tobin-' + id + '" list="bpaw-bin-datalist" autocomplete="off" placeholder="To" style="width:100%;"></div>' +
+            '<div style="width:74px;flex-shrink:0;"><label class="form-label" style="font-size:11px;margin-bottom:2px;">Qty</label><input type="number" id="bpaw-qty-' + id + '" min="1" placeholder="Qty" style="width:100%;"></div>' +
+        '</div>';
+    wrap.appendChild(div);
+    bpawRowCount();
+    const sku = document.getElementById('bpaw-sku-' + id); if (sku) sku.focus();
+}
+
+function bpawRemoveRow(id) {
+    const row = document.querySelector('[data-bpaw-row="' + id + '"]');
+    if (row) row.remove();
+    const wrap = document.getElementById('bpaw-ns-rows');
+    if (wrap && !wrap.children.length) bpawAddRow();
+    bpawRowCount();
+}
+
+function bpawRowCount() {
+    const wrap = document.getElementById('bpaw-ns-rows');
+    const el = document.getElementById('bpaw-ns-row-count');
+    if (wrap && el) el.textContent = wrap.children.length;
+}
+
+// "Where are these items?" — serials -> current bins, tap to set destination.
+async function bpawLookupSerialBins() {
+    const raw = (document.getElementById('bpaw-serials').value || '').trim();
+    if (!raw) { toast('Scan at least one serial first.', 'warning'); return; }
+    const overlay = document.getElementById('stock-sheet-overlay');
+    const sheet = document.getElementById('stock-sheet');
+    const title = document.getElementById('stock-sheet-title');
+    const body = document.getElementById('stock-sheet-body');
+    title.textContent = 'Where are these items?';
+    body.innerHTML = '<div style="text-align:center;padding:20px;color:var(--text-muted);">Loading\u2026</div>';
+    overlay.classList.add('open'); sheet.classList.add('open');
+    try {
+        const data = await apiGet('getBinInventoryForSerials', { serials: raw });
+        if (!data.success || !data.results || !data.results.length) {
+            body.innerHTML = '<div style="text-align:center;padding:20px;color:var(--text-muted);">' + escHtml((data && data.message) || 'No current bin locations found.') + '</div>';
+            return;
+        }
+        let html = '<div style="padding:8px 16px;font-size:11px;color:var(--text-muted);background:var(--bg-soft,#f5f7fa);border-bottom:1px solid var(--border);">Tap a bin to set it as the destination</div>';
+        let currentComponent = null;
+        data.results.forEach(r => {
+            if (r.component && r.component !== currentComponent) {
+                currentComponent = r.component;
+                html += '<div style="padding:10px 16px 6px;font-size:12px;font-weight:700;color:var(--text);background:var(--bg-soft,#f5f7fa);border-bottom:1px solid var(--border);">' + escHtml(currentComponent) + '</div>';
+            }
+            html += '<button type="button" class="stock-sheet-row stock-sheet-row-pick" data-bin-name="' + escHtml(String(r.bin)) + '" data-qty-avail="' + (r.qtyAvail || 0) + '" onclick="_sopickPickBinFromSheet(this)">' +
+                '<div class="stock-sheet-bin">' + escHtml(r.bin) + '</div>' +
+                '<div class="stock-sheet-qty"><span class="stock-sheet-oh">' + r.qtyOH + ' on hand</span><span class="stock-sheet-avail">' + r.qtyAvail + ' avail</span></div>' +
+                '</button>';
+        });
+        body.innerHTML = html;
+        sheet.dataset.binTarget = 'bpaw-to-bin';
+        sheet.dataset.qtyTarget = '';
+        sheet.dataset.serialTarget = '';
+    } catch (e) {
+        body.innerHTML = '<div style="text-align:center;padding:20px;color:var(--danger);">' + escHtml(e.message) + '</div>';
+    }
+}
+
+// "Where else is this item?" — resolve SKU, then reuse the pickable bin sheet
+// to fill this row's To Bin (and cap qty at available).
+async function bpawLookupItemBins(rowId) {
+    const skuEl = document.getElementById('bpaw-sku-' + rowId);
+    const sku = skuEl ? skuEl.value.trim() : '';
+    if (!sku) { toast('Enter a part number first.', 'warning'); return; }
+    showProcessing('Looking up\u2026', 'Finding bins for ' + sku);
+    try {
+        const idata = await apiGet('getItems', { q: sku });
+        const list = (idata && idata.results) ? idata.results : [];
+        let match = list.find(i => (i.name || '').toLowerCase() === sku.toLowerCase());
+        if (!match && list.length === 1) match = list[0];
+        hideProcessing();
+        if (!match) { toast('No item matches "' + sku + '".', 'error'); return; }
+        openStockLookup(match.id, match.name || sku, '1', { binTarget: 'bpaw-tobin-' + rowId, qtyTarget: 'bpaw-qty-' + rowId, pickable: true });
+    } catch (e) { hideProcessing(); toast('Error: ' + e.message, 'error'); }
+}
+
+async function bpawSubmit() {
+    if (bpawMode === 'serialized') {
+        const toBin = (document.getElementById('bpaw-to-bin').value || '').trim();
+        const serials = (document.getElementById('bpaw-serials').value || '').split(/\\r?\\n/).map(s => s.trim()).filter(Boolean);
+        if (!toBin) { toast('Select a destination bin.', 'error'); return; }
+        if (!serials.length) { toast('Scan at least one serial number.', 'error'); return; }
+
+        // Pre-submit validation: warn on unknown serials before they're skipped.
+        try {
+            const v = await apiGet('validateSerialsExist', { serials: serials.join('\\n') });
+            if (v && v.success && v.invalidCount > 0) {
+                const proceed = confirm(v.invalidCount + ' serial(s) not found in NetSuite and will be skipped:\\n\\n' + (v.invalid || []).join('\\n') + '\\n\\nContinue with ' + v.validCount + ' valid serial(s)?');
+                if (!proceed) return;
+            }
+        } catch (e) { /* non-fatal — let the server handle it */ }
+
+        const btn = document.getElementById('bpaw-ser-submit-btn');
+        _btnWait(btn);
+        showProcessing('Creating Bin Transfer\u2026', 'Putting away ' + serials.length + ' serial(s)');
+        try {
+            const r = await apiPost('binPutawaySerialized', { toBinNumber: toBin, serials: serials });
+            if (r.success) bpawShowSuccess(r);
+            else toast(r.message || 'Putaway failed.', 'error');
+        } catch (e) { toast('Error: ' + e.message, 'error'); }
+        finally { hideProcessing(); _btnReset(btn); }
+    } else {
+        const rows = [];
+        let bad = false;
+        const setErr = (elId, on) => { const el = document.getElementById(elId); if (el) el.style.borderColor = on ? '#ef4444' : ''; };
+        document.querySelectorAll('#bpaw-ns-rows [data-bpaw-row]').forEach(div => {
+            const id = div.getAttribute('data-bpaw-row');
+            const sku = (document.getElementById('bpaw-sku-' + id).value || '').trim();
+            const fb = (document.getElementById('bpaw-frombin-' + id).value || '').trim();
+            const tb = (document.getElementById('bpaw-tobin-' + id).value || '').trim();
+            const q = parseInt(document.getElementById('bpaw-qty-' + id).value, 10) || 0;
+            if (!sku && !fb && !tb && q === 0) return; // ignore fully-empty rows
+            let rowBad = false;
+            setErr('bpaw-sku-' + id, !sku); if (!sku) rowBad = true;
+            setErr('bpaw-frombin-' + id, !fb); if (!fb) rowBad = true;
+            setErr('bpaw-tobin-' + id, !tb); if (!tb) rowBad = true;
+            setErr('bpaw-qty-' + id, q <= 0); if (q <= 0) rowBad = true;
+            if (rowBad) { bad = true; return; }
+            rows.push({ itemName: sku, fromBinNumber: fb, toBinNumber: tb, quantity: q });
+        });
+        if (!rows.length) { toast('Fill in at least one row.', 'error'); return; }
+        if (bad) { toast('Fix the highlighted fields.', 'error'); return; }
+
+        const btn = document.getElementById('bpaw-ns-submit-btn');
+        _btnWait(btn);
+        showProcessing('Creating Bin Transfer\u2026', 'Moving ' + rows.length + ' item(s)');
+        try {
+            const r = await apiPost('binPutawayNonSerialized', { rows: rows });
+            if (r.success) bpawShowSuccess(r);
+            else toast(r.message || 'Putaway failed.', 'error');
+        } catch (e) { toast('Error: ' + e.message, 'error'); }
+        finally { hideProcessing(); _btnReset(btn); }
+    }
+}
+
+function bpawShowSuccess(r) {
+    lastBpawLabelData = r.labelGroups || [];
+    lastBpawTranId = r.tranId || '';
+    document.getElementById('bpaw-serialized-section').style.display = 'none';
+    document.getElementById('bpaw-nonserialized-section').style.display = 'none';
+    document.getElementById('bpaw-mode-card').style.display = 'none';
+    document.getElementById('bpaw-success-num').textContent = r.tranId || '';
+    document.getElementById('bpaw-success-msg').textContent = r.message || '';
+    const failedEl = document.getElementById('bpaw-success-failed');
+    if (r.failed && r.failed.length) {
+        failedEl.style.display = 'block';
+        failedEl.innerHTML = '<div style="background:#fef2f2;border:1px solid #fca5a5;border-radius:8px;padding:10px;text-align:left;">' +
+            '<div style="font-weight:700;color:#991b1b;font-size:13px;margin-bottom:4px;">' + r.failed.length + ' serial(s) skipped (not found)</div>' +
+            '<div style="font-size:12px;color:#991b1b;font-family:var(--mono);word-break:break-all;">' + r.failed.map(s => escHtml(s)).join(', ') + '</div></div>';
+    } else { failedEl.style.display = 'none'; }
+    const printBtn = document.getElementById('bpaw-print-btn');
+    if (printBtn) printBtn.style.display = (lastBpawLabelData && lastBpawLabelData.length) ? 'inline-flex' : 'none';
+    document.getElementById('bpaw-success').style.display = 'block';
+    toast('Bin transfer ' + (r.tranId || '') + ' created.', 'success');
+    window.scrollTo(0, 0);
+}
+
+function bpawPrintLabels() {
+    if (!lastBpawLabelData.length) { toast('No label data available.', 'error'); return; }
+    const labelData = lastBpawLabelData.map(g => ({ itemText: g.itemText || '', description: g.description || '', serialNumbers: g.serialNumbers || [], quantity: (g.serialNumbers || []).length }));
+    const qs = new URLSearchParams({ action: 'printReceiptLabels', labelData: JSON.stringify(labelData), recordId: lastBpawTranId }).toString();
+    window.open(API + '&' + qs, '_blank');
+}
+
+function bpawReset() {
+    document.getElementById('bpaw-success').style.display = 'none';
+    document.getElementById('bpaw-mode-card').style.display = '';
+    const tb = document.getElementById('bpaw-to-bin'); if (tb) tb.value = '';
+    const ta = document.getElementById('bpaw-serials'); if (ta) ta.value = '';
+    const cnt = document.getElementById('bpaw-serial-count'); if (cnt) cnt.textContent = '0 scanned';
+    const badge = document.getElementById('bpaw-ser-count-badge'); if (badge) badge.textContent = '0';
+    const dupe = document.getElementById('bpaw-serial-dupe'); if (dupe) dupe.style.display = 'none';
+    const wrap = document.getElementById('bpaw-ns-rows'); if (wrap) wrap.innerHTML = '';
+    bpawRowSeq = 0;
+    bpawAddRow();
+    lastBpawLabelData = []; lastBpawTranId = '';
+    bpawSwitchMode(bpawMode);
+    bpawSyncSubmit();
+}
+
+
+// ═══════════════════════════════════════════════════════════
+//  INVENTORY STATUS CHANGE  (native SPA view)
+//  Serialized: scan serials, pick one target status.
+//  Non-serialized: item / bin / qty rows, pick one target status.
+//  Calls inventoryStatusChangeSerialized /
+//  inventoryStatusChangeNonSerialized JSON endpoints.
+// ═══════════════════════════════════════════════════════════
+let iscMode = 'serialized';
+let iscRowSeq = 0;
+let lastIscTranId = '';
+let _iscBinsLoaded = false;
+let _iscStatusLoaded = false;
+
+async function iscInit() {
+    if (!_iscBinsLoaded) {
+        try {
+            const bins = await loadBins('1');
+            const dl = document.getElementById('isc-bin-datalist');
+            if (dl) { dl.innerHTML = ''; bins.forEach(b => { const o = document.createElement('option'); o.value = b.name; dl.appendChild(o); }); }
+            _iscBinsLoaded = true;
+        } catch (e) { /* non-fatal */ }
+    }
+    if (!_iscStatusLoaded) {
+        try {
+            const statuses = await loadStatusCodes();
+            const sel = document.getElementById('isc-to-status');
+            if (sel) {
+                const cur = sel.value;
+                sel.innerHTML = '<option value="">\u2014 Select status \u2014</option>';
+                statuses.forEach(s => { const o = document.createElement('option'); o.value = s.id; o.textContent = s.name; sel.appendChild(o); });
+                if (cur) sel.value = cur;
+            }
+            _iscStatusLoaded = true;
+        } catch (e) { /* non-fatal */ }
+    }
+    const wrap = document.getElementById('isc-ns-rows');
+    if (wrap && !wrap.children.length) iscAddRow();
+    iscSyncSubmit();
+}
+
+function iscSwitchMode(mode) {
+    iscMode = mode;
+    document.getElementById('isc-serialized-section').style.display = (mode === 'serialized') ? 'block' : 'none';
+    document.getElementById('isc-nonserialized-section').style.display = (mode === 'nonserialized') ? 'block' : 'none';
+    const sBtn = document.getElementById('isc-mode-serialized-btn');
+    const nBtn = document.getElementById('isc-mode-nonserialized-btn');
+    if (sBtn) sBtn.className = 'btn' + (mode === 'serialized' ? ' btn-primary' : '');
+    if (nBtn) nBtn.className = 'btn' + (mode === 'nonserialized' ? ' btn-primary' : '');
+    if (mode === 'serialized') { const t = document.getElementById('isc-serials'); if (t) t.focus(); }
+    else { iscInit(); }
+    iscSyncSubmit();
+}
+
+// Dedupe within the textarea + live count (same UX as Bin Putaway).
+function iscSerialCount() {
+    const ta = document.getElementById('isc-serials');
+    const countEl = document.getElementById('isc-serial-count');
+    const dupeEl = document.getElementById('isc-serial-dupe');
+    if (!ta || !countEl) return;
+    const raw = ta.value.split(/\\r?\\n/);
+    const seen = new Set(); const dupes = []; const kept = [];
+    raw.forEach(s => { const t = s.trim(); if (!t) return; const u = t.toUpperCase(); if (seen.has(u)) { dupes.push(t); return; } seen.add(u); kept.push(t); });
+    if (dupes.length) {
+        ta.value = kept.join('\\n');
+        if (dupeEl) { dupeEl.textContent = '\u26A0 Duplicate rejected: ' + [...new Set(dupes)].join(', '); dupeEl.style.display = 'block'; }
+        ta.classList.add('has-dupe');
+        if (typeof porcvDing === 'function') porcvDing();
+        setTimeout(() => ta.classList.remove('has-dupe'), 600);
+    } else if (dupeEl) { dupeEl.style.display = 'none'; }
+    countEl.textContent = kept.length + ' scanned';
+    const badge = document.getElementById('isc-ser-count-badge'); if (badge) badge.textContent = kept.length;
+    iscSyncSubmit();
+}
+
+function iscSyncSubmit() {
+    const statusEl = document.getElementById('isc-to-status');
+    const status = statusEl ? (statusEl.value || '').trim() : '';
+    const taEl = document.getElementById('isc-serials');
+    const n = taEl ? (taEl.value || '').split(/\\r?\\n/).map(s => s.trim()).filter(Boolean).length : 0;
+    const serBtn = document.getElementById('isc-ser-submit-btn');
+    if (serBtn) serBtn.disabled = !(status && n > 0);
+    const nsBtn = document.getElementById('isc-ns-submit-btn');
+    if (nsBtn) nsBtn.disabled = !status;
+}
+
+function iscAddRow() {
+    const wrap = document.getElementById('isc-ns-rows');
+    if (!wrap) return;
+    iscRowSeq++;
+    const id = iscRowSeq;
+    const div = document.createElement('div');
+    div.className = 'card';
+    div.setAttribute('data-isc-row', id);
+    div.style.cssText = 'padding:12px;margin-bottom:10px;background:var(--surface);';
+    div.innerHTML =
+        '<div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;">' +
+            '<input type="text" id="isc-sku-' + id + '" autocomplete="off" placeholder="Part number / SKU" style="flex:1;min-width:0;">' +
+            '<button type="button" class="btn" title="Where is this item?" onclick="iscLookupItemBins(' + id + ')" style="flex-shrink:0;width:44px;justify-content:center;padding:0;">' +
+                '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.3-4.3"></path></svg>' +
+            '</button>' +
+            '<button type="button" class="btn" title="Remove row" onclick="iscRemoveRow(' + id + ')" style="flex-shrink:0;width:44px;justify-content:center;padding:0;color:#ef4444;font-size:20px;">&times;</button>' +
+        '</div>' +
+        '<div style="display:flex;gap:8px;">' +
+            '<div style="flex:1;min-width:0;"><label class="form-label" style="font-size:11px;margin-bottom:2px;">Bin</label><input type="text" id="isc-bin-' + id + '" list="isc-bin-datalist" autocomplete="off" placeholder="Bin" style="width:100%;"></div>' +
+            '<div style="width:74px;flex-shrink:0;"><label class="form-label" style="font-size:11px;margin-bottom:2px;">Qty</label><input type="number" id="isc-qty-' + id + '" min="1" placeholder="Qty" style="width:100%;"></div>' +
+        '</div>';
+    wrap.appendChild(div);
+    iscRowCount();
+    const sku = document.getElementById('isc-sku-' + id); if (sku) sku.focus();
+}
+
+function iscRemoveRow(id) {
+    const row = document.querySelector('[data-isc-row="' + id + '"]');
+    if (row) row.remove();
+    const wrap = document.getElementById('isc-ns-rows');
+    if (wrap && !wrap.children.length) iscAddRow();
+    iscRowCount();
+}
+
+function iscRowCount() {
+    const wrap = document.getElementById('isc-ns-rows');
+    const el = document.getElementById('isc-ns-row-count');
+    if (wrap && el) el.textContent = wrap.children.length;
+}
+
+// "Where is this item?" — resolve SKU, then reuse the pickable bin sheet to
+// fill this row's Bin (and cap qty at available).
+async function iscLookupItemBins(rowId) {
+    const skuEl = document.getElementById('isc-sku-' + rowId);
+    const sku = skuEl ? skuEl.value.trim() : '';
+    if (!sku) { toast('Enter a part number first.', 'warning'); return; }
+    showProcessing('Looking up\u2026', 'Finding bins for ' + sku);
+    try {
+        const idata = await apiGet('getItems', { q: sku });
+        const list = (idata && idata.results) ? idata.results : [];
+        let match = list.find(i => (i.name || '').toLowerCase() === sku.toLowerCase());
+        if (!match && list.length === 1) match = list[0];
+        hideProcessing();
+        if (!match) { toast('No item matches "' + sku + '".', 'error'); return; }
+        openStockLookup(match.id, match.name || sku, '1', { binTarget: 'isc-bin-' + rowId, qtyTarget: 'isc-qty-' + rowId, pickable: true });
+    } catch (e) { hideProcessing(); toast('Error: ' + e.message, 'error'); }
+}
+
+async function iscSubmit() {
+    const statusEl = document.getElementById('isc-to-status');
+    const toStatusId = statusEl ? (statusEl.value || '').trim() : '';
+    const statusName = (statusEl && statusEl.selectedIndex >= 0) ? statusEl.options[statusEl.selectedIndex].textContent : '';
+    if (!toStatusId) { toast('Select a target status.', 'error'); return; }
+
+    if (iscMode === 'serialized') {
+        const serials = (document.getElementById('isc-serials').value || '').split(/\\r?\\n/).map(s => s.trim()).filter(Boolean);
+        if (!serials.length) { toast('Scan at least one serial number.', 'error'); return; }
+
+        // Pre-submit validation: warn on unknown serials before they're skipped.
+        try {
+            const v = await apiGet('validateSerialsExist', { serials: serials.join('\\n') });
+            if (v && v.success && v.invalidCount > 0) {
+                const proceed = confirm(v.invalidCount + ' serial(s) not found in NetSuite and will be skipped:\\n\\n' + (v.invalid || []).join('\\n') + '\\n\\nContinue with ' + v.validCount + ' valid serial(s)?');
+                if (!proceed) return;
+            }
+        } catch (e) { /* non-fatal — let the server handle it */ }
+
+        const btn = document.getElementById('isc-ser-submit-btn');
+        _btnWait(btn);
+        showProcessing('Creating Status Change\u2026', 'Setting ' + serials.length + ' serial(s) to ' + statusName);
+        try {
+            const r = await apiPost('inventoryStatusChangeSerialized', { toStatusId: toStatusId, serials: serials });
+            if (r.success) iscShowSuccess(r);
+            else toast(r.message || 'Status change failed.', 'error');
+        } catch (e) { toast('Error: ' + e.message, 'error'); }
+        finally { hideProcessing(); _btnReset(btn); }
+    } else {
+        const rows = [];
+        let bad = false;
+        const setErr = (elId, on) => { const el = document.getElementById(elId); if (el) el.style.borderColor = on ? '#ef4444' : ''; };
+        document.querySelectorAll('#isc-ns-rows [data-isc-row]').forEach(div => {
+            const id = div.getAttribute('data-isc-row');
+            const sku = (document.getElementById('isc-sku-' + id).value || '').trim();
+            const bin = (document.getElementById('isc-bin-' + id).value || '').trim();
+            const q = parseInt(document.getElementById('isc-qty-' + id).value, 10) || 0;
+            if (!sku && !bin && q === 0) return; // ignore fully-empty rows
+            let rowBad = false;
+            setErr('isc-sku-' + id, !sku); if (!sku) rowBad = true;
+            setErr('isc-bin-' + id, !bin); if (!bin) rowBad = true;
+            setErr('isc-qty-' + id, q <= 0); if (q <= 0) rowBad = true;
+            if (rowBad) { bad = true; return; }
+            rows.push({ itemName: sku, binNumber: bin, quantity: q });
+        });
+        if (!rows.length) { toast('Fill in at least one row.', 'error'); return; }
+        if (bad) { toast('Fix the highlighted fields.', 'error'); return; }
+
+        const btn = document.getElementById('isc-ns-submit-btn');
+        _btnWait(btn);
+        showProcessing('Creating Status Change\u2026', 'Setting ' + rows.length + ' line(s) to ' + statusName);
+        try {
+            const r = await apiPost('inventoryStatusChangeNonSerialized', { toStatusId: toStatusId, rows: rows });
+            if (r.success) iscShowSuccess(r);
+            else toast(r.message || 'Status change failed.', 'error');
+        } catch (e) { toast('Error: ' + e.message, 'error'); }
+        finally { hideProcessing(); _btnReset(btn); }
+    }
+}
+
+function iscShowSuccess(r) {
+    lastIscTranId = r.tranId || '';
+    document.getElementById('isc-serialized-section').style.display = 'none';
+    document.getElementById('isc-nonserialized-section').style.display = 'none';
+    document.getElementById('isc-mode-card').style.display = 'none';
+    document.getElementById('isc-success-num').textContent = r.tranId || '';
+    document.getElementById('isc-success-msg').textContent = r.message || '';
+    const failedEl = document.getElementById('isc-success-failed');
+    const failed = (r.failed || []).concat(r.alreadyInStatus || []);
+    if (r.failed && r.failed.length) {
+        failedEl.style.display = 'block';
+        failedEl.innerHTML = '<div style="background:#fef2f2;border:1px solid #fca5a5;border-radius:8px;padding:10px;text-align:left;">' +
+            '<div style="font-weight:700;color:#991b1b;font-size:13px;margin-bottom:4px;">' + r.failed.length + ' serial(s) skipped (not found)</div>' +
+            '<div style="font-size:12px;color:#991b1b;font-family:var(--mono);word-break:break-all;">' + r.failed.map(s => escHtml(s)).join(', ') + '</div></div>';
+    } else { failedEl.style.display = 'none'; }
+    document.getElementById('isc-success').style.display = 'block';
+    toast('Inventory Status Change ' + (r.tranId || '') + ' created.', 'success');
+    window.scrollTo(0, 0);
+}
+
+function iscReset() {
+    document.getElementById('isc-success').style.display = 'none';
+    document.getElementById('isc-mode-card').style.display = '';
+    const ta = document.getElementById('isc-serials'); if (ta) ta.value = '';
+    const cnt = document.getElementById('isc-serial-count'); if (cnt) cnt.textContent = '0 scanned';
+    const badge = document.getElementById('isc-ser-count-badge'); if (badge) badge.textContent = '0';
+    const dupe = document.getElementById('isc-serial-dupe'); if (dupe) dupe.style.display = 'none';
+    const wrap = document.getElementById('isc-ns-rows'); if (wrap) wrap.innerHTML = '';
+    iscRowSeq = 0;
+    iscAddRow();
+    lastIscTranId = '';
+    iscSwitchMode(iscMode);
+    iscSyncSubmit();
+}
+
 
 // ═══════════════════════════════════════════════════════════
 //  SO PICKING
 // ═══════════════════════════════════════════════════════════
 let currentSOPickData = null;
+
+// ─── ALREADY-PICKED SERIALS ─────────────────────────────────
+// Serials sitting on this SO's open Item Fulfillments (Picked/Packed). They
+// can't be picked again, so we (a) show them on each line and (b) auto-remove
+// them if they get scanned into a textarea — see _sopickStripPickedSerials.
+let _sopickPickedSet = new Set(); // uppercased serials already picked on the loaded SO
+
+function _sopickBuildPickedSet(data) {
+    _sopickPickedSet = new Set();
+    const add = (arr) => { (arr || []).forEach(s => { const t = (s || '').trim(); if (t) _sopickPickedSet.add(t.toUpperCase()); }); };
+    if (data) {
+        add(data.pickedSerials);
+        (data.lines || []).forEach(l => {
+            add(l.pickedSerials);
+            (l.components || []).forEach(c => add(c.pickedSerials));
+        });
+    }
+}
+
+// Renders the read-only "Already picked" panel for a serialized line/component.
+function _sopickPickedBlock(pickedSerials) {
+    if (!pickedSerials || !pickedSerials.length) return '';
+    const list = pickedSerials.map(s => escHtml(s)).join(', ');
+    return '<div class="sopick-picked-list">' +
+        '<div class="sopick-picked-head">\u2713 Already picked (' + pickedSerials.length + ') \u2014 won\\'t be picked again</div>' +
+        '<div class="sopick-picked-serials">' + list + '</div>' +
+    '</div>';
+}
 
 document.getElementById('sopick-so-input').addEventListener('keydown', e => {
     if (e.key === 'Enter') { e.preventDefault(); sopickLoadSO(); }
@@ -11037,6 +13712,7 @@ async function sopickLoadSO() {
         if (!data.success) { toast(data.message, 'error'); return; }
 
         currentSOPickData = data;
+        _sopickBuildPickedSet(data);
         // Fresh SO → drop any leftover per-textarea validation cache/timers.
         Object.keys(_sopickValCache).forEach(k => delete _sopickValCache[k]);
         Object.keys(_sopickValTimer).forEach(k => { clearTimeout(_sopickValTimer[k]); delete _sopickValTimer[k]; });
@@ -11052,6 +13728,14 @@ async function sopickLoadSO() {
             container.innerHTML += sopickRenderLine(line, idx);
             if (line.quantityRemaining > 0) hasPickable = true;
         });
+
+        // Attach the bin typeahead to every (non-serialized + kit-component) bin
+        // field just rendered. Re-reads the sopick bin datalist live.
+        if (window.WAAC) {
+            container.querySelectorAll('.sopick-bin-input').forEach(function(el){
+                WAAC.attach(el, { type: 'bin', datalistId: 'sopick-bin-datalist' });
+            });
+        }
 
         // Warning banner: SO already has open Item Fulfillments (Picked/Packed)
         // that haven't shipped yet. Those units have been subtracted from
@@ -11080,7 +13764,15 @@ async function sopickLoadSO() {
         const locationId = document.getElementById('sopick-location').value;
         if (locationId) await sopickRefreshBins(locationId);
 
+        // Presentation: keep every rendered line in the DOM (submit/validation
+        // read them directly) but show only one at a time via a lean list.
+        container.querySelectorAll('.sopick-line').forEach(function(el){ el.style.display = 'none'; });
+        sopickRenderList();
+
         document.getElementById('sopick-lines-section').style.display = 'block';
+        document.getElementById('sopick-load-card').style.display = 'none';
+        document.getElementById('sopick-list-screen').style.display = 'block';
+        document.getElementById('sopick-detail-screen').style.display = 'none';
         document.getElementById('sopick-success').style.display = 'none';
 
         if (!hasPickable) {
@@ -11090,6 +13782,81 @@ async function sopickLoadSO() {
             toast(data.lines.length + ' line(s) loaded from SO ' + data.soTranId + '.', 'success');
         }
     } finally { hideProcessing(); }
+}
+
+// ── List / detail presentation (one line per screen) ─────────
+function sopickLineEntered(idx) {
+    const block = document.getElementById('sopick-line-' + idx);
+    if (!block) return 0;
+    let count = 0;
+    block.querySelectorAll('textarea').forEach(function(ta) {
+        count += ta.value.split('\\n').map(function(s){ return s.trim(); }).filter(Boolean).length;
+    });
+    return count;
+}
+
+function sopickRenderList() {
+    const wrap = document.getElementById('sopick-list');
+    if (!wrap || !currentSOPickData) { if (wrap) wrap.innerHTML = ''; return; }
+    let html = '';
+    currentSOPickData.lines.forEach(function(line, idx) {
+        const pickable = line.quantityRemaining > 0;
+        const kitBadge = line.isKit ? ' <span class="badge badge-info" style="font-size:10px;">Kit</span>' : '';
+        const entered = pickable ? sopickLineEntered(idx) : 0;
+
+        // "remaining" is NetSuite's outstanding qty and only drops after Fulfill,
+        // so reflect scan progress here instead of showing both at once.
+        let badge;
+        if (line.isFullyFulfilled) {
+            badge = '<span class="badge badge-success">Fulfilled</span>';
+        } else if (line.isKit) {
+            badge = entered > 0
+                ? '<span class="badge badge-info">\u2713 ' + entered + ' scanned</span>'
+                : '<span class="badge badge-warning">' + line.quantityRemaining + ' remaining</span>';
+        } else if (line.isSerialized) {
+            if (entered >= line.quantityRemaining && entered > 0)
+                badge = '<span class="badge badge-success">\u2713 Picked ' + entered + '/' + line.quantityRemaining + '</span>';
+            else if (entered > 0)
+                badge = '<span class="badge badge-info">' + entered + ' of ' + line.quantityRemaining + ' scanned</span>';
+            else
+                badge = '<span class="badge badge-warning">' + line.quantityRemaining + ' remaining</span>';
+        } else {
+            badge = '<span class="badge badge-warning">' + line.quantityRemaining + ' remaining</span>';
+        }
+
+        const clickable = pickable;
+        const onclick = clickable ? ' onclick="sopickOpenLine(' + idx + ')"' : '';
+        const baseStyle = 'padding:18px 14px;margin-bottom:10px;border-radius:10px;';
+        const style = clickable ? ' style="' + baseStyle + 'cursor:pointer;"' : ' style="' + baseStyle + 'opacity:.55;"';
+        const chevron = clickable ? '<span style="color:var(--text-dim);font-size:22px;line-height:1;">\u203A</span>' : '';
+
+        html += '<div class="sopick-line' + (clickable ? ' selected' : '') + '"' + onclick + style + '>' +
+            '<div class="sopick-line-header" style="margin-bottom:0;gap:10px;">' +
+            '<div class="sopick-line-item" style="font-size:16px;line-height:1.35;">' + escHtml(line.itemText) + kitBadge + '</div>' +
+            badge + chevron +
+            '</div></div>';
+    });
+    wrap.innerHTML = html || '<div style="color:var(--text-dim);font-size:13px;padding:8px;">No lines on this SO.</div>';
+}
+
+function sopickOpenLine(idx) {
+    if (!currentSOPickData) return;
+    const line = currentSOPickData.lines[idx];
+    if (!line || line.quantityRemaining <= 0) return;
+    const container = document.getElementById('sopick-lines-container');
+    container.querySelectorAll('.sopick-line').forEach(function(el){ el.style.display = 'none'; });
+    const block = document.getElementById('sopick-line-' + idx);
+    if (block) block.style.display = '';
+    document.getElementById('sopick-list-screen').style.display = 'none';
+    document.getElementById('sopick-detail-screen').style.display = 'block';
+    window.scrollTo(0, 0);
+}
+
+function sopickBackToList() {
+    document.getElementById('sopick-detail-screen').style.display = 'none';
+    document.getElementById('sopick-list-screen').style.display = 'block';
+    sopickRenderList();
+    window.scrollTo(0, 0);
 }
 
 function sopickRenderComponentInput(comp, idx, cidx) {
@@ -11103,6 +13870,7 @@ function sopickRenderComponentInput(comp, idx, cidx) {
     if (comp.isSerialized) {
         return '<div class="sopick-kit-component" id="sopick-comp-' + idx + '-' + cidx + '">' +
             '<div class="sopick-comp-name" style="display:flex;align-items:center;gap:6px;">' + escHtml(comp.itemText) + ' <span style="color:var(--text-muted);font-size:12px;">&times;' + totalQty + '</span>' + compLookupBtnSerial + '</div>' +
+            _sopickPickedBlock(comp.pickedSerials) +
             '<label class="form-label" style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;">Serial Numbers (one per line)' +
             '<button class="btn" style="font-size:11px;padding:2px 10px;height:26px;gap:4px;" data-target="sopick-comp-serials-' + idx + '-' + cidx + '" data-max="' + totalQty + '" onclick="sopickOpenLPSheet(this)"><svg width="12" height="12" viewBox=\\"0 0 24 24\\" fill=\\"none\\" stroke=\\"currentColor\\" stroke-width=\\"2\\"><rect x=\\"3\\" y=\\"3\\" width=\\"7\\" height=\\"7\\"/><rect x=\\"14\\" y=\\"3\\" width=\\"7\\" height=\\"7\\"/><rect x=\\"3\\" y=\\"14\\" width=\\"7\\" height=\\"7\\"/><path d=\\"M14 14h3v3m0 4h4m-4-4v4m-4 0h4\\"/></svg> Scan LP QR</button>' +
             '</label>' +
@@ -11146,6 +13914,7 @@ function sopickRenderLine(line, idx) {
             inputHtml = '<div class="sopick-line-input">' + compHtml + '</div>';
         } else if (line.isSerialized) {
             inputHtml = '<div class="sopick-line-input">' +
+                _sopickPickedBlock(line.pickedSerials) +
                 '<label class="form-label" style="display:flex;align-items:center;justify-content:space-between;">Serial Numbers (one per line)' +
                 '<button class="btn" style="font-size:11px;padding:2px 10px;height:26px;gap:4px;" data-target="sopick-serials-' + idx + '" data-max="' + line.quantityRemaining + '" onclick="sopickOpenLPSheet(this)"><svg width="12" height="12" viewBox=\\"0 0 24 24\\" fill=\\"none\\" stroke=\\"currentColor\\" stroke-width=\\"2\\"><rect x=\\"3\\" y=\\"3\\" width=\\"7\\" height=\\"7\\"/><rect x=\\"14\\" y=\\"3\\" width=\\"7\\" height=\\"7\\"/><rect x=\\"3\\" y=\\"14\\" width=\\"7\\" height=\\"7\\"/><path d=\\"M14 14h3v3m0 4h4m-4-4v4m-4 0h4\\"/></svg> Scan LP QR</button>' +
                 '</label>' +
@@ -11169,7 +13938,11 @@ function sopickRenderLine(line, idx) {
     // bin picker — click a bin row to fill the inputs below instead of typing.
     const sopickPickAttrs = (!line.isKit && !line.isSerialized)
         ? ' data-bin-target="sopick-bin-' + idx + '" data-qty-target="sopick-qty-' + idx + '"' : '';
-    const sopickLookupBtn = '<button class="stock-lookup-btn" data-iid="' + escHtml(String(line.itemId)) + '" data-iname="' + escHtml(line.itemText) + '" data-locfn="sopick-location"' + sopickPickAttrs + ' onclick="stockLookupBtn(this)" title="Check bin stock"><svg viewBox=\\"0 0 24 24\\" fill=\\"none\\" stroke=\\"currentColor\\" stroke-width=\\"2\\"><line x1=\\"18\\" y1=\\"20\\" x2=\\"18\\" y2=\\"10\\"/><line x1=\\"12\\" y1=\\"20\\" x2=\\"12\\" y2=\\"4\\"/><line x1=\\"6\\" y1=\\"20\\" x2=\\"6\\" y2=\\"14\\"/></svg></button>';
+    // For serialized lines, wire the sheet to act as a "Pick All" source — each
+    // bin row gets a button that appends that bin's serials into the textarea.
+    const sopickSerialPickAttrs = (!line.isKit && line.isSerialized)
+        ? ' data-serial-target="sopick-serials-' + idx + '" data-serial-max="' + line.quantityRemaining + '"' : '';
+    const sopickLookupBtn = '<button class="stock-lookup-btn" data-iid="' + escHtml(String(line.itemId)) + '" data-iname="' + escHtml(line.itemText) + '" data-locfn="sopick-location"' + sopickPickAttrs + sopickSerialPickAttrs + ' onclick="stockLookupBtn(this)" title="Check bin stock"><svg viewBox=\\"0 0 24 24\\" fill=\\"none\\" stroke=\\"currentColor\\" stroke-width=\\"2\\"><line x1=\\"18\\" y1=\\"20\\" x2=\\"18\\" y2=\\"10\\"/><line x1=\\"12\\" y1=\\"20\\" x2=\\"12\\" y2=\\"4\\"/><line x1=\\"6\\" y1=\\"20\\" x2=\\"6\\" y2=\\"14\\"/></svg></button>';
     return '<div class="sopick-line' + stateClass + (line.quantityRemaining > 0 ? ' selected' : '') + '" id="sopick-line-' + idx + '">' +
         '<div class="sopick-line-header">' +
         '<input type="checkbox" id="sopick-check-' + idx + '" ' + checkedAttr + ' ' + disabledAttr + ' onchange="sopickToggleLine(' + idx + ')">' +
@@ -11180,13 +13953,18 @@ function sopickRenderLine(line, idx) {
         '<div><div>Fulfilled</div><div class="value">' + line.quantityFulfilled + '</div></div>' +
         (line.quantityOnOpenIF ? '<div><div>On Open IF</div><div class="value" style="color:var(--warning, #f59e0b);">' + line.quantityOnOpenIF + '</div></div>' : '') +
         '<div><div>Remaining</div><div class="value">' + line.quantityRemaining + '</div></div></div>' +
-        inputHtml + '</div>';
+        inputHtml +
+        ((line.isSerialized && line.quantityRemaining <= 0) ? _sopickPickedBlock(line.pickedSerials) : '') +
+        '</div>';
 }
 
 function sopickUpdateCompSerialCount(idx, cidx, max) {
     const ta = document.getElementById('sopick-comp-serials-' + idx + '-' + cidx);
     const countEl = document.getElementById('sopick-comp-serial-count-' + idx + '-' + cidx);
     if (!ta || !countEl) return;
+
+    // Auto-remove already-picked serials the instant they land here.
+    _sopickStripPickedSerials('sopick-comp-serials-' + idx + '-' + cidx);
 
     // Cross-line + cross-component dupe check across the whole SO
     const otherIds = window._collectSiblingTextareaIds
@@ -11260,6 +14038,9 @@ function _sopickQueueValidate(textareaId, itemId, itemName, opts) {
 async function _sopickRunValidate(textareaId, expectedItemId, expectedItemName, includeTrailing) {
     const ta = document.getElementById(textareaId);
     if (!ta) return;
+    // Drop any already-picked serials before anything else — they're not errors,
+    // just unavailable, so they get quietly removed instead of blocking scans.
+    _sopickStripPickedSerials(textareaId);
     if (!_sopickValCache[textareaId]) _sopickValCache[textareaId] = {};
     const cache = _sopickValCache[textareaId];
 
@@ -11442,6 +14223,42 @@ function _sopickClearIssues(textareaId) {
     _sopickRenderIssuesPanel(textareaId);
 }
 
+// Auto-remove any serial that's already committed on an open Item Fulfillment.
+// Unlike the bad-serial error gate, this is silent-and-forgiving: the picked
+// serial is simply stripped from the textarea (with a brief notice) so the
+// picker can keep scanning whatever is still available — they never have to
+// remember where a partial pick left off. Idempotent; safe to call repeatedly.
+function _sopickStripPickedSerials(textareaId) {
+    const ta = document.getElementById(textareaId);
+    if (!ta || !_sopickPickedSet || !_sopickPickedSet.size) return false;
+    const hadTrailing = ta.value.endsWith('\\n');
+    const lines = ta.value.split('\\n');
+    const kept = [];
+    const removed = [];
+    lines.forEach(raw => {
+        const t = raw.trim();
+        if (t && _sopickPickedSet.has(t.toUpperCase())) removed.push(t);
+        else kept.push(raw);
+    });
+    if (!removed.length) return false;
+
+    let cleaned = kept.join('\\n').replace(/\\n+$/, '');
+    ta.value = cleaned + (hadTrailing && cleaned ? '\\n' : '');
+
+    // Refresh the count subtitle (re-uses the "N of MAX" pattern already shown).
+    const countEl = document.getElementById(_sopickCountId(textareaId));
+    if (countEl) {
+        const live = ta.value.split('\\n').map(s => s.trim()).filter(Boolean);
+        const maxMatch = (countEl.textContent.match(/of (\\d+)/) || [])[1];
+        if (maxMatch) { countEl.textContent = live.length + ' of ' + maxMatch + ' serials entered'; countEl.classList.remove('has-dupe'); }
+    }
+
+    const uniq = [...new Set(removed)];
+    toast('\u2713 Already picked \u2014 skipped: ' + uniq.slice(0, 8).join(', ') + (uniq.length > 8 ? ' (+' + (uniq.length - 8) + ' more)' : ''), 'info');
+    ta.classList.remove('dupe-shake'); void ta.offsetWidth; ta.classList.add('dupe-shake');
+    return true;
+}
+
 // Blur handlers — validate the FINAL line too (handles cases where the user
 // types a serial and tabs/clicks away without pressing Enter first).
 function sopickValidateOnBlur(idx) {
@@ -11463,6 +14280,9 @@ function sopickUpdateSerialCount(idx, max) {
     const ta = document.getElementById('sopick-serials-' + idx);
     const countEl = document.getElementById('sopick-serial-count-' + idx);
     if (!ta || !countEl) return;
+
+    // Auto-remove already-picked serials the instant they land here.
+    _sopickStripPickedSerials('sopick-serials-' + idx);
 
     // Cross-line + cross-component dupe check across the whole SO
     const otherIds = window._collectSiblingTextareaIds
@@ -11604,12 +14424,14 @@ function sopickReloadSO() {
 
 function sopickReset() {
     currentSOPickData = null;
+    _sopickPickedSet = new Set();
     // Clear per-textarea scan validation caches/timers
     Object.keys(_sopickValCache).forEach(k => delete _sopickValCache[k]);
     Object.keys(_sopickValTimer).forEach(k => { clearTimeout(_sopickValTimer[k]); delete _sopickValTimer[k]; });
     document.getElementById('sopick-so-input').value = '';
     document.getElementById('sopick-lines-section').style.display = 'none';
     document.getElementById('sopick-success').style.display = 'none';
+    document.getElementById('sopick-load-card').style.display = '';
     document.getElementById('sopick-lines-container').innerHTML = '';
     document.getElementById('sopick-so-input').focus();
 }
@@ -11883,9 +14705,9 @@ async function scLoadItems() {
                     ? '<span class="badge badge-info">Serialized</span>'
                     : '<span class="badge" style="background:var(--surface-hover)">Non-Serialized</span>';
                 return '<tr>' +
-                    '<td><input type="checkbox" class="sc-item-cb" data-idx="' + idx + '" checked onchange="scUpdateSelectAll()"></td>' +
-                    '<td style="font-weight:500;">' + escHtml(item.itemName) + '</td>' +
-                    '<td>' + typeBadge + '</td>' +
+                    '<td class="sc-cell-cb"><input type="checkbox" class="sc-item-cb" data-idx="' + idx + '" checked onchange="scUpdateSelectAll()"></td>' +
+                    '<td data-label="Item" style="font-weight:500;">' + escHtml(item.itemName) + '</td>' +
+                    '<td data-label="Type">' + typeBadge + '</td>' +
                     '</tr>';
             }).join('');
         }
@@ -11972,14 +14794,14 @@ async function scdLoadStockCounts() {
             const statusBadge = scdGetStatusBadge(sc.status);
             const actionBtn = scdGetActionButton(sc);
             return '<tr>' +
-                '<td style="font-weight:500;">#' + escHtml(sc.id) + '</td>' +
-                '<td>' + escHtml(sc.location || '—') + '</td>' +
-                '<td>' + escHtml(sc.binName || '—') + '</td>' +
-                '<td>' + escHtml(sc.assignedTo || '—') + '</td>' +
-                '<td style="text-align:center;">' + sc.itemCount + '</td>' +
-                '<td>' + statusBadge + '</td>' +
-                '<td style="font-size:12px;">' + escHtml(sc.created || '—') + '</td>' +
-                '<td>' + actionBtn + '</td>' +
+                '<td data-label="ID" style="font-weight:500;">#' + escHtml(sc.id) + '</td>' +
+                '<td data-label="Location">' + escHtml(sc.location || '—') + '</td>' +
+                '<td data-label="Bin">' + escHtml(sc.binName || '—') + '</td>' +
+                '<td data-label="Assigned">' + escHtml(sc.assignedTo || '—') + '</td>' +
+                '<td data-label="Items" style="text-align:center;">' + sc.itemCount + '</td>' +
+                '<td data-label="Status">' + statusBadge + '</td>' +
+                '<td data-label="Created" style="font-size:12px;">' + escHtml(sc.created || '—') + '</td>' +
+                '<td data-label="" class="sc-cell-action">' + actionBtn + '</td>' +
                 '</tr>';
         }).join('');
     } catch (err) {
@@ -12005,13 +14827,13 @@ async function scprLoadPendingReview() {
         }
         tbody.innerHTML = results.map(sc => {
             return '<tr>' +
-                '<td style="font-weight:500;">#' + escHtml(sc.id) + '</td>' +
-                '<td>' + escHtml(sc.location || '—') + '</td>' +
-                '<td>' + escHtml(sc.binName || '—') + '</td>' +
-                '<td>' + escHtml(sc.assignedTo || '—') + '</td>' +
-                '<td style="text-align:center;">' + sc.itemCount + '</td>' +
-                '<td style="font-size:12px;">' + escHtml(sc.created || '—') + '</td>' +
-                '<td><button class="btn" style="padding:6px 12px;font-size:12px;background:var(--warning);color:#000;" onclick="scrStartReview(' + sc.id + ')">Review</button></td>' +
+                '<td data-label="ID" style="font-weight:500;">#' + escHtml(sc.id) + '</td>' +
+                '<td data-label="Location">' + escHtml(sc.location || '—') + '</td>' +
+                '<td data-label="Bin">' + escHtml(sc.binName || '—') + '</td>' +
+                '<td data-label="Assigned">' + escHtml(sc.assignedTo || '—') + '</td>' +
+                '<td data-label="Items" style="text-align:center;">' + sc.itemCount + '</td>' +
+                '<td data-label="Created" style="font-size:12px;">' + escHtml(sc.created || '—') + '</td>' +
+                '<td data-label="" class="sc-cell-action"><button class="btn" style="padding:6px 12px;font-size:12px;background:var(--warning);color:#000;" onclick="scrStartReview(' + sc.id + ')">Review</button></td>' +
                 '</tr>';
         }).join('');
     } catch (err) {
@@ -12245,9 +15067,9 @@ function sceRenderCountedTable() {
         }
         const recountBtn = '<button class="btn" style="padding:2px 8px;font-size:11px;" onclick="sceRecountItem(' + idx + ')" title="Recount this item">↩ Redo</button>';
         return '<tr>' +
-            '<td style="font-weight:500;">' + escHtml(c.itemName) + '</td>' +
-            '<td>' + countedVal + '</td>' +
-            '<td style="text-align:center;">' + recountBtn + '</td>' +
+            '<td data-label="Item" style="font-weight:500;">' + escHtml(c.itemName) + '</td>' +
+            '<td data-label="Qty">' + countedVal + '</td>' +
+            '<td data-label="" class="sc-cell-action" style="text-align:center;">' + recountBtn + '</td>' +
             '</tr>';
     }).join('');
 }
@@ -12524,12 +15346,12 @@ function scrRenderReviewTable() {
         }
 
         return '<tr style="' + rowStyle + '">' +
-            '<td style="font-weight:500;">' + escHtml(d.itemName) + '</td>' +
-            '<td>' + typeBadge + '</td>' +
-            '<td>' + expectedCell + '</td>' +
-            '<td>' + countedCell + '</td>' +
-            '<td>' + discrepancyCell + '</td>' +
-            '<td style="white-space:nowrap;">' + actionCell + '</td>' +
+            '<td data-label="Item" style="font-weight:500;">' + escHtml(d.itemName) + '</td>' +
+            '<td data-label="Type">' + typeBadge + '</td>' +
+            '<td data-label="Expected">' + expectedCell + '</td>' +
+            '<td data-label="Counted">' + countedCell + '</td>' +
+            '<td data-label="Discrepancy">' + discrepancyCell + '</td>' +
+            '<td data-label="Action" class="sc-cell-action" style="white-space:nowrap;">' + actionCell + '</td>' +
             '</tr>';
     }).join('');
 }
@@ -12714,6 +15536,19 @@ function scrViewApproved(id) {
 
     await Promise.all([initCreateForm(), initSearchForm(), initPOForm(), initIRForm(), initPORcvForm(), initSOPickForm(), initStockCountForm(), initBinTransferAllForm()]);
     // Dashboard loads lazily on first nav click (warehouse is default view)
+
+    // Attach the SKU/bin typeahead to the static bin fields (item fields here
+    // already have their own search dropdowns). Bin options are read live from
+    // each field's existing datalist, so the loaders above stay untouched.
+    if (window.WAAC) {
+        [['form-bin','lp-bin-datalist'],
+         ['bta-source-bin','bta-source-bin-datalist'],
+         ['bta-dest-bin','bta-dest-bin-datalist'],
+         ['transfer-dest-bin','transfer-bin-datalist']].forEach(function(p){
+            var el = document.getElementById(p[0]);
+            if (el) WAAC.attach(el, { type: 'bin', datalistId: p[1] });
+        });
+    }
 
     // Also populate search bin dropdown
     const locs = await loadLocations();

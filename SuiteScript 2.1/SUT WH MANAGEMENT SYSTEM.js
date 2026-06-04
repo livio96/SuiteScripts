@@ -2259,12 +2259,58 @@ define([
             const quantityRemaining = Math.max(0, quantity - quantityFulfilled - quantityOnOpenIF);
             const isFullyFulfilled = quantityRemaining <= 0;
             const isKit = !!(itemMeta[itemId] && itemMeta[itemId].isKit);
+            const isSerialized = !!(itemMeta[itemId] && itemMeta[itemId].isSerialized);
+
+            // ── Committed inventory detail (special orders) ──────────
+            // When a special order's linked PO is received, NetSuite writes the
+            // specific committed serial(s) — or qty + bin for non-serialized —
+            // onto the SO line's own inventory detail. Such a line should be
+            // fulfilled straight from that commitment: no scan, no staging, just
+            // "check it in." Detect it here and surface what's committed so the
+            // client can render it read-only and the picker just clicks Fulfill.
+            let isCommitted = false;
+            let committedSerials = [];
+            let committedQty = 0;
+            let committedBinText = '';
+            if (!isKit && quantityRemaining > 0) {
+                try {
+                    const invDet = soRec.getSublistSubrecord({ sublistId: 'item', fieldId: 'inventorydetail', line: i });
+                    const aCount = invDet ? invDet.getLineCount({ sublistId: 'inventoryassignment' }) : 0;
+                    for (let a = 0; a < aCount; a++) {
+                        let sn = '';
+                        try { sn = (invDet.getSublistText({ sublistId: 'inventoryassignment', fieldId: 'issueinventorynumber', line: a }) || '').trim(); } catch (e1) {}
+                        const aQty = Math.abs(parseFloat(invDet.getSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity', line: a })) || 0);
+                        let binTxt = '';
+                        try { binTxt = (invDet.getSublistText({ sublistId: 'inventoryassignment', fieldId: 'binnumber', line: a }) || '').trim(); } catch (e2) {}
+                        if (binTxt && !committedBinText) committedBinText = binTxt;
+                        if (sn) committedSerials.push(sn);
+                        else committedQty += aQty;
+                    }
+                } catch (cdErr) { /* line carries no committed inventory detail */ }
+
+                // A committed serial already sitting on an open (Picked/Packed) IF
+                // is spoken for — drop it so we don't try to fulfill it twice.
+                if (committedSerials.length && allPickedSerials.length) {
+                    const _pset = new Set(allPickedSerials.map(s => s.toUpperCase()));
+                    committedSerials = committedSerials.filter(s => !_pset.has(s.toUpperCase()));
+                }
+
+                if (committedSerials.length) {
+                    if (committedSerials.length > quantityRemaining) committedSerials = committedSerials.slice(0, quantityRemaining);
+                    committedQty = committedSerials.length;
+                    isCommitted = true;
+                } else if (!isSerialized && committedQty > 0) {
+                    committedQty = Math.min(committedQty, quantityRemaining);
+                    isCommitted = true;
+                }
+            }
 
             const lineData = {
                 lineNum: i, itemId, itemText, description,
                 quantity, quantityFulfilled, quantityOnOpenIF, quantityRemaining,
-                isSerialized: !!(itemMeta[itemId] && itemMeta[itemId].isSerialized),
+                isSerialized,
                 isFullyFulfilled, isKit,
+                isCommitted, committedSerials, committedQty, committedBinText,
                 pickedSerials: pickedSerialsByLine[i] || []
             };
 
@@ -2297,23 +2343,36 @@ define([
     // moves anything not already in the staging bin, and save it. Returns the
     // BT internal id (or null if nothing needed moving). Throws on hard errors.
     const stageSerialsForPick = (data) => {
-        // Group submitted serials by item, deduped.
+        // Stage everything that's being picked into the picking bin BEFORE the
+        // IF is built: serialized units by serial, and non-serialized units by
+        // source bin + qty. Once all picked stock sits in the staging bin,
+        // every fulfillment assignment resolves from one place.
         const serialsByItem = {}; // itemId -> Set<serial>
         const addSerials = (itemId, serials) => {
             if (!serials || !serials.length) return;
             if (!serialsByItem[itemId]) serialsByItem[itemId] = new Set();
             serials.forEach(s => { const t = (s || '').trim(); if (t) serialsByItem[itemId].add(t); });
         };
+        const nonSerialMoves = []; // { itemId, qty, fromBinId }
+        const addNonSerial = (itemId, qty, fromBinId) => {
+            const q = parseFloat(qty) || 0;
+            if (!itemId || q <= 0) return;
+            nonSerialMoves.push({ itemId: String(itemId), qty: q, fromBinId: fromBinId ? String(fromBinId) : '' });
+        };
         data.lines.forEach(l => {
+            if (l.committed) return; // committed lines fulfill from their own commitment — never staged
             if (l.isKit && l.components) {
                 l.components.forEach(comp => {
                     if (comp.isSerialized) addSerials(comp.itemId, comp.serialNumbers);
+                    else addNonSerial(comp.itemId, comp.quantity, comp.binId);
                 });
             } else if (l.isSerialized) {
                 addSerials(l.itemId, l.serialNumbers);
+            } else {
+                addNonSerial(l.itemId, l.quantity, l.binId);
             }
         });
-        if (!Object.keys(serialsByItem).length) return null; // No serialized lines.
+        if (!Object.keys(serialsByItem).length && !nonSerialMoves.length) return null; // Nothing to stage.
 
         // We need the SO's location to scope the lookup + set on the BT. The
         // client passes data.locationId; if missing, derive from the SO header.
@@ -2331,6 +2390,7 @@ define([
         // numeric list. Filtering with the raw text triggers "Filter expecting
         // numeric value was removed".
         const toMoveByItem = {}; // itemId -> [serials needing transfer]
+        const unstageable  = []; // serials with no resolvable on-hand bin at this location
         Object.keys(serialsByItem).forEach(itemId => {
             const serials = Array.from(serialsByItem[itemId]);
             if (!serials.length) return;
@@ -2368,22 +2428,51 @@ define([
                 }
             }
 
-            const toMove = serials.filter(s => {
+            // Anti-fake-staging: a serial with no resolvable on-hand bin at
+            // this location CANNOT be staged. Previously these were silently
+            // skipped, then the IF assignment below would fail on them and
+            // leave the staging Bin Transfer orphaned (committed, no IF).
+            // Instead, collect them and abort the whole pick up front with a
+            // clear message — no transfer is created, so nothing to orphan.
+            // Serials already sitting in the staging bin are genuinely staged
+            // and simply need no move.
+            serials.forEach(s => {
                 const cur = currentBin[s];
-                // Skip serials with no resolvable bin (let the IF error out
-                // naturally) and serials already in the staging bin.
-                return cur && cur !== String(SO_PICK_STAGING_BIN_ID);
+                if (!cur) {
+                    unstageable.push('Item ' + itemId + ' \u2192 ' + s);
+                } else if (cur !== String(SO_PICK_STAGING_BIN_ID)) {
+                    if (!toMoveByItem[itemId]) toMoveByItem[itemId] = [];
+                    toMoveByItem[itemId].push(s);
+                }
             });
-            if (toMove.length) toMoveByItem[itemId] = toMove;
         });
 
-        if (!Object.keys(toMoveByItem).length) return null; // Already staged.
+        // Non-serialized: each picked line names its own source bin. A line
+        // with no source bin can't be staged (same fake-staging guard as
+        // serials). A line already sourced from the staging bin needs no move.
+        const nonSerialToMove = []; // { itemId, qty, fromBinId }
+        nonSerialMoves.forEach(m => {
+            if (!m.fromBinId) {
+                unstageable.push('Item ' + m.itemId + ' (non-serialized, qty ' + m.qty + ') \u2014 no source bin');
+            } else if (m.fromBinId !== String(SO_PICK_STAGING_BIN_ID)) {
+                nonSerialToMove.push(m);
+            }
+        });
+
+        if (unstageable.length) {
+            const shown = unstageable.slice(0, 15).join('  |  ') + (unstageable.length > 15 ? '  (+' + (unstageable.length - 15) + ' more)' : '');
+            const err = new Error('Cannot stage \u2014 these item(s) have no resolvable source bin at this location, so they cannot be picked: ' + shown + '. Re-scan or reload the SO.');
+            err.name = 'FakeStagingPrevented';
+            throw err;
+        }
+
+        if (!Object.keys(toMoveByItem).length && !nonSerialToMove.length) return null; // Already staged.
 
         // Build the Bin Transfer (one record, multiple item lines).
         const bt = record.create({ type: record.Type.BIN_TRANSFER, isDynamic: true });
         bt.setValue({ fieldId: 'subsidiary', value: '1' });
         if (locationId) bt.setValue({ fieldId: 'location', value: parseInt(locationId) });
-        bt.setValue({ fieldId: 'memo', value: 'Auto-staged for SO ' + data.soId });
+        bt.setValue({ fieldId: 'memo', value: 'Picked for SO ' + data.soId });
 
         Object.keys(toMoveByItem).forEach(itemId => {
             const serials = toMoveByItem[itemId];
@@ -2401,8 +2490,33 @@ define([
             bt.commitLine({ sublistId: 'inventory' });
         });
 
+        // Non-serialized lines — one inventory line per item, one assignment
+        // per source bin (binnumber -> tobinnumber = staging bin). Status is
+        // left as-is on the move (mirrors executeBulkBinTransfer).
+        const nsByItem = {};
+        nonSerialToMove.forEach(m => {
+            if (!nsByItem[m.itemId]) nsByItem[m.itemId] = [];
+            nsByItem[m.itemId].push(m);
+        });
+        Object.keys(nsByItem).forEach(itemId => {
+            const moves = nsByItem[itemId];
+            const totalQty = moves.reduce((s, m) => s + m.qty, 0);
+            bt.selectNewLine({ sublistId: 'inventory' });
+            bt.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'item',     value: parseInt(itemId) });
+            bt.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'quantity', value: totalQty });
+            const invDetail = bt.getCurrentSublistSubrecord({ sublistId: 'inventory', fieldId: 'inventorydetail' });
+            moves.forEach(m => {
+                invDetail.selectNewLine({ sublistId: 'inventoryassignment' });
+                invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity',    value: m.qty });
+                invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber',   value: parseInt(m.fromBinId) });
+                invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'tobinnumber', value: SO_PICK_STAGING_BIN_ID });
+                invDetail.commitLine({ sublistId: 'inventoryassignment' });
+            });
+            bt.commitLine({ sublistId: 'inventory' });
+        });
+
         const btId = bt.save({ enableSourcing: true, ignoreMandatoryFields: false });
-        log.audit('SO Pick Staging', 'Moved serials into bin ' + SO_PICK_STAGING_BIN_ID + ' via Bin Transfer ' + btId + ' for SO ' + data.soId);
+        log.audit('SO Pick Staging', 'Staged picked stock into bin ' + SO_PICK_STAGING_BIN_ID + ' via Bin Transfer ' + btId + ' for SO ' + data.soId);
         return btId;
     };
 
@@ -2519,6 +2633,17 @@ define([
             };
         }
 
+        // Everything from the transform through save() is wrapped so that if
+        // the Item Fulfillment fails to build or save AFTER the staging Bin
+        // Transfer was already committed, we delete that orphaned transfer.
+        // SuiteScript has no cross-record transaction, so this manual rollback
+        // is what keeps a staging BT from existing with no matching IF.
+        // The delete only ever runs on the failure path — the happy path pays
+        // nothing for it.
+        const shortfalls = []; // lines where fewer units committed than requested
+        let ffId, ffTranId;
+        try {
+
         const fulfillment = record.transform({
             fromType: record.Type.SALES_ORDER,
             fromId: data.soId,
@@ -2558,6 +2683,15 @@ define([
 
             if (!matchedLine) {
                 fulfillment.setCurrentSublistValue({ sublistId: 'item', fieldId: 'itemreceive', value: false });
+            } else if (matchedLine.committed) {
+                // Special-order / committed line. The SO→IF transform already
+                // pre-populated this line's quantity and inventory detail with
+                // the serial(s)/qty committed at PO receipt, sitting in their
+                // real bin + status. Just check it in and leave that detail
+                // exactly as NetSuite built it. Stripping and bare re-adding it
+                // (the free-stock path below) is precisely what produced
+                // "Please enter value(s) for: Bin, Status" on these lines.
+                fulfillment.setCurrentSublistValue({ sublistId: 'item', fieldId: 'itemreceive', value: true });
             } else if (matchedLine._kitParent) {
                 // Kit parent line — just check it in. The transform already set the kit qty
                 // from the SO; the per-component bin/serial assignments live on the
@@ -2574,6 +2708,7 @@ define([
                     }
                     if (matchedLine.isSerialized) {
                         const serialIdMap = bulkGetInventoryNumberIds(matchedLine.itemId, matchedLine.serialNumbers);
+                        let kcAdded = 0;
                         matchedLine.serialNumbers.forEach(serial => {
                             const numId = serialIdMap[serial.trim()];
                             if (!numId) { log.debug('SO Picking (kit comp): serial not found in inventory: ' + serial); return; }
@@ -2582,13 +2717,18 @@ define([
                                 invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity', value: 1 });
                                 invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'issueinventorynumber', value: numId });
                                 invDetail.commitLine({ sublistId: 'inventoryassignment' });
+                                kcAdded++;
                             } catch (se) { log.debug('SO Picking (kit comp): serial assignment failed for ' + serial, se.message); }
                         });
+                        if (kcAdded < matchedLine.serialNumbers.length) {
+                            shortfalls.push('kit component item ' + matchedLine.itemId + ' (' + kcAdded + ' of ' + matchedLine.serialNumbers.length + ' serials)');
+                        }
                     } else {
                         const compQty = parseFloat(matchedLine.quantity) || 0;
                         invDetail.selectNewLine({ sublistId: 'inventoryassignment' });
                         invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity', value: compQty });
-                        if (matchedLine.binId) invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', value: parseInt(matchedLine.binId) });
+                        // Stock was staged into the picking bin — fulfill from there, not the original bin.
+                        invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', value: SO_PICK_STAGING_BIN_ID });
                         if (matchedLine.inventoryStatusId) invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'inventorystatus', value: parseInt(matchedLine.inventoryStatusId) });
                         invDetail.commitLine({ sublistId: 'inventoryassignment' });
                     }
@@ -2629,7 +2769,8 @@ define([
                     } else {
                         invDetail.selectNewLine({ sublistId: 'inventoryassignment' });
                         invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity', value: requestedQty });
-                        if (matchedLine.binId) invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', value: parseInt(matchedLine.binId) });
+                        // Stock was staged into the picking bin — fulfill from there, not the original bin.
+                        invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', value: SO_PICK_STAGING_BIN_ID });
                         if (matchedLine.inventoryStatusId) invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'inventorystatus', value: parseInt(matchedLine.inventoryStatusId) });
                         invDetail.commitLine({ sublistId: 'inventoryassignment' });
                     }
@@ -2640,13 +2781,72 @@ define([
                 // If fewer serials were actually committed (e.g. some not found), realign the line qty.
                 if (finalQty !== requestedQty) {
                     fulfillment.setCurrentSublistValue({ sublistId: 'item', fieldId: 'quantity', value: finalQty });
+                    if (matchedLine.isSerialized) {
+                        shortfalls.push('item ' + matchedLine.itemId + ' (' + finalQty + ' of ' + requestedQty + ' serials)');
+                    }
                 }
             }
             fulfillment.commitLine({ sublistId: 'item' });
         }
 
-        const ffId = fulfillment.save({ enableSourcing: true, ignoreMandatoryFields: false });
-        const ffTranId = search.lookupFields({ type: record.Type.ITEM_FULFILLMENT, id: ffId, columns: ['tranid'] }).tranid || ffId;
+        ffId = fulfillment.save({ enableSourcing: true, ignoreMandatoryFields: false });
+
+        // ── Post-save verification (anti fake-submission) ──
+        // save() returning an id is not proof the record persisted. Re-read it;
+        // only a record we can actually find back counts as a real fulfillment.
+        // This is the same single tranid lookup we did before — no extra cost.
+        const verify = search.lookupFields({ type: record.Type.ITEM_FULFILLMENT, id: ffId, columns: ['tranid'] });
+        ffTranId = (verify && verify.tranid) ? verify.tranid : '';
+        if (!ffTranId) {
+            return {
+                success: false,
+                message: 'Fulfillment save returned id ' + ffId + ' but the record could not be verified in NetSuite. Check before retrying.',
+                stagingTransferId: stagingBtId
+            };
+        }
+
+        } catch (ffErr) {
+            // The IF failed AFTER the staging Bin Transfer committed. Delete the
+            // orphaned transfer so serials don't sit in the staging bin with no
+            // fulfillment. One delete, failure-path only — happy path is untouched.
+            if (stagingBtId) {
+                try {
+                    record.delete({ type: record.Type.BIN_TRANSFER, id: stagingBtId });
+                    log.audit('SO Pick rollback', 'Deleted orphaned staging BT ' + stagingBtId + ' after IF failure for SO ' + data.soId);
+                    return {
+                        success: false,
+                        stagingReversed: true,
+                        message: 'Fulfillment could not be created: ' + (ffErr.message || ffErr) + ' \u2014 staging was reversed, nothing was committed.'
+                    };
+                } catch (delErr) {
+                    log.error('SO Pick rollback FAILED', 'Staging BT ' + stagingBtId + ' could not be deleted: ' + delErr.message);
+                    return {
+                        success: false,
+                        needsManualReversal: true,
+                        stagingTransferId: stagingBtId,
+                        message: 'Fulfillment failed (' + (ffErr.message || ffErr) + ') AND the staging bin transfer ' + stagingBtId + ' could not be auto-reversed. Serials are in bin ' + SO_PICK_STAGING_BIN_ID + ' \u2014 reverse that transfer manually.'
+                    };
+                }
+            }
+            // No staging transfer existed (e.g. all lines non-serialized) — nothing to reverse.
+            return { success: false, message: 'Fulfillment could not be created: ' + (ffErr.message || ffErr) };
+        }
+
+        // ── Verified fulfillment ──
+        if (shortfalls.length) {
+            // IF saved, but committed fewer units than were scanned/entered.
+            // Report as partial so the UI warns instead of showing a clean
+            // success — the operator still needs to re-pick the remainder.
+            return {
+                success: true,
+                partial: true,
+                message: 'Item Fulfillment ' + ffTranId + ' created, but some lines were short: ' + shortfalls.join('; ') + '. Re-pick the remainder.',
+                fulfillmentId: ffId,
+                fulfillmentTranId: ffTranId,
+                stagingTransferId: stagingBtId,
+                shortfalls: shortfalls
+            };
+        }
 
         return {
             success: true,
@@ -2744,7 +2944,12 @@ define([
                                    || r.getValue({ name: 'binnumber', summary: search.Summary.GROUP })
                                    || '(No Bin)';
                     const qtyOH     = parseFloat(r.getValue({ name: 'onhand',    summary: search.Summary.SUM })) || 0;
-                    const qtyAvail  = parseFloat(r.getValue({ name: 'available', summary: search.Summary.SUM })) || qtyOH;
+                    // `available` of exactly 0 means fully committed — keep it.
+                    // Only fall back to on-hand when the column returns nothing
+                    // (null/empty/NaN); `|| qtyOH` would wrongly turn a real 0
+                    // into the on-hand qty, showing committed stock as available.
+                    const _rawAvail = parseFloat(r.getValue({ name: 'available', summary: search.Summary.SUM }));
+                    const qtyAvail  = isNaN(_rawAvail) ? qtyOH : _rawAvail;
                     if (qtyOH <= 0) return;
 
                     const group = grouped[rowItemId];
@@ -13278,13 +13483,31 @@ async function bpawLookupSerialBins() {
     overlay.classList.add('open'); sheet.classList.add('open');
     try {
         const data = await apiGet('getBinInventoryForSerials', { serials: raw });
-        if (!data.success || !data.results || !data.results.length) {
-            body.innerHTML = '<div style="text-align:center;padding:20px;color:var(--text-muted);">' + escHtml((data && data.message) || 'No current bin locations found.') + '</div>';
+        if (!data.success) {
+            body.innerHTML = '<div style="text-align:center;padding:20px;color:var(--danger);">' + escHtml(data.message || 'Error loading inventory.') + '</div>';
+            return;
+        }
+        // Server returns { items: [{ itemName, bins:[{bin,qtyOH,qtyAvail}], ... }], invalid:[] }.
+        // Flatten to the flat rows this sheet renders, tagging each with the item
+        // name so the component-subheader logic groups bins by item.
+        const rows = [];
+        (data.items || []).forEach(item => {
+            (item.bins || []).forEach(b => {
+                rows.push({ component: item.itemName, bin: b.bin, qtyOH: b.qtyOH, qtyAvail: b.qtyAvail });
+            });
+        });
+        if (!rows.length) {
+            let emptyMsg = 'No current bin locations found.';
+            if (data.invalid && data.invalid.length) emptyMsg += ' (' + data.invalid.length + ' serial(s) not found in stock)';
+            body.innerHTML = '<div style="text-align:center;padding:20px;color:var(--text-muted);">' + escHtml(emptyMsg) + '</div>';
             return;
         }
         let html = '<div style="padding:8px 16px;font-size:11px;color:var(--text-muted);background:var(--bg-soft,#f5f7fa);border-bottom:1px solid var(--border);">Tap a bin to set it as the destination</div>';
+        if (data.invalid && data.invalid.length) {
+            html += '<div style="padding:8px 16px;font-size:11px;color:var(--danger);background:var(--bg-soft,#f5f7fa);border-bottom:1px solid var(--border);">\u26a0 ' + data.invalid.length + ' serial(s) not found in stock and skipped</div>';
+        }
         let currentComponent = null;
-        data.results.forEach(r => {
+        rows.forEach(r => {
             if (r.component && r.component !== currentComponent) {
                 currentComponent = r.component;
                 html += '<div style="padding:10px 16px 6px;font-size:12px;font-weight:700;color:var(--text);background:var(--bg-soft,#f5f7fa);border-bottom:1px solid var(--border);">' + escHtml(currentComponent) + '</div>';
@@ -13809,6 +14032,8 @@ function sopickRenderList() {
         let badge;
         if (line.isFullyFulfilled) {
             badge = '<span class="badge badge-success">Fulfilled</span>';
+        } else if (line.isCommitted) {
+            badge = '<span class="badge badge-success">\\u2713 Committed ' + (line.committedQty || line.quantityRemaining) + ' \\u2014 ready</span>';
         } else if (line.isKit) {
             badge = entered > 0
                 ? '<span class="badge badge-info">\u2713 ' + entered + ' scanned</span>'
@@ -13903,7 +14128,22 @@ function sopickRenderLine(line, idx) {
     }
 
     let inputHtml = '';
-    if (line.quantityRemaining > 0) {
+    if (line.quantityRemaining > 0 && line.isCommitted) {
+        // Special-order committed line — show what NetSuite already committed at
+        // PO receipt, read-only. No scan box, no bin entry; the picker leaves it
+        // checked and clicks Fulfill.
+        let detailHtml;
+        if (line.isSerialized && line.committedSerials && line.committedSerials.length) {
+            detailHtml = '<div class="sopick-picked-serials">' + line.committedSerials.map(s => escHtml(s)).join(', ') + '</div>';
+        } else {
+            detailHtml = '<div class="sopick-picked-serials">Qty ' + (line.committedQty || line.quantityRemaining) + (line.committedBinText ? ' \\u00b7 Bin ' + escHtml(line.committedBinText) : '') + '</div>';
+        }
+        inputHtml = '<div class="sopick-line-input">' +
+            '<div class="sopick-picked-list" style="border-left:4px solid var(--success, #2A9D58);">' +
+            '<div class="sopick-picked-head" style="color:var(--success, #2A9D58);">\\u2713 Special order \\u2014 committed at receipt. Ready to fulfill.</div>' +
+            detailHtml +
+            '</div></div>';
+    } else if (line.quantityRemaining > 0) {
         if (line.isKit && line.components && line.components.length) {
             // Kit: render each component with its own bin/serial input
             let compHtml = '<div class="sopick-kit-components">';
@@ -13942,7 +14182,7 @@ function sopickRenderLine(line, idx) {
     // bin row gets a button that appends that bin's serials into the textarea.
     const sopickSerialPickAttrs = (!line.isKit && line.isSerialized)
         ? ' data-serial-target="sopick-serials-' + idx + '" data-serial-max="' + line.quantityRemaining + '"' : '';
-    const sopickLookupBtn = '<button class="stock-lookup-btn" data-iid="' + escHtml(String(line.itemId)) + '" data-iname="' + escHtml(line.itemText) + '" data-locfn="sopick-location"' + sopickPickAttrs + sopickSerialPickAttrs + ' onclick="stockLookupBtn(this)" title="Check bin stock"><svg viewBox=\\"0 0 24 24\\" fill=\\"none\\" stroke=\\"currentColor\\" stroke-width=\\"2\\"><line x1=\\"18\\" y1=\\"20\\" x2=\\"18\\" y2=\\"10\\"/><line x1=\\"12\\" y1=\\"20\\" x2=\\"12\\" y2=\\"4\\"/><line x1=\\"6\\" y1=\\"20\\" x2=\\"6\\" y2=\\"14\\"/></svg></button>';
+    const sopickLookupBtn = line.isCommitted ? '' : '<button class="stock-lookup-btn" data-iid="' + escHtml(String(line.itemId)) + '" data-iname="' + escHtml(line.itemText) + '" data-locfn="sopick-location"' + sopickPickAttrs + sopickSerialPickAttrs + ' onclick="stockLookupBtn(this)" title="Check bin stock"><svg viewBox=\\"0 0 24 24\\" fill=\\"none\\" stroke=\\"currentColor\\" stroke-width=\\"2\\"><line x1=\\"18\\" y1=\\"20\\" x2=\\"18\\" y2=\\"10\\"/><line x1=\\"12\\" y1=\\"20\\" x2=\\"12\\" y2=\\"4\\"/><line x1=\\"6\\" y1=\\"20\\" x2=\\"6\\" y2=\\"14\\"/></svg></button>';
     return '<div class="sopick-line' + stateClass + (line.quantityRemaining > 0 ? ' selected' : '') + '" id="sopick-line-' + idx + '">' +
         '<div class="sopick-line-header">' +
         '<input type="checkbox" id="sopick-check-' + idx + '" ' + checkedAttr + ' ' + disabledAttr + ' onchange="sopickToggleLine(' + idx + ')">' +
@@ -14347,6 +14587,14 @@ async function sopickSubmit() {
         const cb = document.getElementById('sopick-check-' + idx);
         if (!cb || !cb.checked || line.quantityRemaining <= 0) return;
 
+        if (line.isCommitted) {
+            // Committed special-order line — fulfill exactly what NetSuite
+            // committed at receipt. No bin entry, no serial scan/validation;
+            // the server trusts the transform's pre-populated detail.
+            selectedLines.push({ lineNum: line.lineNum, itemId: line.itemId, committed: true, isSerialized: !!line.isSerialized });
+            return;
+        }
+
         if (line.isKit && line.components && line.components.length) {
             // Collect component picks
             const components = [];
@@ -14401,14 +14649,26 @@ async function sopickSubmit() {
     try {
         const result = await apiPost('pickSOItems', { soId: currentSOPickData.soId, locationId: sopickLocId, lines: selectedLines });
 
-        if (result.success) {
+        if (result.success && result.fulfillmentId && !result.partial) {
+            // Genuine, verified fulfillment — only now do we show the
+            // checkmark and the transaction number.
             document.getElementById('sopick-lines-section').style.display = 'none';
             document.getElementById('sopick-success-title').textContent = 'Item Fulfillment Created!';
             document.getElementById('sopick-fulfillment-num').textContent = result.fulfillmentTranId || '';
             document.getElementById('sopick-success-msg').textContent = result.message;
             document.getElementById('sopick-success').style.display = 'block';
             toast('Item Fulfillment ' + (result.fulfillmentTranId || '') + ' created!', 'success');
+        } else if (result.success && result.partial) {
+            // IF was created but committed less than scanned — no clean
+            // checkmark. Warn, name the fulfillment, and keep the picker on the
+            // list so they can re-pick the remainder.
+            toast(result.message || 'Fulfillment created with shortfalls.', 'warning');
+        } else if (result.needsManualReversal) {
+            // Worst case: IF failed and the staging transfer could not be
+            // auto-reversed. Make this loud — it needs a human.
+            toast(result.message || 'Fulfillment failed and staging could not be reversed.', 'error');
         } else {
+            // Failure (staging reversed, or nothing staged). No number shown.
             toast(result.message || 'Fulfillment failed.', 'error');
         }
     } catch (err) {

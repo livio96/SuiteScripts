@@ -1295,7 +1295,12 @@ define([
 
         const itemMap = {};
 
-        // Step 1: all items with inventory in this bin
+        // Step 1: all items with inventory in this bin.
+        // Includes `status` so the snapshot preserves which inventory status each
+        // serial / non-serial unit was sitting in. Without this, the finalize
+        // step has no choice but to dump every restored unit into the default
+        // "back to stock" status — which silently flips Damaged / Hold stock to
+        // Available on approval.
         try {
             search.create({
                 type: 'inventorybalance',
@@ -1309,25 +1314,38 @@ define([
                 columns: [
                     search.createColumn({ name: 'item' }),
                     search.createColumn({ name: 'onhand' }),
-                    search.createColumn({ name: 'inventorynumber' })
+                    search.createColumn({ name: 'inventorynumber' }),
+                    search.createColumn({ name: 'status' })
                 ]
             }).run().each(r => {
                 const id   = r.getValue({ name: 'item' });
                 const name = r.getText({ name: 'item' });
                 const sn   = r.getText({ name: 'inventorynumber' });
                 const onhand = parseFloat(r.getValue({ name: 'onhand' })) || 0;
-                log.debug('InvBalance Row', 'Item: ' + id + ' (' + name + '), SN: ' + sn + ', OnHand: ' + onhand);
+                const statusId   = r.getValue({ name: 'status' }) || '';
+                const statusText = r.getText({ name: 'status' }) || '';
                 if (id) {
                     if (!itemMap[id]) {
-                        itemMap[id] = { itemId: id, itemName: name, serialized: false, serialNumbers: [], expectedQty: 0 };
+                        itemMap[id] = {
+                            itemId: id, itemName: name,
+                            serialized: false, serialNumbers: [],
+                            serialStatusMap: {},   // serial -> { statusId, statusText }
+                            statusBuckets: {},     // statusId -> { statusId, statusText, qty }
+                            expectedQty: 0
+                        };
                     }
+                    const it = itemMap[id];
                     // If this row has an inventory number, item is serialized
                     if (sn) {
-                        itemMap[id].serialized = true;
-                        itemMap[id].serialNumbers.push(sn);
+                        it.serialized = true;
+                        it.serialNumbers.push(sn);
+                        if (statusId) it.serialStatusMap[sn] = { statusId: String(statusId), statusText };
                     } else {
-                        // Non-serialized: accumulate onhand quantity
-                        itemMap[id].expectedQty += onhand;
+                        // Non-serialized: accumulate onhand quantity + per-status bucket
+                        it.expectedQty += onhand;
+                        const key = statusId ? String(statusId) : '_default';
+                        if (!it.statusBuckets[key]) it.statusBuckets[key] = { statusId: String(statusId || ''), statusText, qty: 0 };
+                        it.statusBuckets[key].qty += onhand;
                     }
                 }
                 return true;
@@ -1372,13 +1390,86 @@ define([
             log.error('getStockCountItems item lookup', e.message);
         }
 
-        // Log final results
-        const results = Object.values(itemMap);
+        // Flatten statusBuckets to array; sort items by name for stable order.
+        const results = Object.values(itemMap).map(it => {
+            it.statusBuckets = Object.values(it.statusBuckets);
+            return it;
+        });
         results.forEach(item => {
             log.audit('Final Item', 'ID: ' + item.itemId + ', Name: ' + item.itemName + ', Serialized: ' + item.serialized + ', SNs: ' + item.serialNumbers.length);
         });
 
         return { success: true, results: results };
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  STOCK COUNT — classify a list of serials by their *current*
+    //  inventory location, used at finalize time to decide whether
+    //  an "extra" serial needs a Bin Transfer (it lives in another
+    //  bin) or a true adjustment (truly new), and to cancel an
+    //  adj-out for a "missing" serial that actually just moved.
+    //
+    //  Returns: { serial -> {
+    //     where: 'same_bin' | 'cross_bin' | 'cross_location'
+    //          | 'wrong_item' | 'not_found',
+    //     current: { itemId, itemName, locationId, locationName,
+    //                binId, binName, statusId, statusText, qty }
+    //  } }
+    // ═══════════════════════════════════════════════════════════
+    const classifySerialLocations = (serials, itemId, currentLocationId, currentBinId) => {
+        const verdict = {};
+        const trimmed = (serials || []).map(s => (s || '').trim()).filter(Boolean);
+        if (!trimmed.length) return verdict;
+
+        const found = {}; // serial -> first inventorybalance row we saw with onhand > 0
+        const BATCH = 50;
+        for (let off = 0; off < trimmed.length; off += BATCH) {
+            const batch = trimmed.slice(off, off + BATCH);
+            const filterExpr = [];
+            batch.forEach((s, i) => {
+                if (i > 0) filterExpr.push('OR');
+                filterExpr.push(['inventorynumber', 'is', s]);
+            });
+            try {
+                search.create({
+                    type: 'inventorybalance',
+                    filters: [filterExpr, 'AND', ['onhand', 'greaterthan', 0]],
+                    columns: [
+                        search.createColumn({ name: 'inventorynumber' }),
+                        search.createColumn({ name: 'item' }),
+                        search.createColumn({ name: 'location' }),
+                        search.createColumn({ name: 'binnumber' }),
+                        search.createColumn({ name: 'status' }),
+                        search.createColumn({ name: 'onhand' })
+                    ]
+                }).run().each(r => {
+                    const sn = (r.getText({ name: 'inventorynumber' }) || '').trim();
+                    if (!sn || found[sn]) return true;
+                    found[sn] = {
+                        itemId:       String(r.getValue({ name: 'item' }) || ''),
+                        itemName:     r.getText({ name: 'item' }) || '',
+                        locationId:   String(r.getValue({ name: 'location' }) || ''),
+                        locationName: r.getText({ name: 'location' }) || '',
+                        binId:        String(r.getValue({ name: 'binnumber' }) || ''),
+                        binName:      r.getText({ name: 'binnumber' }) || '',
+                        statusId:     String(r.getValue({ name: 'status' }) || ''),
+                        statusText:   r.getText({ name: 'status' }) || '',
+                        qty:          parseFloat(r.getValue({ name: 'onhand' })) || 0
+                    };
+                    return true;
+                });
+            } catch (e) { log.debug('classifySerialLocations batch failed', e.message); }
+        }
+
+        trimmed.forEach(sn => {
+            const row = found[sn];
+            if (!row)                                          { verdict[sn] = { serial: sn, where: 'not_found' }; return; }
+            if (String(row.itemId)     !== String(itemId))     { verdict[sn] = { serial: sn, where: 'wrong_item',     current: row }; return; }
+            if (String(row.locationId) !== String(currentLocationId)) { verdict[sn] = { serial: sn, where: 'cross_location', current: row }; return; }
+            if (String(row.binId)      === String(currentBinId)) { verdict[sn] = { serial: sn, where: 'same_bin', current: row }; return; }
+            verdict[sn] = { serial: sn, where: 'cross_bin', current: row };
+        });
+        return verdict;
     };
 
     const createStockCount = (data) => {
@@ -1499,154 +1590,269 @@ define([
         try {
             const { stockCountId, locationId, binId, adjustments } = data;
             if (!stockCountId) return { success: false, message: 'Stock count ID required.' };
-            if (!locationId) return { success: false, message: 'Location ID required.' };
+            if (!locationId)   return { success: false, message: 'Location ID required.' };
             if (!adjustments || adjustments.length === 0) return { success: false, message: 'No adjustments provided.' };
 
-            // Check if any adjustments actually need to be made
-            const hasChanges = adjustments.some(adj => {
-                if (adj.serialized) {
-                    return (adj.addSerials && adj.addSerials.length > 0) || (adj.removeSerials && adj.removeSerials.length > 0);
-                } else {
-                    return adj.adjustQty !== 0;
-                }
-            });
-
-            if (!hasChanges) {
-                // No actual changes needed, just mark the stock count as approved
-                const scRec = record.load({ type: 'customrecord_wh_stock_count', id: stockCountId, isDynamic: true });
-                scRec.setValue({ fieldId: 'custrecord_sc_status', value: 'approved' });
-                scRec.save({ enableSourcing: true, ignoreMandatoryFields: false });
-                return { success: true, message: 'No adjustments needed. Stock count approved.' };
-            }
-
-            // Look up serial IDs for removal operations
-            const serialsToRemove = [];
-            adjustments.forEach(adj => {
-                if (adj.serialized && adj.removeSerials && adj.removeSerials.length > 0) {
-                    adj.removeSerials.forEach(sn => serialsToRemove.push(sn));
-                }
-            });
-
-            const serialIdMap = {};
-            if (serialsToRemove.length > 0) {
-                try {
-                    // Build OR filter for all serials
-                    const serialFilter = [];
-                    serialsToRemove.forEach((sn, i) => {
-                        if (i > 0) serialFilter.push('OR');
-                        serialFilter.push(['inventorynumber', 'is', sn]);
-                    });
-                    search.create({
-                        type: 'inventorynumber',
-                        filters: serialFilter,
-                        columns: ['internalid', 'inventorynumber']
-                    }).run().each(r => {
-                        const sn = r.getValue({ name: 'inventorynumber' });
-                        const id = r.getValue({ name: 'internalid' });
-                        serialIdMap[sn] = id;
-                        log.debug('Serial mapped', sn + ' -> ' + id);
-                        return true;
-                    });
-                    log.audit('Serial lookup complete', 'Found ' + Object.keys(serialIdMap).length + ' of ' + serialsToRemove.length + ' serials');
-                } catch (e) {
-                    log.error('Serial lookup error', e.message);
-                }
-            }
-
-            // Get item costs
-            const itemIds = adjustments.map(a => a.itemId);
-            const costCache = {};
-            itemIds.forEach(itemId => {
-                try {
-                    const costLookup = search.lookupFields({ type: search.Type.ITEM, id: itemId, columns: ['averagecost'] });
-                    costCache[itemId] = parseFloat(costLookup.averagecost) || 0;
-                } catch (e) { costCache[itemId] = 0; }
-            });
-
-            // Create inventory adjustment
-            const adjRecord = record.create({ type: record.Type.INVENTORY_ADJUSTMENT, isDynamic: true });
-            adjRecord.setValue({ fieldId: 'subsidiary', value: '1' });
-            adjRecord.setValue({ fieldId: 'account', value: '154' });
-            adjRecord.setValue({ fieldId: 'memo', value: 'Stock Count #' + stockCountId + ' Adjustment' });
-
-            adjustments.forEach(adj => {
-                const itemCost = costCache[adj.itemId] || 0;
-
-                if (adj.serialized) {
-                    // Remove serials (expected but not counted)
-                    if (adj.removeSerials && adj.removeSerials.length > 0) {
-                        adjRecord.selectNewLine({ sublistId: 'inventory' });
-                        adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'item', value: adj.itemId });
-                        adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'location', value: locationId });
-                        adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'adjustqtyby', value: -adj.removeSerials.length });
-                        if (itemCost > 0) adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'unitcost', value: itemCost });
-
-                        const removeDetail = adjRecord.getCurrentSublistSubrecord({ sublistId: 'inventory', fieldId: 'inventorydetail' });
-                        adj.removeSerials.forEach(sn => {
-                            removeDetail.selectNewLine({ sublistId: 'inventoryassignment' });
-                            removeDetail.setCurrentSublistText({ sublistId: 'inventoryassignment', fieldId: 'issueinventorynumber', text: sn });
-                            removeDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity', value: -1 });
-                            if (binId) removeDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', value: binId });
-                            removeDetail.commitLine({ sublistId: 'inventoryassignment' });
-                        });
-                        adjRecord.commitLine({ sublistId: 'inventory' });
-                    }
-
-                    // Add serials (counted but not expected)
-                    if (adj.addSerials && adj.addSerials.length > 0) {
-                        adjRecord.selectNewLine({ sublistId: 'inventory' });
-                        adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'item', value: adj.itemId });
-                        adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'location', value: locationId });
-                        adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'adjustqtyby', value: adj.addSerials.length });
-                        if (itemCost > 0) adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'unitcost', value: itemCost });
-
-                        const addDetail = adjRecord.getCurrentSublistSubrecord({ sublistId: 'inventory', fieldId: 'inventorydetail' });
-                        adj.addSerials.forEach(sn => {
-                            addDetail.selectNewLine({ sublistId: 'inventoryassignment' });
-                            addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'receiptinventorynumber', value: sn });
-                            addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity', value: 1 });
-                            if (binId) addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', value: binId });
-                            addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'inventorystatus', value: BACK_TO_STOCK_STATUS_ID });
-                            addDetail.commitLine({ sublistId: 'inventoryassignment' });
-                        });
-                        adjRecord.commitLine({ sublistId: 'inventory' });
-                    }
-                } else {
-                    // Non-serialized: quantity adjustment with inventory detail
-                    if (adj.adjustQty !== 0) {
-                        adjRecord.selectNewLine({ sublistId: 'inventory' });
-                        adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'item', value: adj.itemId });
-                        adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'location', value: locationId });
-                        adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'adjustqtyby', value: adj.adjustQty });
-                        if (itemCost > 0) adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'unitcost', value: itemCost });
-
-                        // Must configure inventory detail for bin-managed locations
-                        const invDetail = adjRecord.getCurrentSublistSubrecord({ sublistId: 'inventory', fieldId: 'inventorydetail' });
-                        invDetail.selectNewLine({ sublistId: 'inventoryassignment' });
-                        invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity', value: adj.adjustQty });
-                        if (binId) invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', value: binId });
-                        invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'inventorystatus', value: BACK_TO_STOCK_STATUS_ID });
-                        invDetail.commitLine({ sublistId: 'inventoryassignment' });
-                        adjRecord.commitLine({ sublistId: 'inventory' });
-                    }
-                }
-            });
-
-            const adjId = adjRecord.save({ enableSourcing: true, ignoreMandatoryFields: false });
-            let tranId = String(adjId);
+            // Load the SC snapshot. Used to restore each serial's *original*
+            // inventory status on adj-out, and to apportion non-serial losses
+            // across the correct status buckets instead of dumping everything
+            // into "back to stock."
+            const snapshotById = {};
             try {
-                const l = search.lookupFields({ type: search.Type.INVENTORY_ADJUSTMENT, id: adjId, columns: ['tranid'] });
-                tranId = l.tranid || String(adjId);
-            } catch (e) {}
+                const snapRec = record.load({ type: 'customrecord_wh_stock_count', id: stockCountId });
+                const snapItems = JSON.parse(snapRec.getValue('custrecordsc_items_json') || '[]');
+                snapItems.forEach(it => { snapshotById[String(it.itemId)] = it; });
+            } catch (snapErr) { log.debug('SC snapshot load failed', snapErr.message); }
 
-            // Update stock count record with adjustment ID
+            // ── Classify every submitted extra/missing serial by WHERE it
+            // ── actually lives right now. Drives the cross-bin behavior.
+            const classified = adjustments.map(adj => {
+                const itemId = String(adj.itemId);
+                const out = {
+                    itemId, itemName: adj.itemName, serialized: !!adj.serialized,
+                    adjustQty: parseFloat(adj.adjustQty) || 0,
+                    addPlan:    { transferIn: [], trueAdd: [], blocked: [] },
+                    removePlan: { realRemove: [], cancelled: [], blocked: [] }
+                };
+                if (adj.serialized) {
+                    const addV = classifySerialLocations(adj.addSerials || [],    itemId, locationId, binId);
+                    const remV = classifySerialLocations(adj.removeSerials || [], itemId, locationId, binId);
+                    (adj.addSerials || []).forEach(rawSn => {
+                        const sn = (rawSn || '').trim(); if (!sn) return;
+                        const v = addV[sn];
+                        if (!v || v.where === 'not_found') { out.addPlan.trueAdd.push(sn); return; }
+                        if (v.where === 'cross_bin')      { out.addPlan.transferIn.push({ serial: sn, fromBinId: v.current.binId, fromBinName: v.current.binName, statusId: v.current.statusId }); return; }
+                        if (v.where === 'cross_location') { out.addPlan.blocked.push({ serial: sn, reason: 'in another location: ' + (v.current.locationName || v.current.locationId) }); return; }
+                        if (v.where === 'wrong_item')     { out.addPlan.blocked.push({ serial: sn, reason: 'belongs to item ' + (v.current.itemName || v.current.itemId) }); return; }
+                        if (v.where === 'same_bin')       { out.addPlan.blocked.push({ serial: sn, reason: 'already on hand in this bin — refresh count' }); return; }
+                    });
+                    (adj.removeSerials || []).forEach(rawSn => {
+                        const sn = (rawSn || '').trim(); if (!sn) return;
+                        const v = remV[sn];
+                        if (!v || v.where === 'not_found') { out.removePlan.realRemove.push(sn); return; }
+                        if (v.where === 'cross_bin')      { out.removePlan.cancelled.push({ serial: sn, reason: 'now in bin ' + v.current.binName }); return; }
+                        if (v.where === 'cross_location') { out.removePlan.cancelled.push({ serial: sn, reason: 'now at ' + v.current.locationName }); return; }
+                        if (v.where === 'wrong_item')     { out.removePlan.blocked.push({ serial: sn, reason: 'belongs to ' + (v.current.itemName || v.current.itemId) + ' — check the snapshot' }); return; }
+                        if (v.where === 'same_bin')       { out.removePlan.blocked.push({ serial: sn, reason: 'still on hand here — count missed scanning it' }); return; }
+                    });
+                }
+                return out;
+            });
+
+            const transferCount    = classified.reduce((n, c) => n + (c.serialized ? c.addPlan.transferIn.length    : 0), 0);
+            const trueAddCount     = classified.reduce((n, c) => n + (c.serialized ? c.addPlan.trueAdd.length       : 0), 0);
+            const realRemoveCount  = classified.reduce((n, c) => n + (c.serialized ? c.removePlan.realRemove.length : 0), 0);
+            const nonSerialChanges = classified.filter(c => !c.serialized && c.adjustQty !== 0);
+            const cancelledCount   = classified.reduce((n, c) => n + (c.serialized ? c.removePlan.cancelled.length  : 0), 0);
+            const blockedCount     = classified.reduce((n, c) => n + (c.serialized ? c.addPlan.blocked.length + c.removePlan.blocked.length : 0), 0);
+            const needTransfer     = transferCount > 0;
+            const needAdjustment   = trueAddCount > 0 || realRemoveCount > 0 || nonSerialChanges.length > 0;
+
+            // ── Build the Bin Transfer (cross_bin extras → count bin) ──
+            let btId = null, btTranId = null;
+            if (needTransfer) {
+                const bt = record.create({ type: record.Type.BIN_TRANSFER, isDynamic: true });
+                bt.setValue({ fieldId: 'subsidiary', value: '1' });
+                bt.setValue({ fieldId: 'location',   value: parseInt(locationId) });
+                bt.setValue({ fieldId: 'memo',       value: 'Stock Count #' + stockCountId + ' — relocate found serials' });
+                classified.forEach(c => {
+                    if (!c.serialized || !c.addPlan.transferIn.length) return;
+                    bt.selectNewLine({ sublistId: 'inventory' });
+                    bt.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'item',     value: parseInt(c.itemId) });
+                    bt.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'quantity', value: c.addPlan.transferIn.length });
+                    const invDetail = bt.getCurrentSublistSubrecord({ sublistId: 'inventory', fieldId: 'inventorydetail' });
+                    c.addPlan.transferIn.forEach(t => {
+                        invDetail.selectNewLine({ sublistId: 'inventoryassignment' });
+                        invDetail.setCurrentSublistText({  sublistId: 'inventoryassignment', fieldId: 'issueinventorynumber', text: t.serial });
+                        invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity',             value: 1 });
+                        invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'tobinnumber',          value: parseInt(binId) });
+                        invDetail.commitLine({ sublistId: 'inventoryassignment' });
+                    });
+                    bt.commitLine({ sublistId: 'inventory' });
+                });
+                btId = bt.save({ enableSourcing: true, ignoreMandatoryFields: false });
+                try {
+                    const lk = search.lookupFields({ type: record.Type.BIN_TRANSFER, id: btId, columns: ['tranid'] });
+                    btTranId = lk.tranid || String(btId);
+                } catch (e) { btTranId = String(btId); }
+            }
+
+            // ── Build the Inventory Adjustment (true adds / true losses / qty changes) ──
+            let adjId = null, adjTranId = null;
+            if (needAdjustment) {
+                const costCache = {};
+                classified.forEach(c => {
+                    try {
+                        const cl = search.lookupFields({ type: search.Type.ITEM, id: c.itemId, columns: ['averagecost'] });
+                        costCache[c.itemId] = parseFloat(cl.averagecost) || 0;
+                    } catch (e) { costCache[c.itemId] = 0; }
+                });
+
+                const adjRecord = record.create({ type: record.Type.INVENTORY_ADJUSTMENT, isDynamic: true });
+                adjRecord.setValue({ fieldId: 'subsidiary', value: '1' });
+                adjRecord.setValue({ fieldId: 'account',    value: ADJUSTMENT_ACCOUNT_ID });
+                adjRecord.setValue({ fieldId: 'memo',       value: 'Stock Count #' + stockCountId + ' Adjustment' });
+
+                classified.forEach(c => {
+                    const itemCost = costCache[c.itemId] || 0;
+                    if (c.serialized) {
+                        // ── adj-out for serials confirmed missing nowhere on-hand ──
+                        if (c.removePlan.realRemove.length) {
+                            adjRecord.selectNewLine({ sublistId: 'inventory' });
+                            adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'item',         value: c.itemId });
+                            adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'location',     value: locationId });
+                            adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'adjustqtyby',  value: -c.removePlan.realRemove.length });
+                            if (itemCost > 0) adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'unitcost', value: itemCost });
+                            const removeDetail = adjRecord.getCurrentSublistSubrecord({ sublistId: 'inventory', fieldId: 'inventorydetail' });
+                            const snap = snapshotById[c.itemId];
+                            const statusMap = (snap && snap.serialStatusMap) || {};
+                            c.removePlan.realRemove.forEach(sn => {
+                                removeDetail.selectNewLine({ sublistId: 'inventoryassignment' });
+                                removeDetail.setCurrentSublistText({  sublistId: 'inventoryassignment', fieldId: 'issueinventorynumber', text: sn });
+                                removeDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity',             value: -1 });
+                                if (binId) removeDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', value: binId });
+                                // Preserve the serial's original status from the snapshot so a damaged
+                                // serial gets adjusted out of Damaged, not Available.
+                                const histStatus = statusMap[sn] && statusMap[sn].statusId;
+                                removeDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'inventorystatus', value: parseInt(histStatus || BACK_TO_STOCK_STATUS_ID) });
+                                removeDetail.commitLine({ sublistId: 'inventoryassignment' });
+                            });
+                            adjRecord.commitLine({ sublistId: 'inventory' });
+                        }
+                        // ── adj-in for truly new serials (not_found anywhere) ──
+                        // Use setCurrentSublistText: receiptinventorynumber is a list field, passing
+                        // raw text via setValue silently fails to bind.
+                        if (c.addPlan.trueAdd.length) {
+                            adjRecord.selectNewLine({ sublistId: 'inventory' });
+                            adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'item',        value: c.itemId });
+                            adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'location',    value: locationId });
+                            adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'adjustqtyby', value: c.addPlan.trueAdd.length });
+                            if (itemCost > 0) adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'unitcost', value: itemCost });
+                            const addDetail = adjRecord.getCurrentSublistSubrecord({ sublistId: 'inventory', fieldId: 'inventorydetail' });
+                            c.addPlan.trueAdd.forEach(sn => {
+                                addDetail.selectNewLine({ sublistId: 'inventoryassignment' });
+                                addDetail.setCurrentSublistText({  sublistId: 'inventoryassignment', fieldId: 'receiptinventorynumber', text: sn });
+                                addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity', value: 1 });
+                                if (binId) addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', value: parseInt(binId) });
+                                addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'inventorystatus', value: BACK_TO_STOCK_STATUS_ID });
+                                addDetail.commitLine({ sublistId: 'inventoryassignment' });
+                            });
+                            adjRecord.commitLine({ sublistId: 'inventory' });
+                        }
+                    } else {
+                        // ── Non-serialized qty adjustment ──
+                        // Loss apportioned across snapshot's statusBuckets (largest first) so
+                        // damaged/hold stock doesn't silently become Available.
+                        const adjQ = c.adjustQty;
+                        if (adjQ === 0) return;
+                        adjRecord.selectNewLine({ sublistId: 'inventory' });
+                        adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'item',        value: c.itemId });
+                        adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'location',    value: locationId });
+                        adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'adjustqtyby', value: adjQ });
+                        if (itemCost > 0) adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'unitcost', value: itemCost });
+                        const invDetail = adjRecord.getCurrentSublistSubrecord({ sublistId: 'inventory', fieldId: 'inventorydetail' });
+
+                        if (adjQ > 0) {
+                            // Gain → put into BACK_TO_STOCK_STATUS_ID. No history for fresh stock.
+                            invDetail.selectNewLine({ sublistId: 'inventoryassignment' });
+                            invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity', value: adjQ });
+                            if (binId) invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', value: binId });
+                            invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'inventorystatus', value: BACK_TO_STOCK_STATUS_ID });
+                            invDetail.commitLine({ sublistId: 'inventoryassignment' });
+                        } else {
+                            let remaining = Math.abs(adjQ);
+                            const snap = snapshotById[c.itemId];
+                            const buckets = ((snap && Array.isArray(snap.statusBuckets) && snap.statusBuckets.length)
+                                ? snap.statusBuckets
+                                : [{ statusId: '', statusText: '', qty: remaining }]
+                            ).slice().sort((a, b) => (parseFloat(b.qty) || 0) - (parseFloat(a.qty) || 0));
+                            buckets.forEach(b => {
+                                if (remaining <= 0) return;
+                                const take = Math.min(remaining, parseFloat(b.qty) || 0);
+                                if (take <= 0) return;
+                                invDetail.selectNewLine({ sublistId: 'inventoryassignment' });
+                                invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity', value: -take });
+                                if (binId) invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', value: binId });
+                                const sid = b.statusId ? parseInt(b.statusId) : BACK_TO_STOCK_STATUS_ID;
+                                invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'inventorystatus', value: sid });
+                                invDetail.commitLine({ sublistId: 'inventoryassignment' });
+                                remaining -= take;
+                            });
+                            if (remaining > 0) {
+                                invDetail.selectNewLine({ sublistId: 'inventoryassignment' });
+                                invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity', value: -remaining });
+                                if (binId) invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', value: binId });
+                                invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'inventorystatus', value: BACK_TO_STOCK_STATUS_ID });
+                                invDetail.commitLine({ sublistId: 'inventoryassignment' });
+                            }
+                        }
+                        adjRecord.commitLine({ sublistId: 'inventory' });
+                    }
+                });
+
+                adjId = adjRecord.save({ enableSourcing: true, ignoreMandatoryFields: false });
+                try {
+                    const lk = search.lookupFields({ type: search.Type.INVENTORY_ADJUSTMENT, id: adjId, columns: ['tranid'] });
+                    adjTranId = lk.tranid || String(adjId);
+                } catch (e) { adjTranId = String(adjId); }
+            }
+
+            // ── Compact per-item summary for the client ──
+            const summary = classified.map(c => {
+                const out = { itemId: c.itemId, itemName: c.itemName, serialized: !!c.serialized };
+                if (c.serialized) {
+                    out.transferIn = c.addPlan.transferIn.map(t => ({ serial: t.serial, fromBin: t.fromBinName }));
+                    out.trueAdd    = c.addPlan.trueAdd.slice();
+                    out.realRemove = c.removePlan.realRemove.slice();
+                    out.cancelled  = c.removePlan.cancelled.slice();
+                    out.blocked    = c.addPlan.blocked.concat(c.removePlan.blocked);
+                } else {
+                    out.adjustQty = c.adjustQty;
+                }
+                return out;
+            });
+
+            // ── Mark SC approved + link primary record ──
             const scRec = record.load({ type: 'customrecord_wh_stock_count', id: stockCountId, isDynamic: true });
-            scRec.setValue({ fieldId: 'custrecord_sc_adj_id', value: adjId });
+            // sc_adj_id is the single legacy link field. Adjustment is the primary
+            // (financial) record when both exist — fall back to transfer.
+            scRec.setValue({ fieldId: 'custrecord_sc_adj_id', value: String(adjId || btId || '') });
             scRec.setValue({ fieldId: 'custrecord_sc_status', value: 'approved' });
             scRec.save({ enableSourcing: true, ignoreMandatoryFields: false });
 
-            log.audit('Stock Count Adjustment Created', 'SC#' + stockCountId + ' -> Adj#' + tranId);
-            return { success: true, adjustmentId: adjId, tranId: tranId, message: 'Inventory adjustment created: ' + tranId };
+            // ── Build the user-facing message ──
+            const parts = [];
+            if (btId)  parts.push('Bin Transfer ' + btTranId + ' moved ' + transferCount + ' serial(s) into the count bin');
+            if (adjId) {
+                const adjPieces = [];
+                if (trueAddCount)            adjPieces.push('+' + trueAddCount + ' new serial(s)');
+                if (realRemoveCount)         adjPieces.push('-' + realRemoveCount + ' missing serial(s)');
+                if (nonSerialChanges.length) {
+                    const nq = nonSerialChanges.reduce((n, c) => n + c.adjustQty, 0);
+                    adjPieces.push((nq >= 0 ? '+' : '') + nq + ' qty (non-serial)');
+                }
+                parts.push('Adjustment ' + adjTranId + (adjPieces.length ? ' (' + adjPieces.join(', ') + ')' : ''));
+            }
+            if (cancelledCount) parts.push(cancelledCount + ' missing serial(s) skipped — already correct elsewhere');
+            if (blockedCount)   parts.push(blockedCount + ' serial(s) need manual review');
+            if (!parts.length)  parts.push('No adjustments needed. Stock count approved.');
+
+            log.audit('Stock Count Finalized', 'SC#' + stockCountId + ' → ' + parts.join('; '));
+            return {
+                success: true,
+                message: parts.join('. ') + '.',
+                // Legacy fields the existing client reads:
+                adjustmentId: adjId, tranId: adjTranId || btTranId,
+                // New fields:
+                binTransferId: btId, binTransferTranId: btTranId,
+                adjustmentTranId: adjTranId,
+                summary,
+                counts: {
+                    transferred: transferCount, addedNew: trueAddCount, removed: realRemoveCount,
+                    nonSerialNet: nonSerialChanges.reduce((n, c) => n + c.adjustQty, 0),
+                    cancelled: cancelledCount, blocked: blockedCount
+                }
+            };
         } catch (e) {
             log.error('createStockCountAdjustment Error', e.message + '\n' + e.stack);
             return { success: false, message: e.message };
@@ -2085,7 +2291,15 @@ define([
             if (!itemIds.includes(itemId)) itemIds.push(itemId);
         }
 
-        const itemMeta = {}; // itemId -> { isSerialized, isKit }
+        // Inventory-tracked item types. Anything outside this set (and not a Kit)
+        // is treated as non-inventory — NetSuite never tracks bins/inventory
+        // detail for those, so the picker UI must not ask for a bin.
+        const _INV_TRACKED_TYPES = new Set([
+            'InvtPart', 'Assembly', 'SerialInvtPart', 'SerialAsmbl',
+            'LotNumberedInvtPart', 'LotNumberedAssemblyItem',
+            'InventoryItem', 'SerializedInventoryItem', 'InventoryAssemblyItem'
+        ]);
+        const itemMeta = {}; // itemId -> { isSerialized, isKit, isNonInventory }
         if (itemIds.length) {
             search.create({
                 type: search.Type.ITEM,
@@ -2094,9 +2308,13 @@ define([
             }).run().each(r => {
                 const itemType = r.getValue('type');
                 const serialFlag = r.getValue('isserialitem');
+                const isKit = (itemType === 'Kit' || itemType === 'kit');
+                const isSerialized = (itemType === 'SerializedInventoryItem' || itemType === 'serializedinventoryitem' || serialFlag === 'T' || serialFlag === true);
+                const isTracked = isSerialized || _INV_TRACKED_TYPES.has(itemType);
                 itemMeta[r.id] = {
-                    isSerialized: (itemType === 'SerializedInventoryItem' || itemType === 'serializedinventoryitem' || serialFlag === 'T' || serialFlag === true),
-                    isKit: (itemType === 'Kit' || itemType === 'kit')
+                    isSerialized,
+                    isKit,
+                    isNonInventory: !isTracked && !isKit
                 };
                 return true;
             });
@@ -2132,9 +2350,12 @@ define([
                 }).run().each(r => {
                     const itemType = r.getValue('type');
                     const serialFlag = r.getValue('isserialitem');
+                    const isSerialized = (itemType === 'SerializedInventoryItem' || itemType === 'serializedinventoryitem' || serialFlag === 'T' || serialFlag === true);
+                    const isTracked = isSerialized || _INV_TRACKED_TYPES.has(itemType);
                     itemMeta[r.id] = {
-                        isSerialized: (itemType === 'SerializedInventoryItem' || itemType === 'serializedinventoryitem' || serialFlag === 'T' || serialFlag === true),
-                        isKit: false
+                        isSerialized,
+                        isKit: false,
+                        isNonInventory: !isTracked
                     };
                     return true;
                 });
@@ -2260,6 +2481,7 @@ define([
             const isFullyFulfilled = quantityRemaining <= 0;
             const isKit = !!(itemMeta[itemId] && itemMeta[itemId].isKit);
             const isSerialized = !!(itemMeta[itemId] && itemMeta[itemId].isSerialized);
+            const isNonInventory = !!(itemMeta[itemId] && itemMeta[itemId].isNonInventory);
 
             // ── Committed inventory detail (special orders) ──────────
             // When a special order's linked PO is received, NetSuite writes the
@@ -2272,7 +2494,7 @@ define([
             let committedSerials = [];
             let committedQty = 0;
             let committedBinText = '';
-            if (!isKit && quantityRemaining > 0) {
+            if (!isKit && !isNonInventory && quantityRemaining > 0) {
                 try {
                     const invDet = soRec.getSublistSubrecord({ sublistId: 'item', fieldId: 'inventorydetail', line: i });
                     const aCount = invDet ? invDet.getLineCount({ sublistId: 'inventoryassignment' }) : 0;
@@ -2308,7 +2530,7 @@ define([
             const lineData = {
                 lineNum: i, itemId, itemText, description,
                 quantity, quantityFulfilled, quantityOnOpenIF, quantityRemaining,
-                isSerialized,
+                isSerialized, isNonInventory,
                 isFullyFulfilled, isKit,
                 isCommitted, committedSerials, committedQty, committedBinText,
                 pickedSerials: pickedSerialsByLine[i] || []
@@ -2361,6 +2583,7 @@ define([
         };
         data.lines.forEach(l => {
             if (l.committed) return; // committed lines fulfill from their own commitment — never staged
+            if (l.isNonInventory) return; // services / non-inv parts have no stock to stage
             if (l.isKit && l.components) {
                 l.components.forEach(comp => {
                     if (comp.isSerialized) addSerials(comp.itemId, comp.serialNumbers);
@@ -2734,6 +2957,16 @@ define([
                     }
                 } catch (invErr) {
                     log.debug('SO Picking: Kit component inventory detail not available for line ' + i, invErr.message);
+                }
+            } else if (matchedLine.isNonInventory) {
+                // Non-inventory line (Service / NonInvtPart / OthCharge / etc.).
+                // NetSuite doesn't track bins or inventory detail for these — the
+                // transform already brought the line over with the correct qty, we
+                // just check it in. Touching inventorydetail would error.
+                fulfillment.setCurrentSublistValue({ sublistId: 'item', fieldId: 'itemreceive', value: true });
+                const niQty = parseFloat(matchedLine.quantity) || 0;
+                if (niQty > 0) {
+                    fulfillment.setCurrentSublistValue({ sublistId: 'item', fieldId: 'quantity', value: niQty });
                 }
             } else {
                 fulfillment.setCurrentSublistValue({ sublistId: 'item', fieldId: 'itemreceive', value: true });
@@ -3551,8 +3784,28 @@ define([
         // LABEL PDF GENERATION
         // ====================================================================
 
+        // Initials of the logged-in employee (from their actual name, not ID),
+        // printed on every label generated through the Warehouse Assistant.
+        // Handles both "First Last" and "Last, First" NetSuite name formats.
+        function getCurrentUserInitials() {
+            try {
+                let name = (runtime.getCurrentUser().name || '').trim();
+                if (!name) return '';
+                if (name.indexOf(',') !== -1) {
+                    const p = name.split(',');
+                    name = ((p[1] || '').trim() + ' ' + (p[0] || '').trim()).trim();
+                }
+                const parts = name.split(/\s+/).filter(s => /[A-Za-z]/.test(s.charAt(0)));
+                return parts.map(s => s.charAt(0).toUpperCase()).join('').substring(0, 3);
+            } catch (e) {
+                return '';
+            }
+        }
+
         function generateLabelsPdf(labelGroups, recordId) {
             let bodyContent = '';
+            const initials = escapeXml(getCurrentUserInitials());
+            const initialsCell = initials ? `<td style="font-size:12px;font-weight:bold;padding-left:3px;">${initials}</td>` : '';
             labelGroups.forEach(group => {
                 const itemName = escapeXml(group.itemText || '');
                 const description = escapeXml(group.description || '');
@@ -3565,7 +3818,7 @@ define([
                             <table align="right" width="98%" height="50%">
                                 <tr height="12%"><td align="center"><table width="100%"><tr>
                                     <td style="font-size:18px;">${itemName}</td>
-                                    <td align="right"><table style="border:1px;"><tr><td style="font-size:16px;">${escapedRecordId}</td></tr></table></td>
+                                    <td align="right"><table style="border:1px;"><tr><td style="font-size:16px;">${escapedRecordId}</td>${initialsCell}</tr></table></td>
                                 </tr></table></td></tr>
                                 <tr height="25%"><td align="center"><table width="100%"><tr><td style="font-size:11px;">${description}</td></tr></table></td></tr>
                             </table>
@@ -3586,7 +3839,7 @@ define([
                             <table align="right" width="98%" height="50%">
                                 <tr height="12%"><td align="center"><table width="100%"><tr>
                                     <td style="font-size:18px;">${itemName}</td>
-                                    <td align="right"><table style="border:1px;"><tr><td style="font-size:16px;">${escapedRecordId}</td></tr></table></td>
+                                    <td align="right"><table style="border:1px;"><tr><td style="font-size:16px;">${escapedRecordId}</td>${initialsCell}</tr></table></td>
                                 </tr></table></td></tr>
                                 <tr height="25%"><td align="center"><table width="100%"><tr><td style="font-size:11px;">${description}</td></tr></table></td></tr>
                             </table>
@@ -4494,6 +4747,77 @@ define([
                 #ns-grid-body tr { animation:rowIn .25s ease; }
                 @keyframes rowIn { from { background:#dbeafe; } to { background:transparent; } }
 
+                /* ─── WH Assistant: NS bin lookup modal (ported from Bin Putaway) ─── */
+                .wh-modal-overlay {
+                    display:none; position:fixed; inset:0; z-index:99999;
+                    background:rgba(0,0,0,.55);
+                    align-items:center; justify-content:center;
+                    padding:12px; -webkit-tap-highlight-color: transparent;
+                }
+                .wh-modal-overlay.open { display:flex; }
+                .wh-modal {
+                    background:#fff; border-radius:14px;
+                    box-shadow:0 20px 60px rgba(0,0,0,.35);
+                    width:100%; max-width:480px;
+                    max-height:88vh;
+                    display:flex; flex-direction:column;
+                    overflow:hidden;
+                    animation: whModalIn .18s ease-out;
+                }
+                @keyframes whModalIn {
+                    from { opacity:0; transform: scale(.94); }
+                    to   { opacity:1; transform: scale(1); }
+                }
+                .wh-modal-head {
+                    padding:14px 18px;
+                    border-bottom:1px solid #e5e7eb;
+                    flex-shrink:0;
+                    display:flex; align-items:flex-start; justify-content:space-between; gap:12px;
+                    background:#fff;
+                }
+                .wh-modal-head-text { flex:1; min-width:0; }
+                .wh-modal-title {
+                    font-size:15px; font-weight:700; color:#111827;
+                    margin-bottom:2px; word-break:break-word;
+                }
+                .wh-modal-sub { font-size:12px; color:#6b7280; }
+                .wh-modal-close {
+                    width:36px; height:36px; flex-shrink:0;
+                    background:#f3f4f6; border:none; border-radius:50%;
+                    cursor:pointer; font-size:22px; line-height:1;
+                    color:#374151;
+                    display:flex; align-items:center; justify-content:center;
+                }
+                .wh-modal-close:hover { background:#e5e7eb; }
+                .wh-modal-body { flex:1; overflow-y:auto; -webkit-overflow-scrolling:touch; }
+                .wh-modal-row {
+                    width:100%; background:transparent;
+                    border:none; border-bottom:1px solid #f1f3f5;
+                    text-align:left; cursor:pointer; font:inherit; color:inherit;
+                    padding:14px 18px;
+                    display:flex; align-items:center; justify-content:space-between;
+                    gap:12px;
+                    min-height:56px;
+                    transition: background .12s;
+                }
+                .wh-modal-row:last-child { border-bottom:none; }
+                .wh-modal-row:hover { background:#f9fafb; }
+                .wh-modal-row:active { background:#eff6ff; }
+                .wh-modal-row-bin { font-size:15px; font-weight:600; color:#111827; flex:1; min-width:0; word-break:break-word; }
+                .wh-modal-row-qty {
+                    font-size:13px; color:#6b7280; white-space:nowrap;
+                    display:flex; flex-direction:column; align-items:flex-end; gap:2px;
+                }
+                .wh-modal-row-oh { color:#111827; font-weight:700; font-size:14px; }
+                .wh-modal-row-avail { color:#6b7280; font-size:11px; }
+                .wh-modal-badge {
+                    display:inline-block; font-size:10px; font-weight:700;
+                    padding:2px 7px; border-radius:999px; vertical-align:middle;
+                    margin-left:6px; letter-spacing:.3px;
+                }
+                .wh-modal-badge.largest { background:#dcfce7; color:#166534; }
+                .wh-modal-empty { padding:28px 18px; text-align:center; color:#6b7280; font-size:14px; }
+
                 /* === MOBILE RESPONSIVE === */
                 @media screen and (max-width:768px) {
                     #main_form { padding:0 !important; margin:0 !important; overflow-x:hidden !important; }
@@ -4694,7 +5018,10 @@ define([
                         nsGridRowId++;
                         var tr = document.createElement('tr');
                         tr.setAttribute('data-row-id', nsGridRowId);
-                        tr.innerHTML = '<td data-label="SKU"><input type="text" class="ns-grid-input ns-item-input" data-row="' + nsGridRowId + '" placeholder="Enter SKU" style="width:100%;padding:10px;border:1.5px solid #d1d5db;border-radius:6px;font-size:16px;box-sizing:border-box;min-height:44px;"></td>'
+                        tr.innerHTML = '<td data-label="SKU"><div style="display:flex;gap:6px;align-items:center;"><input type="text" class="ns-grid-input ns-item-input" data-row="' + nsGridRowId + '" placeholder="Enter SKU" style="flex:1;min-width:0;padding:10px;border:1.5px solid #d1d5db;border-radius:6px;font-size:16px;box-sizing:border-box;min-height:44px;">'
+                            + '<button type="button" title="Where is this item?" onclick="openWhStockLookup(' + nsGridRowId + ')" style="background:#f3f4f6;border:1.5px solid #d1d5db;border-radius:6px;cursor:pointer;padding:0;width:44px;height:44px;flex-shrink:0;display:flex;align-items:center;justify-content:center;color:#374151;">'
+                            + '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.3-4.3"></path></svg>'
+                            + '</button></div></td>'
                             + '<td data-label="From Bin"><input type="text" class="ns-grid-input ns-bin-input" data-row="' + nsGridRowId + '" list="ns-bin-datalist" autocomplete="off" placeholder="Type bin" style="min-width:120px;padding:10px;border:1.5px solid #d1d5db;border-radius:6px;font-size:16px;min-height:44px;"></td>'
                             + '<td data-label="Qty"><input type="number" class="ns-grid-input ns-qty-input" data-row="' + nsGridRowId + '" placeholder="Qty" min="1" style="width:80px;padding:10px;border:1.5px solid #d1d5db;border-radius:6px;font-size:16px;min-height:44px;"></td>'
                             + '<td data-label="Action"><select class="action-select ns-action-input" data-row="' + nsGridRowId + '" style="min-width:180px;min-height:44px;" onchange="handleNsActionChange(this)">' + nsActionOptions + '</select>'
@@ -4705,6 +5032,24 @@ define([
                         updateNsRowCount();
                         var iEl = tr.querySelector('.ns-item-input'); if (iEl && window.WAAC) WAAC.attach(iEl, { type: 'item', apiUrl: nsBinsApiUrl });
                         var bEl = tr.querySelector('.ns-bin-input');  if (bEl && window.WAAC) WAAC.attach(bEl, { type: 'bin', datalistId: 'ns-bin-datalist' });
+                        // Inherit the bulk "Apply to All" action (and its PNC/upcharge value) if one is set
+                        var bulkSel = document.getElementById('ns-bulk-action');
+                        if (bulkSel && bulkSel.value) {
+                            var rowSel = tr.querySelector('.ns-action-input');
+                            if (rowSel) {
+                                rowSel.value = bulkSel.value;
+                                handleNsActionChange(rowSel);
+                                if (bulkSel.value === 'part_number_change' || bulkSel.value === 'part_number_change_stock') {
+                                    var bni = document.getElementById('ns-bulk-new-item');
+                                    var rni = tr.querySelector('.ns-new-item-input');
+                                    if (bni && rni && bni.value.trim()) rni.value = bni.value.trim();
+                                } else if (bulkSel.value === 'transfer_upcharge') {
+                                    var bup = document.getElementById('ns-bulk-upcharge');
+                                    var rup = tr.querySelector('.ns-upcharge-input');
+                                    if (bup && rup && bup.value.trim()) rup.value = bup.value.trim();
+                                }
+                            }
+                        }
                         var newInput = tr.querySelector('.ns-item-input');
                         if (newInput) newInput.focus();
                     }
@@ -4727,6 +5072,12 @@ define([
                         var tbody = document.getElementById('ns-grid-body');
                         if (tbody) tbody.innerHTML = '';
                         nsGridRowId = 0;
+                        var bulkSel = document.getElementById('ns-bulk-action');
+                        if (bulkSel) { bulkSel.value = ''; }
+                        var bni = document.getElementById('ns-bulk-new-item');
+                        if (bni) { bni.value = ''; bni.style.display = 'none'; }
+                        var bup = document.getElementById('ns-bulk-upcharge');
+                        if (bup) { bup.value = ''; bup.style.display = 'none'; }
                         addNsGridRow();
                     }
 
@@ -4746,10 +5097,173 @@ define([
                         }
                     }
 
+                    // ── Apply same action to all NS rows (mirrors serialized page) ──
+                    function setAllNsActions(value) {
+                        var bulkNewItem = document.getElementById('ns-bulk-new-item');
+                        var bulkUpcharge = document.getElementById('ns-bulk-upcharge');
+                        var isPnc = value === 'part_number_change' || value === 'part_number_change_stock';
+                        if (bulkNewItem) { bulkNewItem.style.display = isPnc ? 'block' : 'none'; if (!isPnc) bulkNewItem.value = ''; }
+                        if (bulkUpcharge) { bulkUpcharge.style.display = value === 'transfer_upcharge' ? 'block' : 'none'; if (value !== 'transfer_upcharge') bulkUpcharge.value = ''; }
+
+                        var selects = document.querySelectorAll('#ns-grid-body .ns-action-input');
+                        for (var i = 0; i < selects.length; i++) { selects[i].value = value; handleNsActionChange(selects[i]); }
+
+                        if (isPnc) {
+                            var bulkItemName = bulkNewItem ? bulkNewItem.value.trim() : '';
+                            if (bulkItemName) {
+                                var inputs = document.querySelectorAll('#ns-grid-body .ns-new-item-input');
+                                for (var j = 0; j < inputs.length; j++) inputs[j].value = bulkItemName;
+                            } else if (bulkNewItem) { bulkNewItem.focus(); }
+                            return;
+                        }
+                        if (value === 'transfer_upcharge') {
+                            var bulkUpchargeVal = bulkUpcharge ? bulkUpcharge.value.trim() : '';
+                            if (bulkUpchargeVal && parseFloat(bulkUpchargeVal) > 0) {
+                                var uInputs = document.querySelectorAll('#ns-grid-body .ns-upcharge-input');
+                                for (var k = 0; k < uInputs.length; k++) uInputs[k].value = bulkUpchargeVal;
+                            } else if (bulkUpcharge) { bulkUpcharge.focus(); }
+                        }
+                    }
+
+                    // Live-propagate the bulk new-item / upcharge values to all rows
+                    // currently set to the matching action (so "select first, type
+                    // after" also works without re-selecting).
+                    function _nsBulkPropagate() {
+                        var bulkSel = document.getElementById('ns-bulk-action');
+                        var value = bulkSel ? bulkSel.value : '';
+                        if (value === 'part_number_change' || value === 'part_number_change_stock') {
+                            var v = (document.getElementById('ns-bulk-new-item') || {}).value || '';
+                            var rows = document.querySelectorAll('#ns-grid-body tr');
+                            for (var i = 0; i < rows.length; i++) {
+                                var sel = rows[i].querySelector('.ns-action-input');
+                                var inp = rows[i].querySelector('.ns-new-item-input');
+                                if (sel && inp && sel.value === value) inp.value = v;
+                            }
+                        } else if (value === 'transfer_upcharge') {
+                            var u = (document.getElementById('ns-bulk-upcharge') || {}).value || '';
+                            var rows2 = document.querySelectorAll('#ns-grid-body tr');
+                            for (var j = 0; j < rows2.length; j++) {
+                                var sel2 = rows2[j].querySelector('.ns-action-input');
+                                var inp2 = rows2[j].querySelector('.ns-upcharge-input');
+                                if (sel2 && inp2 && sel2.value === value) inp2.value = u;
+                            }
+                        }
+                    }
+
+                    // ── WH NS bin lookup (ported from Bin Putaway) ──────────
+                    function _whEscHtml(s) {
+                        return String(s == null ? '' : s).replace(/[&<>"']/g, function(c) {
+                            return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c];
+                        });
+                    }
+
+                    async function openWhStockLookup(rowId) {
+                        var itemInput = document.querySelector('.ns-item-input[data-row="' + rowId + '"]');
+                        if (!itemInput || !itemInput.value.trim()) {
+                            alert('Enter a SKU first.');
+                            if (itemInput) itemInput.focus();
+                            return;
+                        }
+                        var sku = itemInput.value.trim();
+                        var overlay = document.getElementById('wh-modal-overlay');
+                        var title = document.getElementById('wh-modal-title');
+                        var sub = document.getElementById('wh-modal-sub');
+                        var body = document.getElementById('wh-modal-body');
+                        title.textContent = sku;
+                        sub.textContent = 'Tap a bin to set it as the From Bin';
+                        body.innerHTML = '<div class="wh-modal-empty">Loading\u2026</div>';
+                        overlay.classList.add('open');
+                        overlay.dataset.targetRow = String(rowId);
+                        try {
+                            // Resolve SKU -> itemId via existing getItems endpoint
+                            var itemResp = await fetch(nsBinsApiUrl + '&action=getItems&q=' + encodeURIComponent(sku));
+                            var itemData = await itemResp.json();
+                            var match = null;
+                            if (itemData.results && itemData.results.length) {
+                                for (var i = 0; i < itemData.results.length; i++) {
+                                    if ((itemData.results[i].name || '').toLowerCase() === sku.toLowerCase()) {
+                                        match = itemData.results[i]; break;
+                                    }
+                                }
+                                if (!match) match = itemData.results[0];
+                            }
+                            if (!match) {
+                                body.innerHTML = '<div class="wh-modal-empty" style="color:#ef4444;">Item not found: ' + _whEscHtml(sku) + '</div>';
+                                return;
+                            }
+                            title.textContent = match.name + (match.display ? ' \u2014 ' + match.display : '');
+                            // Fetch bin balances at the warehouse
+                            var binResp = await fetch(nsBinsApiUrl + '&action=getBinInventory&itemId=' + encodeURIComponent(match.id) + '&locationId=1');
+                            var binData = await binResp.json();
+                            if (!binData.success) {
+                                body.innerHTML = '<div class="wh-modal-empty" style="color:#ef4444;">' + _whEscHtml(binData.message || 'Error loading inventory.') + '</div>';
+                                return;
+                            }
+                            if (!binData.results || !binData.results.length) {
+                                body.innerHTML = '<div class="wh-modal-empty">No existing inventory for this SKU at the warehouse.</div>';
+                                return;
+                            }
+                            // Sort by qtyOH desc so the biggest pile shows first
+                            binData.results.sort(function(a, b) { return (b.qtyOH || 0) - (a.qtyOH || 0); });
+                            var html = '';
+                            binData.results.forEach(function(r, idx) {
+                                var badge = idx === 0 ? ' <span class="wh-modal-badge largest">LARGEST PILE</span>' : '';
+                                html += '<button type="button" class="wh-modal-row" data-bin-name="' + _whEscHtml(String(r.bin)) + '" data-qty-avail="' + (r.qtyAvail || 0) + '" onclick="pickBinFromWhSheet(this)">'
+                                    + '<div class="wh-modal-row-bin">' + _whEscHtml(r.bin) + badge + '</div>'
+                                    + '<div class="wh-modal-row-qty"><span class="wh-modal-row-oh">' + r.qtyOH + ' on hand</span>'
+                                    + '<span class="wh-modal-row-avail">' + r.qtyAvail + ' avail</span></div>'
+                                    + '</button>';
+                            });
+                            body.innerHTML = html;
+                        } catch (e) {
+                            body.innerHTML = '<div class="wh-modal-empty" style="color:#ef4444;">Error: ' + _whEscHtml(e.message) + '</div>';
+                        }
+                    }
+
+                    function pickBinFromWhSheet(btn) {
+                        var overlay = document.getElementById('wh-modal-overlay');
+                        var rowId = overlay ? overlay.dataset.targetRow : '';
+                        if (!rowId) { closeWhStockLookup(); return; }
+                        var binName = btn.dataset.binName || '';
+                        var binInput = document.querySelector('.ns-bin-input[data-row="' + rowId + '"]');
+                        if (binInput) {
+                            binInput.value = binName;
+                            binInput.style.borderColor = '#d1d5db';
+                            binInput.dispatchEvent(new Event('input', { bubbles: true }));
+                            binInput.dispatchEvent(new Event('change', { bubbles: true }));
+                        }
+                        // Convenience: if Qty is empty, pre-fill with this bin's available qty
+                        var qtyInput = document.querySelector('.ns-qty-input[data-row="' + rowId + '"]');
+                        var avail = parseInt(btn.dataset.qtyAvail, 10) || 0;
+                        if (qtyInput && !qtyInput.value && avail > 0) {
+                            qtyInput.value = avail;
+                            qtyInput.style.borderColor = '#d1d5db';
+                        }
+                        closeWhStockLookup();
+                        if (qtyInput) qtyInput.focus();
+                    }
+
+                    function closeWhStockLookup() {
+                        var overlay = document.getElementById('wh-modal-overlay');
+                        if (overlay) overlay.classList.remove('open');
+                    }
+
+                    // Escape key closes the modal
+                    document.addEventListener('keydown', function(e) {
+                        if (e.key === 'Escape') {
+                            var overlay = document.getElementById('wh-modal-overlay');
+                            if (overlay && overlay.classList.contains('open')) closeWhStockLookup();
+                        }
+                    });
+
                     function submitNonSerializedMulti() {
                         var rows = document.querySelectorAll('#ns-grid-body tr');
                         var gridData = [];
                         var hasError = false;
+                        var bulkNewItemEl = document.getElementById('ns-bulk-new-item');
+                        var bulkItemName = bulkNewItemEl ? bulkNewItemEl.value.trim() : '';
+                        var bulkUpchargeEl = document.getElementById('ns-bulk-upcharge');
+                        var bulkUpchargeVal = bulkUpchargeEl ? parseFloat(bulkUpchargeEl.value) || 0 : 0;
                         for (var i = 0; i < rows.length; i++) {
                             var row = rows[i];
                             var itemInput = row.querySelector('.ns-item-input');
@@ -4765,6 +5279,9 @@ define([
                             var newItemName = newItemInput ? newItemInput.value.trim() : '';
                             var upcharge = upchargeInput ? parseFloat(upchargeInput.value) || 0 : 0;
                             var isPnc = action === 'part_number_change' || action === 'part_number_change_stock';
+                            // Fall back to the bulk "Apply to All" values when the row's own are empty
+                            if (isPnc && !newItemName && bulkItemName) { newItemName = bulkItemName; if (newItemInput) newItemInput.value = bulkItemName; }
+                            if (action === 'transfer_upcharge' && upcharge <= 0 && bulkUpchargeVal > 0) { upcharge = bulkUpchargeVal; if (upchargeInput) upchargeInput.value = bulkUpchargeVal; }
                             if (!itemName && !binNumber && qty === 0 && !action) continue;
                             if (!itemName) { if (itemInput) itemInput.style.borderColor = '#ef4444'; hasError = true; } else { if (itemInput) itemInput.style.borderColor = '#d1d5db'; }
                             if (!binNumber) { if (binInput) binInput.style.borderColor = '#ef4444'; hasError = true; } else { if (binInput) binInput.style.borderColor = '#d1d5db'; }
@@ -4780,6 +5297,8 @@ define([
                         var form = document.forms[0];
                         var cartField = document.getElementById('custpage_ns_cart_json');
                         if (cartField) cartField.value = JSON.stringify(gridData);
+                        var nsMemoHidden = document.getElementById('custpage_ns_memo');
+                        if (nsMemoHidden) nsMemoHidden.value = (document.getElementById('ns_memo') || {}).value || '';
                         var actionInput = document.createElement('input');
                         actionInput.type = 'hidden'; actionInput.name = 'custpage_action'; actionInput.value = 'process_nonserialized_multi';
                         form.appendChild(actionInput);
@@ -4860,6 +5379,8 @@ define([
                         if (id && !id.value.trim()) { alert('Please select an item'); return; }
                         window.onbeforeunload = null;
                         var form = document.forms[0];
+                        var nsMemoHidden = document.getElementById('custpage_ns_memo');
+                        if (nsMemoHidden) nsMemoHidden.value = (document.getElementById('ns_memo') || {}).value || '';
                         var action = document.createElement('input');
                         action.type = 'hidden'; action.name = 'custpage_action'; action.value = 'process_nonserialized';
                         form.appendChild(action); _disableAllBtns(); form.submit();
@@ -4886,6 +5407,8 @@ define([
                         if (ifItemField) ifItemField.value = itemName;
                         var ifSerialsField = document.getElementById('custpage_if_serials');
                         if (ifSerialsField) ifSerialsField.value = serialsRaw;
+                        var ifMemoHidden = document.getElementById('custpage_if_memo');
+                        if (ifMemoHidden) ifMemoHidden.value = (document.getElementById('if_memo') || {}).value || '';
                         var actionInput = document.createElement('input');
                         actionInput.type = 'hidden'; actionInput.name = 'custpage_action'; actionInput.value = 'process_inventory_found';
                         form.appendChild(actionInput); _disableAllBtns(); form.submit();
@@ -5024,6 +5547,8 @@ define([
                         var form = document.forms[0];
                         var jsonField = document.getElementById('custpage_actions_json');
                         if (jsonField) jsonField.value = JSON.stringify(actions);
+                        var memoHidden = document.getElementById('custpage_memo');
+                        if (memoHidden) memoHidden.value = (document.getElementById('wh_memo') || {}).value || '';
                         var actionInput = document.createElement('input');
                         actionInput.type = 'hidden'; actionInput.name = 'custpage_action'; actionInput.value = 'process_actions';
                         form.appendChild(actionInput); _disableAllBtns(); form.submit();
@@ -5155,6 +5680,12 @@ define([
 
                             <div id="nonserialized-section" class="form-section">
                                 <datalist id="ns-bin-datalist"></datalist>
+                                <div class="bulk-action-bar" style="flex-wrap:wrap;">
+                                    <label>Apply to All:</label>
+                                    <select class="action-select" id="ns-bulk-action" onchange="setAllNsActions(this.value)" style="flex:1;"></select>
+                                    <input type="text" id="ns-bulk-new-item" placeholder="New item name / SKU" style="display:none;flex:1;padding:10px;border:1.5px solid #d1d5db;border-radius:6px;font-size:16px;min-height:44px;">
+                                    <input type="number" id="ns-bulk-upcharge" placeholder="Upcharge $/unit" min="0" step="0.01" style="display:none;flex:1;padding:10px;border:1.5px solid #d1d5db;border-radius:6px;font-size:16px;min-height:44px;">
+                                </div>
                                 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
                                     <label class="custom-label" style="margin-bottom:0;">Items <span class="badge-count"><span id="ns_row_count">1</span> rows</span></label>
                                     <button type="button" class="custom-btn btn-outline" style="padding:8px 14px;font-size:12px;margin:0;min-height:36px;" onclick="addNsGridRow()">+ Add Row</button>
@@ -5163,6 +5694,11 @@ define([
                                     <thead><tr><th style="width:35%;">Part Number / SKU</th><th>From Bin</th><th>Qty</th><th>Action</th><th style="width:40px;"></th></tr></thead>
                                     <tbody id="ns-grid-body"></tbody>
                                 </table>
+                                <div class="input-group" style="margin-top:14px;margin-bottom:0;">
+                                    <label class="custom-label">Memo (optional)</label>
+                                    <input type="text" id="ns_memo" placeholder="Add a note to all transactions..." maxlength="255"
+                                        style="width:100%;padding:12px 14px;border:1.5px solid #d1d5db;border-radius:8px;font-size:15px;color:#374151;min-height:44px;">
+                                </div>
                             </div>
 
                         </div>
@@ -5179,6 +5715,20 @@ define([
                     </div>
                 </div>
 
+                <!-- ▼ WH NS bin lookup modal (popup) -->
+                <div class="wh-modal-overlay" id="wh-modal-overlay" onclick="if(event.target===this)closeWhStockLookup()">
+                    <div class="wh-modal" role="dialog" aria-modal="true" aria-labelledby="wh-modal-title">
+                        <div class="wh-modal-head">
+                            <div class="wh-modal-head-text">
+                                <div class="wh-modal-title" id="wh-modal-title"></div>
+                                <div class="wh-modal-sub" id="wh-modal-sub">Tap a bin to set it as the From Bin</div>
+                            </div>
+                            <button type="button" class="wh-modal-close" aria-label="Close" onclick="closeWhStockLookup()">&times;</button>
+                        </div>
+                        <div class="wh-modal-body" id="wh-modal-body"></div>
+                    </div>
+                </div>
+
                 <div id="inventoryFoundModal" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.5);z-index:9999;justify-content:center;align-items:center;">
                     <div style="background:#fff;border-radius:12px;padding:28px;max-width:500px;width:92%;box-shadow:0 20px 60px rgba(0,0,0,.3);">
                         <h2 style="margin:0 0 6px;color:#1a4971;font-size:18px;font-weight:700;">Inventory Found</h2>
@@ -5186,7 +5736,9 @@ define([
                         <label style="display:block;font-weight:700;margin-bottom:5px;color:#374151;font-size:13px;">Item Name / SKU</label>
                         <input type="text" id="if_item_name" placeholder="Exact item name" style="width:100%;padding:12px;border:1.5px solid #d1d5db;border-radius:8px;font-size:16px;margin-bottom:14px;min-height:44px;">
                         <label style="display:block;font-weight:700;margin-bottom:5px;color:#374151;font-size:13px;">Serial Numbers (one per line)</label>
-                        <textarea id="if_serials" rows="5" placeholder="Scan or type serials" style="width:100%;padding:12px;border:1.5px solid #d1d5db;border-radius:8px;font-size:16px;resize:vertical;margin-bottom:18px;font-family:'SF Mono',Monaco,monospace;"></textarea>
+                        <textarea id="if_serials" rows="5" placeholder="Scan or type serials" style="width:100%;padding:12px;border:1.5px solid #d1d5db;border-radius:8px;font-size:16px;resize:vertical;margin-bottom:14px;font-family:'SF Mono',Monaco,monospace;"></textarea>
+                        <label style="display:block;font-weight:700;margin-bottom:5px;color:#374151;font-size:13px;">Memo (optional)</label>
+                        <input type="text" id="if_memo" placeholder="Add a note to this adjustment..." maxlength="255" style="width:100%;padding:12px;border:1.5px solid #d1d5db;border-radius:8px;font-size:16px;margin-bottom:18px;min-height:44px;">
                         <div style="display:flex;gap:10px;justify-content:flex-end;">
                             <button type="button" class="custom-btn btn-outline" style="padding:10px 20px;margin:0;" onclick="hideInventoryFoundModal()">Cancel</button>
                             <button type="button" class="custom-btn btn-success" style="padding:10px 20px;margin:0;" onclick="submitInventoryFound()">Submit</button>
@@ -5227,6 +5779,10 @@ define([
             ifSerialsField.updateDisplayType({ displayType: serverWidget.FieldDisplayType.HIDDEN }); ifSerialsField.defaultValue = '';
             const nsCartDataField = form.addField({ id: 'custpage_ns_cart_json', type: serverWidget.FieldType.LONGTEXT, label: 'NS Cart Data' });
             nsCartDataField.updateDisplayType({ displayType: serverWidget.FieldDisplayType.HIDDEN }); nsCartDataField.defaultValue = '';
+            const nsMemoField = form.addField({ id: 'custpage_ns_memo', type: serverWidget.FieldType.TEXT, label: 'NS Memo' });
+            nsMemoField.updateDisplayType({ displayType: serverWidget.FieldDisplayType.HIDDEN }); nsMemoField.defaultValue = '';
+            const ifMemoField = form.addField({ id: 'custpage_if_memo', type: serverWidget.FieldType.TEXT, label: 'IF Memo' });
+            ifMemoField.updateDisplayType({ displayType: serverWidget.FieldDisplayType.HIDDEN }); ifMemoField.defaultValue = '';
 
             const containerEnd = form.addField({ id: 'custpage_container_end', type: serverWidget.FieldType.INLINEHTML, label: ' ' });
             containerEnd.defaultValue = `</div>
@@ -5236,6 +5792,16 @@ define([
                     var sl = document.getElementById('custpage_serial_numbers_fs_lbl_uir_label');
                     if (sw && sl) sw.appendChild(sl.parentNode);
                     updateCount();
+                    // Populate the NS "Apply to All" dropdown from the same option
+                    // list used by the per-row selects (single source of truth)
+                    var nsBulk = document.getElementById('ns-bulk-action');
+                    if (nsBulk && typeof nsActionOptions !== 'undefined') {
+                        nsBulk.innerHTML = nsActionOptions.replace('-- Select Action --', '-- Apply to All --');
+                    }
+                    var nsBulkNewItem = document.getElementById('ns-bulk-new-item');
+                    if (nsBulkNewItem) nsBulkNewItem.addEventListener('input', _nsBulkPropagate);
+                    var nsBulkUpcharge = document.getElementById('ns-bulk-upcharge');
+                    if (nsBulkUpcharge) nsBulkUpcharge.addEventListener('input', _nsBulkPropagate);
                     await loadNsBins();
                     addNsGridRow();
                 });
@@ -5331,11 +5897,15 @@ define([
                                 </select>
                                 <input type="text" id="bulk-new-item" placeholder="New item name" style="display:none;flex:1;padding:10px;border:1.5px solid #d1d5db;border-radius:6px;font-size:16px;min-height:44px;">
                                 <input type="number" id="bulk-upcharge" placeholder="Upcharge $/unit" min="0" step="0.01" style="display:none;flex:1;padding:10px;border:1.5px solid #d1d5db;border-radius:6px;font-size:16px;min-height:44px;">
-                                <div style="display:flex;align-items:center;gap:10px;">
-                                    <span style="color:#6b7280;font-weight:600;font-size:13px;">Selected:</span>
-                                    <span style="font-size:22px;font-weight:800;color:#1a4971;" id="action_count">0</span>
-                                    <button type="button" class="custom-btn btn-success" style="padding:10px 20px;margin:0;" onclick="submitActions()">Submit</button>
-                                    <button type="button" class="custom-btn btn-outline" style="padding:10px 20px;margin:0;" onclick="goBack()">Back</button>
+                                <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;width:100%;margin-top:8px;">
+                                    <input type="text" id="wh_memo" placeholder="Memo (optional)" maxlength="255"
+                                        style="flex:1;min-width:180px;padding:10px;border:1.5px solid #d1d5db;border-radius:6px;font-size:14px;min-height:44px;color:#374151;">
+                                    <div style="display:flex;align-items:center;gap:10px;flex-shrink:0;">
+                                        <span style="color:#6b7280;font-weight:600;font-size:13px;">Selected:</span>
+                                        <span style="font-size:22px;font-weight:800;color:#1a4971;" id="action_count">0</span>
+                                        <button type="button" class="custom-btn btn-success" style="padding:10px 20px;margin:0;" onclick="submitActions()">Submit</button>
+                                        <button type="button" class="custom-btn btn-outline" style="padding:10px 20px;margin:0;" onclick="goBack()">Back</button>
+                                    </div>
                                 </div>
                             </div>
                             <table class="results-table">
@@ -5359,6 +5929,9 @@ define([
             const actionsField = form.addField({ id: 'custpage_actions_json', type: serverWidget.FieldType.LONGTEXT, label: 'Actions' });
             actionsField.updateDisplayType({ displayType: serverWidget.FieldDisplayType.HIDDEN });
             actionsField.defaultValue = '';
+            const memoField = form.addField({ id: 'custpage_memo', type: serverWidget.FieldType.TEXT, label: 'Memo' });
+            memoField.updateDisplayType({ displayType: serverWidget.FieldDisplayType.HIDDEN });
+            memoField.defaultValue = '';
 
             context.response.writePage(form);
         }
@@ -5588,6 +6161,7 @@ define([
         function handleProcessActions(context) {
             const serialDataRaw = context.request.parameters.custpage_serial_data;
             const actionsRaw = context.request.parameters.custpage_actions_json;
+            const userMemo = (context.request.parameters.custpage_memo || '').trim();
             if (!serialDataRaw || !actionsRaw) { createEntryForm(context, 'Missing data. Please start over.', 'error'); return; }
 
             let serialData, actions;
@@ -5700,7 +6274,7 @@ define([
             const failedGroups = [];
 
             if (adjustmentGroups.length > 0) {
-                const result = tryBatchThenIndividual(adjustmentGroups, createConditionChangeAdjustment, 'Created via WH Assistant');
+                const result = tryBatchThenIndividual(adjustmentGroups, createConditionChangeAdjustment, userMemo || 'Created via WH Assistant');
                 if (result.tranIds.length > 0) adjustmentTranId = result.tranIds.join(', ');
                 result.succeeded.forEach(g => {
                     let ex = labelGroups.find(lg => lg.itemId === g.targetItemId && lg.action === g.action);
@@ -5713,7 +6287,7 @@ define([
                 if (result.failed.length > 0) errors.push(result.failed.length + ' adjustment group(s) failed');
             }
             if (binTransferGroups.length > 0) {
-                const result = tryBatchThenIndividual(binTransferGroups, createBinTransfer, 'Via WH Assistant');
+                const result = tryBatchThenIndividual(binTransferGroups, createBinTransfer, userMemo || 'Via WH Assistant');
                 if (result.tranIds.length > 0) binTransferTranId = result.tranIds.join(', ');
                 result.succeeded.forEach(g => {
                     let ex = labelGroups.find(lg => lg.itemId === g.itemId && lg.action === g.action);
@@ -5726,7 +6300,7 @@ define([
                 if (result.failed.length > 0) errors.push(result.failed.length + ' bin transfer group(s) failed');
             }
             if (serialChangeList.length > 0) {
-                const result = tryBatchThenIndividual(serialChangeList, createSerialNumberChangeAdjustment, 'Serial Change via WH Assistant');
+                const result = tryBatchThenIndividual(serialChangeList, createSerialNumberChangeAdjustment, userMemo || 'Serial Change via WH Assistant');
                 if (result.tranIds.length > 0) serialChangeTranId = result.tranIds.join(', ');
                 result.succeeded.forEach(c => {
                     let ex = labelGroups.find(lg => lg.itemId === c.itemId && lg.action === c.action);
@@ -5739,7 +6313,7 @@ define([
                 if (result.failed.length > 0) errors.push(result.failed.length + ' serial change(s) failed');
             }
             if (partNumberChangeList.length > 0) {
-                const result = tryBatchThenIndividual(partNumberChangeList, createPartNumberChangeAdjustment, 'Part # Change via WH Assistant');
+                const result = tryBatchThenIndividual(partNumberChangeList, createPartNumberChangeAdjustment, userMemo || 'Part # Change via WH Assistant');
                 if (result.tranIds.length > 0) partNumberChangeTranId = result.tranIds.join(', ');
                 result.succeeded.forEach(c => {
                     let ex = labelGroups.find(lg => lg.itemId === c.newItemId && lg.action === c.action);
@@ -5752,7 +6326,7 @@ define([
                 if (result.failed.length > 0) errors.push(result.failed.length + ' part # change(s) failed');
             }
             if (partSerialChangeList.length > 0) {
-                const result = tryBatchThenIndividual(partSerialChangeList, createPartAndSerialChangeAdjustment, 'Part & Serial Change via WH Assistant');
+                const result = tryBatchThenIndividual(partSerialChangeList, createPartAndSerialChangeAdjustment, userMemo || 'Part & Serial Change via WH Assistant');
                 if (result.tranIds.length > 0) partSerialChangeTranId = result.tranIds.join(', ');
                 result.succeeded.forEach(c => {
                     let ex = labelGroups.find(lg => lg.itemId === c.newItemId && lg.action === c.action);
@@ -5765,7 +6339,7 @@ define([
                 if (result.failed.length > 0) errors.push(result.failed.length + ' part & serial change(s) failed');
             }
             if (inventoryFoundGroups.length > 0) {
-                const result = tryBatchThenIndividual(inventoryFoundGroups, createInventoryFoundAdjustment, 'Inv Found via WH Assistant');
+                const result = tryBatchThenIndividual(inventoryFoundGroups, createInventoryFoundAdjustment, userMemo || 'Inv Found via WH Assistant');
                 if (result.tranIds.length > 0) inventoryFoundTranId = result.tranIds.join(', ');
                 result.succeeded.forEach(g => {
                     let ex = labelGroups.find(lg => lg.itemId === g.itemId && lg.action === g.action);
@@ -5781,7 +6355,7 @@ define([
                 const toTranIds = [];
                 transferUpchargeGroups.forEach(g => {
                     try {
-                        const r = createTransferOrderWithUpcharge({ itemId: g.itemId, itemText: g.itemText, serials: g.serials, upchargePerUnit: g.upchargePerUnit, memo: 'Xfer & Upcharge via WH Asst' });
+                        const r = createTransferOrderWithUpcharge({ itemId: g.itemId, itemText: g.itemText, serials: g.serials, upchargePerUnit: g.upchargePerUnit, memo: userMemo || 'Xfer & Upcharge via WH Asst' });
                         toTranIds.push(r.transferOrderTranId);
                         let ex = labelGroups.find(lg => lg.itemId === g.itemId && lg.action === g.action);
                         if (!ex) { ex = { itemId: g.itemId, itemText: g.itemText, description: g.itemDescription, action: g.action, serialNumbers: [] }; labelGroups.push(ex); }
@@ -5805,6 +6379,7 @@ define([
         function handleProcessInventoryFound(context) {
             const itemName = (context.request.parameters.custpage_if_item_name || '').trim();
             const serialsRaw = (context.request.parameters.custpage_if_serials || '').trim();
+            const userMemo = (context.request.parameters.custpage_if_memo || '').trim();
             if (!itemName) { createEntryForm(context, 'Item name is required.', 'error'); return; }
             if (!serialsRaw) { createEntryForm(context, 'At least one serial number is required.', 'error'); return; }
             const item = findItemByName(itemName);
@@ -5816,7 +6391,7 @@ define([
 
             const groups = [{ itemId: item.id, itemText: item.displayname || item.itemid, itemDescription: item.description, locationId: '1', action: 'inventory_found', serials: uniqueSerials.map(function(s) { return { serialNumber: s, serialId: null, binId: null }; }) }];
             try {
-                const r = createInventoryFoundAdjustment(groups, 'Inv Found via WH Assistant');
+                const r = createInventoryFoundAdjustment(groups, userMemo || 'Inv Found via WH Assistant');
                 createSuccessPage(context, null, null, [{ itemId: item.id, itemText: item.displayname || item.itemid, description: item.description, action: 'inventory_found', serialNumbers: uniqueSerials }], null, r.tranId, null);
             } catch (e) { log.error('Inventory Found Error', e.message); createEntryForm(context, 'Adjustment failed: ' + e.message, 'error'); }
         }
@@ -5826,6 +6401,7 @@ define([
             const fromBinId = context.request.parameters.custpage_ns_bin;
             const quantity = parseInt(context.request.parameters.custpage_ns_quantity) || 0;
             const action = context.request.parameters.custpage_ns_action;
+            const userMemo = (context.request.parameters.custpage_ns_memo || '').trim();
             if (!itemId) { createEntryForm(context, 'Please select an item.', 'warning'); return; }
             if (!fromBinId) { createEntryForm(context, 'Please select a From Bin.', 'warning'); return; }
             if (quantity <= 0) { createEntryForm(context, 'Please enter a valid quantity.', 'warning'); return; }
@@ -5848,7 +6424,7 @@ define([
                 let toBinId = null, toStatusId = null;
                 if (action === 'likenew_stock') { toBinId = BACK_TO_STOCK_BIN_ID; toStatusId = BACK_TO_STOCK_STATUS_ID; }
                 try {
-                    const r = createNonSerializedAdjustment({ sourceItemId: itemId, sourceItemName: itemDetails.itemid, targetItemId: targetItem.id, targetItemName: targetItem.itemid, locationId: locationId, quantity: quantity, fromBinId: fromBinId, toBinId: toBinId || fromBinId, toStatusId: toStatusId }, 'Created via WH Assistant');
+                    const r = createNonSerializedAdjustment({ sourceItemId: itemId, sourceItemName: itemDetails.itemid, targetItemId: targetItem.id, targetItemName: targetItem.itemid, locationId: locationId, quantity: quantity, fromBinId: fromBinId, toBinId: toBinId || fromBinId, toStatusId: toStatusId }, userMemo || 'Created via WH Assistant');
                     adjustmentTranId = r.tranId;
                 } catch (e) { log.error('NS Adjustment Error', e.message); createEntryForm(context, 'Adjustment failed: ' + e.message, 'error'); return; }
             } else if (BIN_TRANSFER_ACTIONS.includes(action)) {
@@ -5861,12 +6437,12 @@ define([
                 else if (action === 'trash') { toBinId = TRASH_BIN_ID; toStatusId = TRASH_STATUS_ID; }
                 else if (action === 'return_to_vendor') { toBinId = RETURN_TO_VENDOR_BIN_ID; toStatusId = RETURN_TO_VENDOR_STATUS_ID; }
                 try {
-                    const r = createNonSerializedBinTransfer({ itemId: itemId, locationId: locationId, quantity: quantity, fromBinId: fromBinId, toBinId: toBinId, toStatusId: toStatusId }, 'Via WH Assistant');
+                    const r = createNonSerializedBinTransfer({ itemId: itemId, locationId: locationId, quantity: quantity, fromBinId: fromBinId, toBinId: toBinId, toStatusId: toStatusId }, userMemo || 'Via WH Assistant');
                     binTransferTranId = r.tranId;
                 } catch (e) { log.error('NS Bin Transfer Error', e.message); createEntryForm(context, 'Bin transfer failed: ' + e.message, 'error'); return; }
             } else if (INVENTORY_FOUND_ACTIONS.includes(action)) {
                 try {
-                    const r = createNonSerializedInventoryFoundAdjustment({ itemId: itemId, locationId: locationId, quantity: quantity }, 'Inv Found via WH Assistant');
+                    const r = createNonSerializedInventoryFoundAdjustment({ itemId: itemId, locationId: locationId, quantity: quantity }, userMemo || 'Inv Found via WH Assistant');
                     inventoryFoundTranId = r.tranId;
                 } catch (e) { log.error('NS Inv Found Error', e.message); createEntryForm(context, 'Inventory found failed: ' + e.message, 'error'); return; }
             }
@@ -5875,6 +6451,7 @@ define([
 
         function handleProcessNonSerializedMulti(context) {
             const cartDataRaw = context.request.parameters.custpage_ns_cart_json;
+            const userMemo = (context.request.parameters.custpage_ns_memo || '').trim();
             if (!cartDataRaw) { createEntryForm(context, 'Missing cart data.', 'error'); return; }
             let cartRows;
             try { cartRows = JSON.parse(cartDataRaw); } catch (e) { createEntryForm(context, 'Invalid cart data.', 'error'); return; }
@@ -5941,21 +6518,21 @@ define([
             const failedItems = [];
 
             if (adjustmentRows.length > 0) {
-                const result = tryBatchThenIndividual(adjustmentRows, createNonSerializedAdjustmentMulti, 'Created via WH Assistant');
+                const result = tryBatchThenIndividual(adjustmentRows, createNonSerializedAdjustmentMulti, userMemo || 'Created via WH Assistant');
                 if (result.tranIds.length > 0) adjustmentTranId = result.tranIds.join(', ');
                 result.succeeded.forEach(function(row) { processedItems.push({ itemText: row.targetDisplayName || row.targetItemName, description: row.targetDescription, quantity: row.quantity, action: row.action }); });
                 result.failed.forEach(function(row) { failedItems.push({ itemText: row.targetDisplayName || row.targetItemName || row.sourceItemName, description: row.targetDescription, quantity: row.quantity, action: row.action, error: row._error || 'Adjustment failed' }); });
                 if (result.failed.length > 0) errors.push(result.failed.length + ' adjustment row(s) failed');
             }
             if (binTransferRows.length > 0) {
-                const result = tryBatchThenIndividual(binTransferRows, createNonSerializedBinTransferMulti, 'Via WH Assistant');
+                const result = tryBatchThenIndividual(binTransferRows, createNonSerializedBinTransferMulti, userMemo || 'Via WH Assistant');
                 if (result.tranIds.length > 0) binTransferTranId = result.tranIds.join(', ');
                 result.succeeded.forEach(function(row) { processedItems.push({ itemText: row.itemText, description: row.description, quantity: row.quantity, action: row.action }); });
                 result.failed.forEach(function(row) { failedItems.push({ itemText: row.itemText, description: row.description, quantity: row.quantity, action: row.action, error: row._error || 'Bin transfer failed' }); });
                 if (result.failed.length > 0) errors.push(result.failed.length + ' bin transfer row(s) failed');
             }
             if (inventoryFoundRows.length > 0) {
-                const result = tryBatchThenIndividual(inventoryFoundRows, createNonSerializedInventoryFoundMulti, 'Inv Found via WH Assistant');
+                const result = tryBatchThenIndividual(inventoryFoundRows, createNonSerializedInventoryFoundMulti, userMemo || 'Inv Found via WH Assistant');
                 if (result.tranIds.length > 0) inventoryFoundTranId = result.tranIds.join(', ');
                 result.succeeded.forEach(function(row) { processedItems.push({ itemText: row.itemText, description: row.description, quantity: row.quantity, action: row.action }); });
                 result.failed.forEach(function(row) { failedItems.push({ itemText: row.itemText, description: row.description, quantity: row.quantity, action: row.action, error: row._error || 'Inventory found failed' }); });
@@ -5965,7 +6542,7 @@ define([
                 const toTranIds = [];
                 transferUpchargeRows.forEach(function(row) {
                     try {
-                        const r = createTransferOrderWithUpcharge({ itemId: row.itemId, itemText: row.itemText, serials: [], quantity: row.quantity, upchargePerUnit: row.upcharge, memo: 'Xfer & Upcharge via WH Asst' });
+                        const r = createTransferOrderWithUpcharge({ itemId: row.itemId, itemText: row.itemText, serials: [], quantity: row.quantity, upchargePerUnit: row.upcharge, memo: userMemo || 'Xfer & Upcharge via WH Asst' });
                         toTranIds.push(r.transferOrderTranId);
                         processedItems.push({ itemText: row.itemText, description: row.description, quantity: row.quantity, action: row.action });
                     } catch (e) {
@@ -5977,7 +6554,7 @@ define([
                 if (toTranIds.length > 0) transferOrderTranId = toTranIds.join(', ');
             }
             if (partNumberChangeRows.length > 0) {
-                const result = tryBatchThenIndividual(partNumberChangeRows, createNonSerializedAdjustmentMulti, 'Part # Change via WH Assistant');
+                const result = tryBatchThenIndividual(partNumberChangeRows, createNonSerializedAdjustmentMulti, userMemo || 'Part # Change via WH Assistant');
                 if (result.tranIds.length > 0) partNumberChangeTranId = result.tranIds.join(', ');
                 result.succeeded.forEach(function(row) { processedItems.push({ itemText: row.targetDisplayName || row.targetItemName, description: row.targetDescription, quantity: row.quantity, action: row.action }); });
                 result.failed.forEach(function(row) { failedItems.push({ itemText: row.targetDisplayName || row.targetItemName || row.sourceItemName, description: row.targetDescription, quantity: row.quantity, action: row.action, error: row._error || 'Part # change failed' }); });
@@ -6611,14 +7188,19 @@ define([
                         bpNsGridRowId++;
                         var tr = document.createElement('tr');
                         tr.setAttribute('data-row-id', bpNsGridRowId);
-                        tr.innerHTML = '<td data-label="SKU"><div style="display:flex;gap:6px;align-items:center;">'
-                                + '<input type="text" class="bp-ns-item-input" id="bp-ns-item-' + bpNsGridRowId + '" data-row="' + bpNsGridRowId + '" placeholder="SKU" style="flex:1;min-width:0;padding:10px;border:1.5px solid #d1d5db;border-radius:6px;font-size:16px;min-height:44px;">'
-                                + '<button type="button" title="Where else is this item?" onclick="openBpStockLookup(' + bpNsGridRowId + ')" style="background:#f3f4f6;border:1.5px solid #d1d5db;border-radius:6px;cursor:pointer;padding:0;width:44px;height:44px;flex-shrink:0;display:flex;align-items:center;justify-content:center;color:#374151;">'
-                                + '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.3-4.3"></path></svg>'
+                        tr.innerHTML = '<td data-label="SKU"><input type="text" class="bp-ns-item-input" id="bp-ns-item-' + bpNsGridRowId + '" data-row="' + bpNsGridRowId + '" placeholder="SKU" style="width:100%;padding:10px;border:1.5px solid #d1d5db;border-radius:6px;font-size:16px;box-sizing:border-box;min-height:44px;"></td>'
+                            + '<td data-label="From Bin"><div style="display:flex;gap:4px;align-items:center;">'
+                                + '<input type="text" class="bp-ns-frombin-input" id="bp-ns-frombin-' + bpNsGridRowId + '" data-row="' + bpNsGridRowId + '" autocomplete="off" placeholder="From" style="flex:1;min-width:60px;padding:10px;border:1.5px solid #d1d5db;border-radius:6px;font-size:16px;min-height:44px;">'
+                                + '<button type="button" title="Where is this item? Tap a bin to set the From Bin" onclick="openBpFromBinLookup(' + bpNsGridRowId + ')" style="background:#f3f4f6;border:1.5px solid #d1d5db;border-radius:6px;cursor:pointer;padding:0;width:40px;height:44px;flex-shrink:0;display:flex;align-items:center;justify-content:center;color:#374151;">'
+                                + '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.3-4.3"></path></svg>'
                                 + '</button>'
                                 + '</div></td>'
-                            + '<td data-label="From Bin"><input type="text" class="bp-ns-frombin-input" id="bp-ns-frombin-' + bpNsGridRowId + '" data-row="' + bpNsGridRowId + '" autocomplete="off" placeholder="From" style="min-width:100px;padding:10px;border:1.5px solid #d1d5db;border-radius:6px;font-size:16px;min-height:44px;"></td>'
-                            + '<td data-label="To Bin"><input type="text" class="bp-ns-tobin-input" id="bp-ns-tobin-' + bpNsGridRowId + '" data-row="' + bpNsGridRowId + '" autocomplete="off" placeholder="To" style="min-width:100px;padding:10px;border:1.5px solid #d1d5db;border-radius:6px;font-size:16px;min-height:44px;"></td>'
+                            + '<td data-label="To Bin"><div style="display:flex;gap:4px;align-items:center;">'
+                                + '<input type="text" class="bp-ns-tobin-input" id="bp-ns-tobin-' + bpNsGridRowId + '" data-row="' + bpNsGridRowId + '" autocomplete="off" placeholder="To" style="flex:1;min-width:60px;padding:10px;border:1.5px solid #d1d5db;border-radius:6px;font-size:16px;min-height:44px;">'
+                                + '<button type="button" title="Where is this item? Tap a bin to set the To Bin" onclick="openBpStockLookup(' + bpNsGridRowId + ')" style="background:#f3f4f6;border:1.5px solid #d1d5db;border-radius:6px;cursor:pointer;padding:0;width:40px;height:44px;flex-shrink:0;display:flex;align-items:center;justify-content:center;color:#374151;">'
+                                + '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.3-4.3"></path></svg>'
+                                + '</button>'
+                                + '</div></td>'
                             + '<td data-label="Qty"><input type="number" class="bp-ns-qty-input" id="bp-ns-qty-' + bpNsGridRowId + '" data-row="' + bpNsGridRowId + '" placeholder="Qty" min="1" style="width:70px;padding:10px;border:1.5px solid #d1d5db;border-radius:6px;font-size:16px;min-height:44px;"></td>'
                             + '<td><button type="button" onclick="removeBpNsGridRow(' + bpNsGridRowId + ')" style="background:none;border:none;color:#ef4444;cursor:pointer;font-size:20px;padding:6px 10px;min-height:44px;min-width:44px;">&times;</button></td>';
                         tbody.appendChild(tr);
@@ -6763,7 +7345,9 @@ define([
                         });
                     }
 
-                    async function openBpStockLookup(rowId) {
+                    // target: 'to' (default) fills the To Bin, 'from' fills the From Bin
+                    async function openBpStockLookup(rowId, target) {
+                        var isFrom = target === 'from';
                         var itemInput = document.querySelector('.bp-ns-item-input[data-row="' + rowId + '"]');
                         if (!itemInput || !itemInput.value.trim()) {
                             alert('Enter a SKU first.');
@@ -6776,10 +7360,10 @@ define([
                         var sub = document.getElementById('bp-modal-sub');
                         var body = document.getElementById('bp-modal-body');
                         title.textContent = sku;
-                        sub.textContent = 'Tap a bin to set it as the destination';
+                        sub.textContent = isFrom ? 'Tap a bin to set it as the From Bin' : 'Tap a bin to set it as the destination';
                         body.innerHTML = '<div class="bp-modal-empty">Loading\u2026</div>';
                         overlay.classList.add('open');
-                        overlay.dataset.targetInputId = 'bp-ns-tobin-' + rowId;
+                        overlay.dataset.targetInputId = (isFrom ? 'bp-ns-frombin-' : 'bp-ns-tobin-') + rowId;
                         try {
                             // Resolve SKU -> itemId via existing getItems endpoint
                             var itemResp = await fetch(bpBinsApiUrl + '&action=getItems&q=' + encodeURIComponent(sku));
@@ -6814,7 +7398,7 @@ define([
                             var html = '';
                             binData.results.forEach(function(r, idx) {
                                 var badge = idx === 0 ? ' <span class="bp-modal-badge largest">LARGEST PILE</span>' : '';
-                                html += '<button type="button" class="bp-modal-row" data-bin-name="' + _bpEscHtml(String(r.bin)) + '" onclick="pickBinFromBpSheet(this)">'
+                                html += '<button type="button" class="bp-modal-row" data-bin-name="' + _bpEscHtml(String(r.bin)) + '" data-qty-avail="' + (r.qtyAvail || 0) + '" onclick="pickBinFromBpSheet(this)">'
                                     + '<div class="bp-modal-row-bin">' + _bpEscHtml(r.bin) + badge + '</div>'
                                     + '<div class="bp-modal-row-qty"><span class="bp-modal-row-oh">' + r.qtyOH + ' on hand</span>'
                                     + '<span class="bp-modal-row-avail">' + r.qtyAvail + ' avail</span></div>'
@@ -6825,6 +7409,9 @@ define([
                             body.innerHTML = '<div class="bp-modal-empty" style="color:#ef4444;">Error: ' + _bpEscHtml(e.message) + '</div>';
                         }
                     }
+
+                    // From Bin variant of the lookup (avoids quote-escaping in inline onclick)
+                    function openBpFromBinLookup(rowId) { openBpStockLookup(rowId, 'from'); }
 
                     // Serialized mode: resolve the serials currently in the textarea,
                     // then show one section per unique item with that item's bin balances.
@@ -6905,6 +7492,17 @@ define([
                             input.style.borderColor = '#d1d5db';
                             input.dispatchEvent(new Event('input', { bubbles: true }));
                             input.dispatchEvent(new Event('change', { bubbles: true }));
+                        }
+                        // From Bin picks: pre-fill the row's Qty with this bin's available
+                        // quantity if Qty is still empty (user can overwrite)
+                        if (targetInputId.indexOf('bp-ns-frombin-') === 0) {
+                            var rowId = targetInputId.substring('bp-ns-frombin-'.length);
+                            var qtyInput = document.getElementById('bp-ns-qty-' + rowId);
+                            var avail = parseInt(btn.dataset.qtyAvail, 10) || 0;
+                            if (qtyInput && !qtyInput.value && avail > 0) {
+                                qtyInput.value = avail;
+                                qtyInput.style.borderColor = '#d1d5db';
+                            }
                         }
                         closeBpStockLookup();
                     }
@@ -9157,14 +9755,26 @@ setTimeout(doPrint, 2000);
             returnExternalUrl: false
         });
 
-        const html = buildHtml(suiteletUrl);
+        // Current user name for the top-right chip. Falls back to email or id.
+        // HTML-escaped here so the template literal in buildHtml can interpolate
+        // it directly without an XSS risk.
+        let userName = '';
+        try {
+            const u = runtime.getCurrentUser();
+            userName = u.name || u.email || (u.id ? ('User ' + u.id) : 'User');
+        } catch (e) { userName = 'User'; }
+        userName = String(userName)
+            .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+
+        const html = buildHtml(suiteletUrl, userName);
         context.response.write(html);
     };
 
     // ═══════════════════════════════════════════════════════════
     //  BUILD THE FULL HTML PAGE
     // ═══════════════════════════════════════════════════════════
-    const buildHtml = (apiUrl) => {
+    const buildHtml = (apiUrl, userName) => {
         return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -9228,8 +9838,57 @@ body {
 }
 .topbar-brand svg { color: var(--accent); }
 .topbar-user {
+    position: relative;
     font-size: 13px; color: var(--text-muted);
 }
+
+/* ─── USER CHIP (logout dropdown) ─── */
+.user-chip-btn {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 6px 12px; border-radius: 999px;
+    background: var(--surface-hover);
+    border: 1px solid var(--border);
+    color: var(--text);
+    font-family: var(--font); font-size: 13px; line-height: 1;
+    cursor: pointer;
+    transition: background .15s ease, border-color .15s ease;
+}
+.user-chip-btn:hover {
+    background: var(--surface-active);
+    border-color: var(--border-light);
+}
+.user-chip-btn .user-chip-avatar { width: 16px; height: 16px; color: var(--accent); flex-shrink: 0; }
+.user-chip-btn .user-chip-chev { width: 12px; height: 12px; color: var(--text-dim); flex-shrink: 0; transition: transform .15s ease; }
+.user-chip[data-open="true"] .user-chip-chev { transform: rotate(180deg); }
+.user-chip-name {
+    max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    font-weight: 500;
+}
+.user-chip-menu {
+    position: absolute; top: calc(100% + 6px); right: 0;
+    min-width: 200px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    padding: 6px;
+    display: none;
+    z-index: 300;
+}
+.user-chip[data-open="true"] .user-chip-menu { display: block; }
+.user-chip-menu-item {
+    display: flex; align-items: center; gap: 10px;
+    width: 100%; padding: 9px 10px;
+    border: none; background: none;
+    text-align: left;
+    border-radius: var(--radius-sm);
+    font-family: var(--font); font-size: 13px; line-height: 1.2;
+    color: var(--text); cursor: pointer;
+}
+.user-chip-menu-item:hover { background: var(--surface-hover); }
+.user-chip-menu-item svg { width: 16px; height: 16px; flex-shrink: 0; }
+.user-chip-menu-danger { color: var(--danger); }
+.user-chip-menu-danger svg { color: var(--danger); }
 
 /* ─── SIDEBAR NAV ─── */
 .layout { display:flex; min-height: calc(100vh - 56px); }
@@ -9573,6 +10232,115 @@ button.stock-sheet-row-pick:active { background:var(--primary-soft, #e3edff); }
 .processing-text { font-size:14px; font-weight:600; color:var(--text); }
 .processing-sub { font-size:12px; color:var(--text-muted); margin-top:4px; }
 
+/* ─── STOCK COUNT EXECUTE (mobile-first list/detail) ─── */
+.sce-progress {
+    display:grid; grid-template-columns:repeat(3,1fr); gap:8px;
+    background:var(--surface); border:1px solid var(--border);
+    border-radius:var(--radius); padding:10px 12px; margin:0 0 12px;
+    position:sticky; top:0; z-index:10;
+}
+.sce-progress-stat { text-align:center; }
+.sce-progress-label { font-size:10px; font-weight:700; text-transform:uppercase; letter-spacing:.05em; color:var(--text-dim); }
+.sce-progress-value { font-size:18px; font-weight:700; color:var(--text); line-height:1.1; margin-top:2px; }
+
+.sce-filter { display:flex; gap:6px; margin-bottom:10px; flex-wrap:wrap; }
+.sce-chip {
+    background:var(--surface); border:1px solid var(--border);
+    border-radius:999px; padding:6px 14px; font-size:12px; font-weight:600;
+    color:var(--text-muted); cursor:pointer; transition:all .15s;
+}
+.sce-chip:hover { background:var(--surface-hover); }
+.sce-chip.selected { background:var(--accent); border-color:var(--accent); color:#fff; }
+
+.sce-list-card { padding:8px; }
+.sce-list-item {
+    display:flex; align-items:center; gap:10px;
+    padding:14px 12px; border:1px solid var(--border);
+    border-radius:var(--radius-sm); margin-bottom:8px;
+    cursor:pointer; transition:border-color .15s, background .15s;
+    background:var(--surface);
+}
+.sce-list-item:last-child { margin-bottom:0; }
+.sce-list-item:hover { background:var(--surface-hover); border-color:var(--border-light); }
+.sce-list-item-text { flex:1; min-width:0; }
+.sce-list-item-name { font-weight:600; font-size:14px; line-height:1.3; word-break:break-word; }
+.sce-list-item-meta { font-size:11px; color:var(--text-dim); margin-top:3px; display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
+.sce-list-item-chev { color:var(--text-dim); font-size:20px; line-height:1; flex-shrink:0; }
+.sce-list-item.counted   { background:rgba(22,163,74,.05); border-color:rgba(22,163,74,.25); }
+.sce-list-item.skipped   { background:rgba(217,119,6,.05); border-color:rgba(217,119,6,.25); }
+.sce-list-item.mismatch  { background:rgba(220,38,38,.05); border-color:rgba(220,38,38,.3); }
+
+.sce-action-bar {
+    position:sticky; bottom:0; z-index:20;
+    display:flex; gap:8px; padding:10px;
+    background:var(--surface);
+    border:1px solid var(--border); border-radius:var(--radius);
+    margin-top:12px;
+    box-shadow:0 -2px 12px rgba(0,0,0,.05);
+}
+.sce-action-bar .btn { min-height:44px; justify-content:center; font-weight:600; }
+
+.sce-detail-card { padding:14px; }
+.sce-item-head { display:flex; align-items:flex-start; gap:10px; }
+.sce-item-label { font-size:10px; font-weight:700; text-transform:uppercase; letter-spacing:.05em; color:var(--text-dim); }
+.sce-item-name { font-size:17px; font-weight:700; line-height:1.25; margin-top:2px; word-break:break-word; }
+.sce-item-meta { font-size:12px; color:var(--text-muted); margin-top:4px; }
+
+.sce-scan-meta {
+    display:flex; align-items:center; justify-content:space-between;
+    margin:14px 0 6px;
+}
+.sce-scan-counter { font-size:12px; color:var(--text-dim); }
+.sce-clear-btn { font-size:11px; padding:4px 10px; height:28px; }
+
+.sce-chip-list {
+    background:var(--surface-hover); border:1px solid var(--border);
+    padding:8px; border-radius:var(--radius-sm);
+    min-height:60px; max-height:42vh; overflow-y:auto;
+    display:flex; flex-wrap:wrap; gap:6px; align-content:flex-start;
+}
+.sce-chip-list:empty { display:block; }
+.sce-serial-pill {
+    display:inline-flex; align-items:center; gap:6px;
+    background:var(--accent); color:#fff;
+    padding:5px 4px 5px 10px; border-radius:999px;
+    font-size:12px; font-family:var(--mono); line-height:1;
+}
+.sce-serial-pill .sce-serial-x {
+    cursor:pointer; opacity:.85; width:20px; height:20px; border-radius:999px;
+    display:inline-flex; align-items:center; justify-content:center;
+    background:rgba(255,255,255,.18); font-weight:700; font-size:13px; line-height:1;
+}
+.sce-serial-pill .sce-serial-x:hover { opacity:1; background:rgba(255,255,255,.32); }
+.sce-serial-pill.extra { background:var(--warning); color:#000; }
+.sce-serial-pill.snapshot { background:var(--surface); color:var(--text); border:1px solid var(--border); }
+
+.sce-expected { margin-top:12px; }
+.sce-expected summary { font-size:12px; color:var(--text-muted); cursor:pointer; padding:6px 0; }
+.sce-expected-list {
+    margin-top:6px; max-height:140px; overflow-y:auto;
+    background:var(--surface); border:1px solid var(--border);
+    border-radius:var(--radius-sm); padding:8px;
+    font-family:var(--mono); font-size:11px; color:var(--text-muted);
+    display:flex; flex-wrap:wrap; gap:4px;
+}
+.sce-expected-list span { background:var(--surface-hover); padding:2px 8px; border-radius:4px; }
+
+.sce-detail-actions {
+    display:flex; gap:8px; margin-top:16px; flex-wrap:wrap;
+    position:sticky; bottom:0; padding-top:10px; background:var(--surface);
+}
+.sce-detail-actions .btn { min-height:44px; justify-content:center; }
+
+@media (max-width: 768px) {
+    .sce-list-item { padding:12px 10px; }
+    .sce-list-item-name { font-size:13.5px; }
+    .sce-progress-value { font-size:16px; }
+    .sce-detail-card { padding:12px; }
+    .sce-item-name { font-size:16px; }
+    .sce-chip-list { max-height:38vh; }
+}
+
 /* ─── TOAST NOTIFICATIONS ─── */
 .toast-container { position:fixed; top:70px; right:24px; z-index:9999; display:flex; flex-direction:column; gap:8px; }
 .toast {
@@ -9721,9 +10489,17 @@ button.stock-sheet-row-pick:active { background:var(--primary-soft, #e3edff); }
     /* ── Viewport guards ── */
     html, body { overflow-x:hidden; }
 
+    /* ── Bin Putaway NS rows: stack From / To / Qty vertically so the
+           bin inputs + magnifier buttons get full width ── */
+    .bpaw-bins-row { flex-wrap:wrap; }
+    .bpaw-bins-row > div { flex:1 1 100% !important; width:100% !important; min-width:0 !important; }
+
     /* ── Topbar (slimmer, room for home button) ── */
     .topbar { height:48px; padding:0 10px; gap:8px; }
-    .topbar-user { display:none; }
+    /* Keep the user chip visible on mobile — just shrink to icon + chevron. */
+    .topbar-user { display:block; }
+    .user-chip-btn { padding:6px 8px; }
+    .user-chip-name { display:none; }
     .topbar-brand { font-size:13px; gap:6px; min-width:0; flex:1; }
     .topbar-brand svg { width:18px; height:18px; flex-shrink:0; }
     .topbar-brand-text { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
@@ -9929,7 +10705,19 @@ button.stock-sheet-row-pick:active { background:var(--primary-soft, #e3edff); }
             <span class="topbar-brand-text">TelQuest Warehouse</span>
         </div>
     </div>
-    <div class="topbar-user">Warehouse Management</div>
+    <div class="topbar-user user-chip" id="user-chip" data-open="false">
+        <button class="user-chip-btn" id="user-chip-btn" type="button" aria-haspopup="true" aria-expanded="false" onclick="toggleUserMenu(event)">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="user-chip-avatar"><circle cx="12" cy="8" r="4"/><path d="M4 21v-1a6 6 0 0 1 6-6h4a6 6 0 0 1 6 6v1"/></svg>
+            <span class="user-chip-name">${userName}</span>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="user-chip-chev"><polyline points="6 9 12 15 18 9"/></svg>
+        </button>
+        <div class="user-chip-menu" id="user-chip-menu" role="menu">
+            <button class="user-chip-menu-item user-chip-menu-danger" type="button" role="menuitem" onclick="appLogout()">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+                <span>Log out / Switch user</span>
+            </button>
+        </div>
+    </div>
 </div>
 
 <!-- ═══ MOBILE BOTTOM NAV ═══ -->
@@ -11134,84 +11922,91 @@ button.stock-sheet-row-pick:active { background:var(--primary-soft, #e3edff); }
     <div class="page-header">
         <div>
             <div class="page-title">Count Stock</div>
-            <div class="page-subtitle" id="sce-subtitle">Stock Count #<span id="sce-count-id">—</span> | <span id="sce-bin-name">—</span></div>
+            <div class="page-subtitle" id="sce-subtitle">SC #<span id="sce-count-id">—</span> · <span id="sce-bin-name">—</span></div>
         </div>
         <button class="btn" onclick="navigateTo('sc-dashboard')">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:16px;height:16px;margin-right:6px;"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></svg>
-            Back to Dashboard
+            Dashboard
         </button>
     </div>
 
-    <!-- Progress Summary -->
-    <div class="stats-row" id="sce-stats" style="max-width:600px;">
-        <div class="stat-card"><div class="label">Total Items</div><div class="value" id="sce-stat-total">—</div></div>
-        <div class="stat-card"><div class="label">Counted</div><div class="value" id="sce-stat-counted" style="color:var(--success)">—</div></div>
-        <div class="stat-card"><div class="label">Remaining</div><div class="value" id="sce-stat-remaining" style="color:var(--warning)">—</div></div>
+    <!-- Compact progress strip (always visible on both screens) -->
+    <div class="sce-progress" id="sce-progress">
+        <div class="sce-progress-stat"><div class="sce-progress-label">Total</div><div class="sce-progress-value" id="sce-stat-total">—</div></div>
+        <div class="sce-progress-stat"><div class="sce-progress-label">Counted</div><div class="sce-progress-value" id="sce-stat-counted" style="color:var(--success);">—</div></div>
+        <div class="sce-progress-stat"><div class="sce-progress-label">Pending</div><div class="sce-progress-value" id="sce-stat-remaining" style="color:var(--warning);">—</div></div>
     </div>
 
-    <!-- Current Item Card -->
-    <div class="card" style="max-width:700px; margin-top:16px;" id="sce-current-item-card">
-        <div class="card-title">Current Item</div>
-        <div id="sce-no-items" style="display:none; text-align:center; padding:30px; color:var(--text-dim);">
-            All items have been counted!
+    <!-- ── LIST screen ── -->
+    <div id="sce-list-screen">
+        <div class="sce-filter" id="sce-filter">
+            <button class="sce-chip selected" data-filter="all" onclick="sceSetFilter('all')">All</button>
+            <button class="sce-chip" data-filter="pending" onclick="sceSetFilter('pending')">Pending</button>
+            <button class="sce-chip" data-filter="counted" onclick="sceSetFilter('counted')">Counted</button>
         </div>
-        <div id="sce-item-details">
-            <div style="margin-bottom:16px;">
-                <div style="font-size:12px; color:var(--text-dim); margin-bottom:4px;">Item Name</div>
-                <div style="font-size:16px; font-weight:600;" id="sce-item-name">—</div>
+        <div class="card sce-list-card">
+            <div id="sce-list"></div>
+            <div id="sce-no-items" style="display:none;text-align:center;padding:24px;color:var(--text-dim);font-size:13px;">No items to show.</div>
+        </div>
+        <!-- Sticky action bar -->
+        <div class="sce-action-bar">
+            <button class="btn" id="sce-save-btn" onclick="sceSaveProgress()" style="flex:1;">Save progress</button>
+            <button class="btn" id="sce-complete-btn" onclick="sceCompleteCount()" style="background:var(--success);color:white;flex:1.2;">Complete count</button>
+        </div>
+    </div>
+
+    <!-- ── DETAIL screen ── -->
+    <div id="sce-detail-screen" style="display:none;">
+        <button class="btn" style="padding:6px 12px;margin:8px 0 12px;" onclick="sceBackToList()">‹ Back to list</button>
+        <div class="card sce-detail-card">
+            <!-- Item header -->
+            <div class="sce-item-head">
+                <div style="flex:1;min-width:0;">
+                    <div class="sce-item-label">Item</div>
+                    <div class="sce-item-name" id="sce-detail-name">—</div>
+                    <div class="sce-item-meta" id="sce-detail-meta">—</div>
+                </div>
+                <div id="sce-detail-state-badge"></div>
             </div>
 
-            <!-- Serialized Item: Scan serials -->
+            <!-- Serialized: scan input + chips -->
             <div id="sce-serial-section" style="display:none;">
-                <div class="form-group">
-                    <label class="form-label">Scan Serial Number</label>
-                    <div style="display:flex; gap:10px;">
-                        <input type="text" id="sce-serial-input" placeholder="Scan or enter serial number" onkeydown="if(event.key==='Enter')sceAddSerial()" style="flex:1;">
-                        <button class="btn btn-primary" onclick="sceAddSerial()">Add</button>
+                <label class="form-label" style="margin-top:12px;">Scan / enter serial</label>
+                <div style="display:flex;gap:8px;">
+                    <input type="text" id="sce-serial-input" placeholder="Scan a serial number"
+                           onkeydown="if(event.key==='Enter'){event.preventDefault();sceAddSerial();}"
+                           autocomplete="off" autocorrect="off" autocapitalize="characters" spellcheck="false" style="flex:1;">
+                    <button class="btn" onclick="sceOpenLPSheet()" title="Load serials from a license plate" aria-label="Load from license plate">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><path d="M14 14h3v3h-3zM21 14v3M17 21h4M14 21h.01"/></svg>
+                    </button>
+                    <button class="btn btn-primary" onclick="sceAddSerial()" style="min-width:64px;">Add</button>
+                </div>
+                <div class="sce-scan-meta">
+                    <div class="sce-scan-counter">
+                        Scanned <span id="sce-scanned-count">0</span><span id="sce-scanned-target"></span>
                     </div>
+                    <button class="btn sce-clear-btn" onclick="sceClearSerials()" type="button">Clear all</button>
                 </div>
-
-                <div style="font-size:12px; color:var(--text-dim); margin-bottom:8px; margin-top:16px;">Scanned Serials (<span id="sce-scanned-count">0</span>)</div>
-                <div id="sce-scanned-serials" style="background:var(--surface); border:1px solid var(--border); padding:10px; border-radius:6px; min-height:60px; max-height:150px; overflow-y:auto;">
-                    <span style="color:var(--text-dim)">No serials scanned yet</span>
+                <div id="sce-scanned-serials" class="sce-chip-list">
+                    <span style="color:var(--text-dim);font-size:12px;">No serials scanned yet</span>
                 </div>
+                <details class="sce-expected" id="sce-expected-wrap" style="display:none;">
+                    <summary>Show snapshot serials (<span id="sce-expected-count">0</span>)</summary>
+                    <div id="sce-expected-list" class="sce-expected-list"></div>
+                </details>
             </div>
 
-            <!-- Non-Serialized Item: Enter quantity -->
+            <!-- Non-serialized: quantity input -->
             <div id="sce-qty-section" style="display:none;">
-                <div class="form-group">
-                    <label class="form-label">Enter Counted Quantity</label>
-                    <input type="number" id="sce-qty-input" min="0" placeholder="0" style="max-width:200px;">
-                </div>
+                <label class="form-label" style="margin-top:12px;">Counted quantity</label>
+                <input type="number" id="sce-qty-input" min="0" placeholder="0" inputmode="numeric" pattern="[0-9]*" style="max-width:220px;">
+                <div class="sce-scan-counter" style="margin-top:6px;">Snapshot expected <span id="sce-qty-expected">0</span></div>
             </div>
 
-            <div style="margin-top:20px; display:flex; gap:10px; flex-wrap:wrap;">
-                <button class="btn btn-primary" id="sce-confirm-btn" onclick="sceConfirmItem()">Confirm & Next</button>
-                <button class="btn" onclick="sceSkipItem()">Skip</button>
+            <div class="sce-detail-actions">
+                <button class="btn btn-primary" id="sce-confirm-btn" onclick="sceConfirmItem()" style="flex:1;">Confirm</button>
+                <button class="btn" id="sce-uncount-btn" onclick="sceUncountActive()" style="display:none;">Remove count</button>
             </div>
-        </div>
-    </div>
-
-    <!-- Counted Items Summary -->
-    <div class="card" style="max-width:900px; margin-top:16px;">
-        <div class="card-title">Counted Items</div>
-        <div class="table-wrap">
-            <table class="sc-table">
-                <thead>
-                    <tr>
-                        <th>Item</th>
-                        <th style="width:80px;">Qty</th>
-                        <th style="width:80px;">Action</th>
-                    </tr>
-                </thead>
-                <tbody id="sce-counted-body">
-                    <tr><td colspan="3" style="text-align:center;color:var(--text-dim)">No items counted yet</td></tr>
-                </tbody>
-            </table>
-        </div>
-        <div style="margin-top:16px; display:flex; gap:10px; flex-wrap:wrap;">
-            <button class="btn btn-primary" id="sce-save-btn" onclick="sceSaveProgress()">Save Progress</button>
-            <button class="btn" id="sce-complete-btn" onclick="sceCompleteCount()" style="background:var(--success);color:white;">Complete Count</button>
         </div>
     </div>
 </div>
@@ -11363,6 +12158,30 @@ button.stock-sheet-row-pick:active { background:var(--primary-soft, #e3edff); }
     </div>
 </div>
 
+<!-- ═══ BOTTOM SHEET (Stock Count: load serials from license plate) ═══ -->
+<div class="stock-sheet-overlay" id="sce-lp-overlay" onclick="closeSceLPSheet()"></div>
+<div class="stock-sheet" id="sce-lp-sheet">
+    <div class="mob-more-handle"></div>
+    <div class="stock-sheet-head">
+        <div class="stock-sheet-title">Load Serials from License Plate</div>
+        <div class="stock-sheet-sub">Type a plate ID or scan its QR code</div>
+    </div>
+    <div class="stock-sheet-body" style="padding:12px 16px 4px;">
+        <div style="display:flex;gap:8px;margin-bottom:10px;">
+            <input type="text" id="sce-lp-name" placeholder="Plate ID\u2026" autocomplete="off" autocorrect="off" autocapitalize="characters" spellcheck="false" style="flex:1;" onkeydown="if(event.key==='Enter'){event.preventDefault();sceLoadLP();}">
+            <button class="btn" id="sce-lp-cam-btn" onclick="sceToggleLPCamera()" title="Scan QR code"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg></button>
+            <button class="btn btn-primary" onclick="sceLoadLP()">Load</button>
+        </div>
+        <div id="sce-lp-qr-area" style="display:none;margin-bottom:10px;border-radius:8px;overflow:hidden;">
+            <div id="sce-lp-qr-reader"></div>
+        </div>
+        <div id="sce-lp-status" style="font-size:13px;min-height:18px;"></div>
+    </div>
+    <div class="stock-sheet-foot">
+        <button class="btn" onclick="closeSceLPSheet()" style="width:100%;justify-content:center;">Cancel</button>
+    </div>
+</div>
+
 <!-- ═══ MODAL (plate detail) ═══ -->
 <div class="modal-overlay" id="plate-modal">
     <div class="modal">
@@ -11425,6 +12244,56 @@ function closeMobMore() {
     document.getElementById('mob-more-overlay').classList.remove('open');
     document.getElementById('mob-more-drawer').classList.remove('open');
 }
+
+// ═══════════════════════════════════════════════════════════
+//  USER CHIP (top-right) — logout / switch user
+// ═══════════════════════════════════════════════════════════
+function toggleUserMenu(e) {
+    if (e && e.stopPropagation) e.stopPropagation();
+    const chip = document.getElementById('user-chip');
+    if (!chip) return;
+    const open = chip.getAttribute('data-open') === 'true';
+    chip.setAttribute('data-open', open ? 'false' : 'true');
+    const btn = document.getElementById('user-chip-btn');
+    if (btn) btn.setAttribute('aria-expanded', open ? 'false' : 'true');
+}
+
+function appLogout() {
+    // /app/login/secure/logout.nl tears down the session and redirects to the
+    // NetSuite login page. The login page reads landingurl and sends the user
+    // back to this exact Suitelet URL after re-authenticating (works for both
+    // same-user reload and switch-user flows).
+    //
+    // window.top is used so this also works when the Suitelet is embedded in
+    // an iframe inside the NetSuite portal — otherwise the logout would only
+    // navigate the inner frame and NetSuite would render the login page
+    // inside that frame, which it disallows (=> "page not found").
+    let target = window;
+    try { if (window.top && window.top.location) target = window.top; } catch (e) { /* cross-origin frame: fall back to self */ }
+    const back = encodeURIComponent(target.location.href);
+    target.location.href = '/app/login/secure/logout.nl?landingurl=' + back;
+}
+
+// Close the user menu on outside click or Escape.
+document.addEventListener('click', function(e) {
+    const chip = document.getElementById('user-chip');
+    if (!chip) return;
+    if (chip.getAttribute('data-open') !== 'true') return;
+    if (!chip.contains(e.target)) {
+        chip.setAttribute('data-open', 'false');
+        const btn = document.getElementById('user-chip-btn');
+        if (btn) btn.setAttribute('aria-expanded', 'false');
+    }
+});
+document.addEventListener('keydown', function(e) {
+    if (e.key !== 'Escape') return;
+    const chip = document.getElementById('user-chip');
+    if (chip && chip.getAttribute('data-open') === 'true') {
+        chip.setAttribute('data-open', 'false');
+        const btn = document.getElementById('user-chip-btn');
+        if (btn) btn.setAttribute('aria-expanded', 'false');
+    }
+});
 function mobNavTo(view) {
     const navItem = document.querySelector('.nav-item[data-view="' + view + '"]');
     if (navItem) navItem.click();
@@ -13441,14 +14310,17 @@ function bpawAddRow() {
     div.innerHTML =
         '<div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;">' +
             '<input type="text" id="bpaw-sku-' + id + '" autocomplete="off" placeholder="Part number / SKU" style="flex:1;min-width:0;">' +
-            '<button type="button" class="btn" title="Where else is this item?" onclick="bpawLookupItemBins(' + id + ')" style="flex-shrink:0;width:44px;justify-content:center;padding:0;">' +
-                '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.3-4.3"></path></svg>' +
-            '</button>' +
             '<button type="button" class="btn" title="Remove row" onclick="bpawRemoveRow(' + id + ')" style="flex-shrink:0;width:44px;justify-content:center;padding:0;color:#ef4444;font-size:20px;">&times;</button>' +
         '</div>' +
-        '<div style="display:flex;gap:8px;">' +
-            '<div style="flex:1;min-width:0;"><label class="form-label" style="font-size:11px;margin-bottom:2px;">From Bin</label><input type="text" id="bpaw-frombin-' + id + '" list="bpaw-bin-datalist" autocomplete="off" placeholder="From" style="width:100%;"></div>' +
-            '<div style="flex:1;min-width:0;"><label class="form-label" style="font-size:11px;margin-bottom:2px;">To Bin</label><input type="text" id="bpaw-tobin-' + id + '" list="bpaw-bin-datalist" autocomplete="off" placeholder="To" style="width:100%;"></div>' +
+        '<div class="bpaw-bins-row" style="display:flex;gap:8px;">' +
+            '<div style="flex:1;min-width:0;"><label class="form-label" style="font-size:11px;margin-bottom:2px;">From Bin</label><div style="display:flex;gap:4px;align-items:center;"><input type="text" id="bpaw-frombin-' + id + '" list="bpaw-bin-datalist" autocomplete="off" placeholder="From" style="flex:1;min-width:0;width:100%;">' +
+                '<button type="button" class="btn" title="Where is this item? Tap a bin to set the From Bin" onclick="bpawLookupItemBins(' + id + ', 1)" style="flex-shrink:0;width:38px;justify-content:center;padding:0;">' +
+                '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.3-4.3"></path></svg>' +
+                '</button></div></div>' +
+            '<div style="flex:1;min-width:0;"><label class="form-label" style="font-size:11px;margin-bottom:2px;">To Bin</label><div style="display:flex;gap:4px;align-items:center;"><input type="text" id="bpaw-tobin-' + id + '" list="bpaw-bin-datalist" autocomplete="off" placeholder="To" style="flex:1;min-width:0;width:100%;">' +
+                '<button type="button" class="btn" title="Where is this item? Tap a bin to set the To Bin" onclick="bpawLookupItemBins(' + id + ')" style="flex-shrink:0;width:38px;justify-content:center;padding:0;">' +
+                '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.3-4.3"></path></svg>' +
+                '</button></div></div>' +
             '<div style="width:74px;flex-shrink:0;"><label class="form-label" style="font-size:11px;margin-bottom:2px;">Qty</label><input type="number" id="bpaw-qty-' + id + '" min="1" placeholder="Qty" style="width:100%;"></div>' +
         '</div>';
     wrap.appendChild(div);
@@ -13528,7 +14400,8 @@ async function bpawLookupSerialBins() {
 
 // "Where else is this item?" — resolve SKU, then reuse the pickable bin sheet
 // to fill this row's To Bin (and cap qty at available).
-async function bpawLookupItemBins(rowId) {
+// isFrom: truthy = fill the row's From Bin, falsy (default) = fill the To Bin
+async function bpawLookupItemBins(rowId, isFrom) {
     const skuEl = document.getElementById('bpaw-sku-' + rowId);
     const sku = skuEl ? skuEl.value.trim() : '';
     if (!sku) { toast('Enter a part number first.', 'warning'); return; }
@@ -13540,7 +14413,8 @@ async function bpawLookupItemBins(rowId) {
         if (!match && list.length === 1) match = list[0];
         hideProcessing();
         if (!match) { toast('No item matches "' + sku + '".', 'error'); return; }
-        openStockLookup(match.id, match.name || sku, '1', { binTarget: 'bpaw-tobin-' + rowId, qtyTarget: 'bpaw-qty-' + rowId, pickable: true });
+        const binTargetId = (isFrom ? 'bpaw-frombin-' : 'bpaw-tobin-') + rowId;
+        openStockLookup(match.id, match.name || sku, '1', { binTarget: binTargetId, qtyTarget: 'bpaw-qty-' + rowId, pickable: true });
     } catch (e) { hideProcessing(); toast('Error: ' + e.message, 'error'); }
 }
 
@@ -14038,6 +14912,8 @@ function sopickRenderList() {
             badge = entered > 0
                 ? '<span class="badge badge-info">\u2713 ' + entered + ' scanned</span>'
                 : '<span class="badge badge-warning">' + line.quantityRemaining + ' remaining</span>';
+        } else if (line.isNonInventory) {
+            badge = '<span class="badge badge-info">Non-inventory \u00b7 ready</span>';
         } else if (line.isSerialized) {
             if (entered >= line.quantityRemaining && entered > 0)
                 badge = '<span class="badge badge-success">\u2713 Picked ' + entered + '/' + line.quantityRemaining + '</span>';
@@ -14152,6 +15028,14 @@ function sopickRenderLine(line, idx) {
             });
             compHtml += '</div>';
             inputHtml = '<div class="sopick-line-input">' + compHtml + '</div>';
+        } else if (line.isNonInventory) {
+            // Non-inventory item (Service / NonInvtPart / OthCharge / etc.) —
+            // NetSuite doesn't track bins for these. No scan, no bin entry; the
+            // picker leaves it checked and clicks Fulfill.
+            inputHtml = '<div class="sopick-line-input">' +
+                '<div class="sopick-picked-list">' +
+                    '<div class="sopick-picked-head">Non-inventory item \\u2014 no bin required. Will fulfill ' + line.quantityRemaining + '.</div>' +
+                '</div></div>';
         } else if (line.isSerialized) {
             inputHtml = '<div class="sopick-line-input">' +
                 _sopickPickedBlock(line.pickedSerials) +
@@ -14628,6 +15512,15 @@ async function sopickSubmit() {
             const uniqueSerials = [...new Set(serialNumbers)];
             if (uniqueSerials.length !== serialNumbers.length) { toast('Duplicate serial numbers detected for ' + line.itemText + '.', 'error'); validationFailed = true; return; }
             selectedLines.push({ lineNum: line.lineNum, itemId: line.itemId, isSerialized: true, serialNumbers, quantity: serialNumbers.length });
+        } else if (line.isNonInventory) {
+            // Non-inventory item — no bin, no serials, no scan. Just fulfill the
+            // remaining qty as-is.
+            selectedLines.push({
+                lineNum: line.lineNum,
+                itemId: line.itemId,
+                isNonInventory: true,
+                quantity: line.quantityRemaining
+            });
         } else {
             const qtyInput = document.getElementById('sopick-qty-' + idx);
             const qty = parseFloat(qtyInput.value) || 0;
@@ -15136,32 +16029,25 @@ function scdGetActionButton(sc) {
 let _sceData = null;
 let _sceItems = [];
 let _sceCounted = [];
-let _sceCurrentIdx = 0;
-let _sceScannedSerials = [];
+let _sceScannedSerials = [];   // scratch buffer for the currently open detail
+let _sceActiveItemId = null;   // which item is open in the detail screen
+let _sceFilter = 'all';        // 'all' | 'pending' | 'counted'
 
 async function sceStartCount(id) {
     showProcessing('Loading Stock Count...', 'Fetching details');
     try {
         const data = await apiGet('getStockCountById', { id });
-        if (!data.success) {
-            toast(data.message || 'Failed to load stock count.', 'error');
-            return;
-        }
+        if (!data.success) { toast(data.message || 'Failed to load stock count.', 'error'); return; }
         _sceData = data.data;
         _sceItems = _sceData.items || [];
         _sceCounted = _sceData.counted || [];
-        _sceCurrentIdx = 0;
         _sceScannedSerials = [];
+        _sceActiveItemId = null;
+        _sceFilter = 'all';
 
-        // Update status to in_progress if pending
         if (_sceData.status === 'pending') {
             await apiPost('updateStockCount', { id: _sceData.id, status: 'in_progress' });
         }
-
-        // Find first uncounted item
-        _sceCurrentIdx = _sceItems.findIndex(item => !_sceCounted.find(c => c.itemId === item.itemId));
-        if (_sceCurrentIdx < 0) _sceCurrentIdx = 0;
-
         navigateTo('sc-execute');
         sceRenderUI();
     } catch (err) {
@@ -15171,89 +16057,221 @@ async function sceStartCount(id) {
     }
 }
 
-async function sceViewCount(id) {
-    await sceStartCount(id);
+async function sceViewCount(id) { await sceStartCount(id); }
+
+function _sceFindItem(itemId)    { return _sceItems.find(i => String(i.itemId) === String(itemId)); }
+function _sceFindCounted(itemId) { return _sceCounted.find(c => String(c.itemId) === String(itemId)); }
+function _sceExpectedCount(item) {
+    if (!item) return 0;
+    return item.serialized
+        ? (item.serialNumbers ? item.serialNumbers.length : 0)
+        : (parseFloat(item.expectedQty) || 0);
 }
 
 function sceRenderUI() {
     if (!_sceData) return;
+    document.getElementById('sce-count-id').textContent  = _sceData.id;
+    document.getElementById('sce-bin-name').textContent  = _sceData.binName || '—';
 
-    document.getElementById('sce-count-id').textContent = _sceData.id;
-    document.getElementById('sce-bin-name').textContent = _sceData.binName || '—';
+    const total    = _sceItems.length;
+    const counted  = _sceCounted.length;
+    document.getElementById('sce-stat-total').textContent     = total;
+    document.getElementById('sce-stat-counted').textContent   = counted;
+    document.getElementById('sce-stat-remaining').textContent = Math.max(0, total - counted);
 
-    // Stats
-    const totalItems = _sceItems.length;
-    const countedItems = _sceCounted.length;
-    const remaining = totalItems - countedItems;
-    document.getElementById('sce-stat-total').textContent = totalItems;
-    document.getElementById('sce-stat-counted').textContent = countedItems;
-    document.getElementById('sce-stat-remaining').textContent = remaining;
-
-    // Current item
-    const uncountedItems = _sceItems.filter(item => !_sceCounted.find(c => c.itemId === item.itemId));
-    if (uncountedItems.length === 0) {
-        document.getElementById('sce-no-items').style.display = 'block';
-        document.getElementById('sce-item-details').style.display = 'none';
-    } else {
-        document.getElementById('sce-no-items').style.display = 'none';
-        document.getElementById('sce-item-details').style.display = 'block';
-        const currentItem = uncountedItems[0];
-        sceRenderCurrentItem(currentItem);
-    }
-
-    // Counted table
-    sceRenderCountedTable();
+    // Default to list, hide detail
+    document.getElementById('sce-list-screen').style.display   = 'block';
+    document.getElementById('sce-detail-screen').style.display = 'none';
+    sceRenderList();
 }
 
-function sceRenderCurrentItem(item) {
-    document.getElementById('sce-item-name').textContent = item.itemName || '—';
+function sceSetFilter(f) {
+    _sceFilter = f;
+    document.querySelectorAll('#sce-filter .sce-chip').forEach(c => {
+        c.classList.toggle('selected', c.getAttribute('data-filter') === f);
+    });
+    sceRenderList();
+}
+
+function sceRenderList() {
+    const wrap  = document.getElementById('sce-list');
+    const empty = document.getElementById('sce-no-items');
+    if (!wrap) return;
+
+    const items = _sceItems.filter(item => {
+        if (_sceFilter === 'all')     return true;
+        const c = _sceFindCounted(item.itemId);
+        if (_sceFilter === 'pending') return !c;
+        if (_sceFilter === 'counted') return !!c;
+        return true;
+    });
+
+    if (!items.length) {
+        wrap.innerHTML = '';
+        if (empty) empty.style.display = 'block';
+        return;
+    }
+    if (empty) empty.style.display = 'none';
+
+    wrap.innerHTML = items.map(item => {
+        const counted   = _sceFindCounted(item.itemId);
+        const expected  = _sceExpectedCount(item);
+        let stateClass  = '';
+        let badge       = '';
+        let metaLeft    = '';
+
+        if (counted) {
+            if (item.serialized) {
+                const scanned = (counted.counted.serials || []).length;
+                const expSet = new Set((item.serialNumbers || []).map(s => String(s).trim()));
+                const cntSet = new Set((counted.counted.serials || []).map(s => String(s).trim()));
+                let miss = 0, extra = 0;
+                expSet.forEach(s => { if (!cntSet.has(s)) miss++;   });
+                cntSet.forEach(s => { if (!expSet.has(s)) extra++; });
+                if (miss === 0 && extra === 0) {
+                    stateClass = 'counted';
+                    badge = '<span class="badge badge-success">✓ ' + scanned + ' scanned</span>';
+                } else {
+                    stateClass = 'mismatch';
+                    const parts = [];
+                    if (extra) parts.push('+' + extra);
+                    if (miss)  parts.push('-' + miss);
+                    badge = '<span class="badge" style="background:var(--danger);color:#fff;">' +
+                        scanned + ' · ' + parts.join(' / ') + '</span>';
+                }
+            } else {
+                const cnt = parseFloat(counted.counted.quantity) || 0;
+                if (cnt === expected) {
+                    stateClass = 'counted';
+                    badge = '<span class="badge badge-success">✓ Qty ' + cnt + '</span>';
+                } else {
+                    stateClass = 'mismatch';
+                    const diff = cnt - expected;
+                    badge = '<span class="badge" style="background:var(--danger);color:#fff;">Qty ' + cnt + ' · ' + (diff > 0 ? '+' : '') + diff + '</span>';
+                }
+            }
+        } else {
+            badge = '<span class="badge badge-warning">Pending</span>';
+        }
+        metaLeft = (item.serialized ? 'Serialized' : 'Non-serial') + ' · expected ' + expected;
+
+        // Encode item id for the inline handler. JSON.stringify gives us safe
+        // quoting; strip the outer quotes and re-escape any embedded single quotes
+        // so we can drop the result inside onclick="sceOpenItem('…')".
+        const idAttr = JSON.stringify(String(item.itemId)).slice(1, -1).replace(/'/g, "\\'");
+        return '<div class="sce-list-item ' + stateClass + '" onclick="sceOpenItem(\\'' + idAttr + '\\')">' +
+            '<div class="sce-list-item-text">' +
+                '<div class="sce-list-item-name">' + escHtml(item.itemName) + '</div>' +
+                '<div class="sce-list-item-meta">' + escHtml(metaLeft) + '</div>' +
+            '</div>' +
+            badge +
+            '<span class="sce-list-item-chev">›</span>' +
+        '</div>';
+    }).join('');
+}
+
+function sceOpenItem(itemId) {
+    const item = _sceFindItem(itemId);
+    if (!item) return;
+    _sceActiveItemId = String(itemId);
+    const existing = _sceFindCounted(itemId);
+    const expected = _sceExpectedCount(item);
+
+    document.getElementById('sce-detail-name').textContent  = item.itemName || '—';
+    document.getElementById('sce-detail-meta').textContent  =
+        (item.serialized ? 'Serialized · ' : 'Non-serial · ') + 'expected ' + expected;
+
+    document.getElementById('sce-detail-state-badge').innerHTML = existing
+        ? '<span class="badge badge-success">Counted</span>'
+        : '<span class="badge badge-warning">Pending</span>';
 
     if (item.serialized) {
         document.getElementById('sce-serial-section').style.display = 'block';
-        document.getElementById('sce-qty-section').style.display = 'none';
-
-        _sceScannedSerials = [];
+        document.getElementById('sce-qty-section').style.display    = 'none';
+        // Pre-fill scratch buffer from existing count so re-opens show prior scans.
+        _sceScannedSerials = existing ? ((existing.counted.serials || []).slice()) : [];
         sceRenderScannedSerials();
-        document.getElementById('sce-serial-input').value = '';
-        document.getElementById('sce-serial-input').focus();
+        const input = document.getElementById('sce-serial-input');
+        input.value = '';
+        // Snapshot-side serials expander, useful for informed counting.
+        const expList = item.serialNumbers || [];
+        const wrap = document.getElementById('sce-expected-wrap');
+        wrap.style.display = expList.length ? 'block' : 'none';
+        if (expList.length) {
+            document.getElementById('sce-expected-count').textContent = expList.length;
+            document.getElementById('sce-expected-list').innerHTML =
+                expList.map(s => '<span>' + escHtml(s) + '</span>').join('');
+        }
+        // Only auto-focus where there's a physical keyboard — avoids the on-screen
+        // keyboard popping up the moment a phone user opens an item.
+        if (window.matchMedia && window.matchMedia('(pointer:fine)').matches) {
+            setTimeout(() => input.focus(), 60);
+        }
     } else {
         document.getElementById('sce-serial-section').style.display = 'none';
-        document.getElementById('sce-qty-section').style.display = 'block';
-        document.getElementById('sce-qty-input').value = '';
-        document.getElementById('sce-qty-input').focus();
+        document.getElementById('sce-qty-section').style.display    = 'block';
+        const qtyIn = document.getElementById('sce-qty-input');
+        qtyIn.value = existing ? (existing.counted.quantity || 0) : '';
+        document.getElementById('sce-qty-expected').textContent = expected;
+        if (window.matchMedia && window.matchMedia('(pointer:fine)').matches) {
+            setTimeout(() => qtyIn.focus(), 60);
+        }
     }
+
+    document.getElementById('sce-uncount-btn').style.display = existing ? '' : 'none';
+    document.getElementById('sce-list-screen').style.display   = 'none';
+    document.getElementById('sce-detail-screen').style.display = 'block';
+    window.scrollTo(0, 0);
+}
+
+function sceBackToList() {
+    _sceActiveItemId = null;
+    document.getElementById('sce-detail-screen').style.display = 'none';
+    document.getElementById('sce-list-screen').style.display   = 'block';
+    sceRenderUI();
+    window.scrollTo(0, 0);
 }
 
 function sceRenderScannedSerials() {
     const container = document.getElementById('sce-scanned-serials');
     document.getElementById('sce-scanned-count').textContent = _sceScannedSerials.length;
+    const item = _sceFindItem(_sceActiveItemId);
+    const expected = _sceExpectedCount(item);
+    const tgt = document.getElementById('sce-scanned-target');
+    if (tgt) tgt.textContent = expected ? (' of ' + expected) : '';
+
     if (_sceScannedSerials.length === 0) {
-        container.innerHTML = '<span style="color:var(--text-dim)">No serials scanned yet</span>';
-    } else {
-        container.innerHTML = _sceScannedSerials.map((sn, idx) =>
-            '<span style="display:inline-flex;align-items:center;gap:4px;background:var(--primary);color:#fff;padding:2px 8px;border-radius:4px;margin:2px;font-size:12px;">' +
-            escHtml(sn) +
-            '<span style="cursor:pointer;opacity:0.7;" onclick="sceRemoveSerial(' + idx + ')">&times;</span>' +
-            '</span>'
-        ).join('');
+        container.innerHTML = '<span style="color:var(--text-dim);font-size:12px;">No serials scanned yet</span>';
+        return;
     }
+    // Mark each pill as "extra" (not in snapshot) so the user can see at-a-glance
+    // which scans are unexpected — that's what gets routed to Bin Transfer / Adj
+    // at finalize.
+    const expSet = new Set(((item && item.serialNumbers) || []).map(s => String(s).trim()));
+    container.innerHTML = _sceScannedSerials.map((sn, idx) => {
+        const isExtra = !expSet.has(String(sn).trim());
+        return '<span class="sce-serial-pill' + (isExtra ? ' extra' : '') + '">' +
+            escHtml(sn) +
+            '<span class="sce-serial-x" onclick="event.stopPropagation();sceRemoveSerial(' + idx + ')" title="Remove">&times;</span>' +
+        '</span>';
+    }).join('');
 }
 
 function sceAddSerial() {
     const input = document.getElementById('sce-serial-input');
-    const sn = input.value.trim();
+    const sn = (input.value || '').trim();
     if (!sn) return;
-
-    if (_sceScannedSerials.includes(sn)) {
-        toast('Serial already scanned.', 'error');
+    if (_sceScannedSerials.indexOf(sn) >= 0) {
+        // Silent visual nudge — rapid scanners don't want a toast per duplicate.
+        input.style.background = 'rgba(220,38,38,.12)';
+        setTimeout(() => { input.style.background = ''; }, 250);
+        input.select();
         return;
     }
-
     _sceScannedSerials.push(sn);
     sceRenderScannedSerials();
     input.value = '';
     input.focus();
-    toast('Serial added: ' + sn, 'success');
 }
 
 function sceRemoveSerial(idx) {
@@ -15261,96 +16279,166 @@ function sceRemoveSerial(idx) {
     sceRenderScannedSerials();
 }
 
-function sceConfirmItem() {
-    const uncountedItems = _sceItems.filter(item => !_sceCounted.find(c => c.itemId === item.itemId));
-    if (uncountedItems.length === 0) {
-        toast('No items to count.', 'info');
+function sceClearSerials() {
+    if (!_sceScannedSerials.length) return;
+    if (!confirm('Clear all ' + _sceScannedSerials.length + ' scanned serial(s)?')) return;
+    _sceScannedSerials = [];
+    sceRenderScannedSerials();
+}
+
+// ── Load serials from a License Plate (QR or typed ID) ──────
+let _sceLPScanner = null;
+
+function sceOpenLPSheet() {
+    document.getElementById('sce-lp-name').value = '';
+    const statusEl = document.getElementById('sce-lp-status');
+    statusEl.textContent = '';
+    statusEl.style.color = '';
+    document.getElementById('sce-lp-qr-area').style.display = 'none';
+    document.getElementById('sce-lp-overlay').classList.add('open');
+    document.getElementById('sce-lp-sheet').classList.add('open');
+    setTimeout(() => document.getElementById('sce-lp-name').focus(), 200);
+}
+
+function closeSceLPSheet() {
+    document.getElementById('sce-lp-overlay').classList.remove('open');
+    document.getElementById('sce-lp-sheet').classList.remove('open');
+    if (_sceLPScanner) {
+        _sceLPScanner.stop().catch(() => {});
+        _sceLPScanner = null;
+        document.getElementById('sce-lp-qr-area').style.display = 'none';
+    }
+    const inp = document.getElementById('sce-serial-input');
+    if (inp) setTimeout(() => inp.focus(), 200);
+}
+
+function sceToggleLPCamera() {
+    const area = document.getElementById('sce-lp-qr-area');
+    if (_sceLPScanner) {
+        _sceLPScanner.stop().catch(() => {});
+        _sceLPScanner = null;
+        area.style.display = 'none';
+        return;
+    }
+    area.style.display = 'block';
+    _sceLPScanner = new Html5Qrcode('sce-lp-qr-reader');
+    _sceLPScanner.start(
+        { facingMode: 'environment' },
+        { fps: 10, qrbox: { width: 220, height: 220 } },
+        (decodedText) => {
+            document.getElementById('sce-lp-name').value = decodedText;
+            if (_sceLPScanner) { _sceLPScanner.stop().catch(() => {}); _sceLPScanner = null; }
+            area.style.display = 'none';
+            sceLoadLP();
+        },
+        () => {}
+    ).catch(err => toast('Camera error: ' + err, 'error'));
+}
+
+async function sceLoadLP() {
+    const name = document.getElementById('sce-lp-name').value.trim();
+    if (!name) { toast('Enter a plate ID.', 'warning'); return; }
+    const statusEl = document.getElementById('sce-lp-status');
+    statusEl.textContent = 'Loading\u2026';
+    statusEl.style.color = 'var(--text-muted)';
+
+    let data;
+    try {
+        data = await apiGet('getPlateByName', { name });
+    } catch (e) {
+        statusEl.textContent = e.message || 'Lookup failed.';
+        statusEl.style.color = 'var(--danger)';
+        return;
+    }
+    if (!data.success) {
+        statusEl.textContent = data.message || 'Plate not found.';
+        statusEl.style.color = 'var(--danger)';
+        return;
+    }
+    const serials = data.plate.serialList || [];
+    if (!serials.length) {
+        statusEl.textContent = 'No serials on this plate.';
+        statusEl.style.color = 'var(--danger)';
         return;
     }
 
-    const currentItem = uncountedItems[0];
-    let countedValue;
+    // Heads-up if the plate is tagged with a different item than the one being counted.
+    // The user can still load (extras get flagged as off-snapshot pills), but they should know.
+    const activeItem = _sceFindItem(_sceActiveItemId);
+    if (activeItem && data.plate.itemId && String(data.plate.itemId) !== String(_sceActiveItemId)) {
+        const plateItem = data.plate.item || 'a different item';
+        if (!confirm('Plate ' + data.plate.name + ' is tagged with "' + plateItem + '", but you are counting "' + (activeItem.itemName || activeItem.item || 'this item') + '".\\n\\nLoad its serials anyway?')) {
+            statusEl.textContent = 'Cancelled \u2014 item mismatch.';
+            statusEl.style.color = 'var(--warning)';
+            return;
+        }
+    }
 
-    if (currentItem.serialized) {
+    const existing = new Set(_sceScannedSerials.map(s => String(s).trim()));
+    const toAdd = serials.map(s => String(s).trim()).filter(s => s && !existing.has(s));
+    toAdd.forEach(s => _sceScannedSerials.push(s));
+    sceRenderScannedSerials();
+
+    const dupes = serials.length - toAdd.length;
+    statusEl.textContent = toAdd.length + ' serial(s) loaded from ' + data.plate.name + (dupes > 0 ? ' (' + dupes + ' already scanned)' : '') + '.';
+    statusEl.style.color = 'var(--success)';
+    setTimeout(() => closeSceLPSheet(), 1200);
+}
+
+function sceConfirmItem() {
+    if (!_sceActiveItemId) { toast('No item selected.', 'error'); return; }
+    const item = _sceFindItem(_sceActiveItemId);
+    if (!item) return;
+
+    let countedValue;
+    if (item.serialized) {
         if (_sceScannedSerials.length === 0) {
-            toast('Please scan at least one serial number.', 'error');
+            toast('Scan at least one serial, or tap Back to leave unchanged.', 'error');
             return;
         }
-        countedValue = { serials: [..._sceScannedSerials] };
+        countedValue = { serials: _sceScannedSerials.slice() };
     } else {
-        const qty = parseInt(document.getElementById('sce-qty-input').value) || 0;
-        if (qty < 0) {
-            toast('Quantity must be 0 or greater.', 'error');
-            return;
-        }
+        const raw = document.getElementById('sce-qty-input').value;
+        const qty = parseInt(raw);
+        if (isNaN(qty) || qty < 0) { toast('Quantity must be 0 or greater.', 'error'); return; }
         countedValue = { quantity: qty };
     }
 
-    _sceCounted.push({
-        itemId: currentItem.itemId,
-        itemName: currentItem.itemName,
-        serialized: currentItem.serialized,
-        expected: currentItem.serialized ? (currentItem.serialNumbers || []) : null,
-        counted: countedValue
-    });
+    const entry = {
+        itemId:     item.itemId,
+        itemName:   item.itemName,
+        serialized: !!item.serialized,
+        expected:   item.serialized ? (item.serialNumbers || []) : null,
+        counted:    countedValue
+    };
+    const i = _sceCounted.findIndex(c => String(c.itemId) === String(item.itemId));
+    if (i >= 0) _sceCounted[i] = entry;
+    else        _sceCounted.push(entry);
 
-    toast('Item counted: ' + currentItem.itemName, 'success');
-    sceRenderUI();
+    toast('Counted: ' + (item.itemName || ''), 'success');
+    sceBackToList();
 }
 
-function sceSkipItem() {
-    const uncountedItems = _sceItems.filter(item => !_sceCounted.find(c => c.itemId === item.itemId));
-    if (uncountedItems.length <= 1) {
-        toast('No more items to skip to.', 'info');
-        return;
+function sceUncountActive() {
+    if (!_sceActiveItemId) return;
+    if (!confirm('Remove the count for this item? You can re-open it later to recount.')) return;
+    const i = _sceCounted.findIndex(c => String(c.itemId) === String(_sceActiveItemId));
+    if (i >= 0) {
+        const name = _sceCounted[i].itemName || '';
+        _sceCounted.splice(i, 1);
+        toast('Removed count for ' + name, 'info');
     }
-    // Move current item to end of uncounted list by adding a skipped marker
-    const skipped = uncountedItems[0];
-    _sceItems = _sceItems.filter(i => i.itemId !== skipped.itemId);
-    _sceItems.push(skipped);
-    sceRenderUI();
+    sceBackToList();
 }
 
-function sceRenderCountedTable() {
-    const tbody = document.getElementById('sce-counted-body');
-    if (_sceCounted.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="3" style="text-align:center;color:var(--text-dim)">No items counted yet</td></tr>';
-        return;
-    }
-    tbody.innerHTML = _sceCounted.map((c, idx) => {
-        let countedVal;
-        if (c.serialized) {
-            const serials = c.counted.serials || [];
-            countedVal = serials.length;
-        } else {
-            countedVal = c.counted.quantity || 0;
-        }
-        const recountBtn = '<button class="btn" style="padding:2px 8px;font-size:11px;" onclick="sceRecountItem(' + idx + ')" title="Recount this item">↩ Redo</button>';
-        return '<tr>' +
-            '<td data-label="Item" style="font-weight:500;">' + escHtml(c.itemName) + '</td>' +
-            '<td data-label="Qty">' + countedVal + '</td>' +
-            '<td data-label="" class="sc-cell-action" style="text-align:center;">' + recountBtn + '</td>' +
-            '</tr>';
-    }).join('');
-}
+// Skip from detail = just go back to the list (the filter chips let the user
+// come back to any pending item).
+function sceSkipItem() { sceBackToList(); }
 
+// Back-compat: older external callers used this to re-open a counted item.
 function sceRecountItem(idx) {
-    if (idx < 0 || idx >= _sceCounted.length) return;
-
-    const item = _sceCounted[idx];
-    // Remove from counted
-    _sceCounted.splice(idx, 1);
-
-    // Move this item to the front of _sceItems so it becomes the current item
-    const itemIdx = _sceItems.findIndex(i => i.itemId === item.itemId);
-    if (itemIdx > -1) {
-        const [removed] = _sceItems.splice(itemIdx, 1);
-        _sceItems.unshift(removed);
-    }
-
-    // Re-render UI
-    sceRenderUI();
-    toast('Item ready for recount: ' + item.itemName, 'info');
+    const c = _sceCounted[idx];
+    if (c) sceOpenItem(c.itemId);
 }
 
 async function sceSaveProgress() {
@@ -15752,7 +16840,15 @@ async function scrFinalizeCount() {
             });
 
             if (data.success) {
-                toast('Inventory adjustment created: ' + (data.tranId || data.adjustmentId), 'success');
+                // Server now returns a rich message describing what was done
+                // (bin transfer for found-in-wrong-bin serials, adjustment for
+                // truly new/missing, etc). Render the full message so the picker
+                // sees the cross-bin result instead of a generic confirmation.
+                toast(data.message || ('Stock count finalized.'), 'success');
+                if (data.counts && data.counts.blocked) {
+                    // Loud follow-up so the operator knows manual review is needed.
+                    toast(data.counts.blocked + ' serial(s) need manual review — see script execution log.', 'warning');
+                }
             } else {
                 toast(data.message || 'Failed to create adjustment.', 'error');
                 return;

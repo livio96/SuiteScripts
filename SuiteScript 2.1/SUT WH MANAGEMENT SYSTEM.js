@@ -167,6 +167,8 @@ define([
                     return respondJson(context, getStockCountById(context.request.parameters));
                 case 'updateStockCount':
                     return respondJson(context, updateStockCount(JSON.parse(context.request.body)));
+                case 'previewStockCountAdjustment':
+                    return respondJson(context, previewStockCountAdjustment(JSON.parse(context.request.body)));
                 case 'createStockCountAdjustment':
                     return respondJson(context, createStockCountAdjustment(JSON.parse(context.request.body)));
                 case 'lookupPOSerials':
@@ -187,6 +189,8 @@ define([
                     return respondJson(context, pickSOItems(JSON.parse(context.request.body)));
                 case 'validateSerialBatch':
                     return respondJson(context, validateSerialBatch(JSON.parse(context.request.body)));
+                case 'validateReceiptSerials':
+                    return respondJson(context, validateReceiptSerials(JSON.parse(context.request.body)));
                 case 'getBinInventory':
                     return respondJson(context, getBinInventory(context.request.parameters));
                 case 'getBinInventoryForSerials':
@@ -197,14 +201,26 @@ define([
                     return respondJson(context, apiBinPutawaySerialized(JSON.parse(context.request.body)));
                 case 'binPutawayNonSerialized':
                     return respondJson(context, apiBinPutawayNonSerialized(JSON.parse(context.request.body)));
+                case 'pickAmazonSerialized':
+                    return respondJson(context, apiPickAmazonSerialized(JSON.parse(context.request.body)));
+                case 'pickAmazonNonSerialized':
+                    return respondJson(context, apiPickAmazonNonSerialized(JSON.parse(context.request.body)));
                 case 'inventoryStatusChangeSerialized':
                     return respondJson(context, apiInventoryStatusChangeSerialized(JSON.parse(context.request.body)));
                 case 'inventoryStatusChangeNonSerialized':
                     return respondJson(context, apiInventoryStatusChangeNonSerialized(JSON.parse(context.request.body)));
                 case 'getSerialsInBins':
                     return respondJson(context, getSerialsInBins(context.request.parameters));
+                case 'getItemBinSerials':
+                    return respondJson(context, getItemBinSerials(context.request.parameters));
                 case 'getBinContents':
                     return respondJson(context, getBinContents(context.request.parameters));
+                case 'getFragmentedItems':
+                    return respondJson(context, getFragmentedItems(context.request.parameters));
+                case 'getConsolidationSerials':
+                    return respondJson(context, getConsolidationSerials(context.request.parameters));
+                case 'executeConsolidation':
+                    return respondJson(context, executeConsolidation(JSON.parse(context.request.body)));
                 case 'executeBulkBinTransfer':
                     return respondJson(context, executeBulkBinTransfer(JSON.parse(context.request.body)));
                 case 'printReceiptLabels': {
@@ -981,6 +997,84 @@ define([
     };
 
     // ═══════════════════════════════════════════════════════════
+    //  RECEIVING GUARD: serials already in stock
+    //  On a PO receipt a serial that NetSuite already shows on hand must
+    //  not be received again:
+    //    - same item, qoh > 0  -> HARD block. NetSuite rejects the save
+    //      (a serialized item can't hold the same inventory number twice)
+    //      and it would double-count stock.
+    //    - different item, qoh > 0 -> soft warn. Technically a separate
+    //      inventory-number record, but almost always a mis-scan.
+    //  Picked/Packed units still count as on hand, so qoh > 0 is the right
+    //  "already here" signal. A serial that exists only with qoh <= 0
+    //  (previously received then shipped) is fine to re-receive — that's a
+    //  normal return/refurb restock — so it is NOT flagged.
+    // ═══════════════════════════════════════════════════════════
+    const validateReceiptSerials = (data) => {
+        const itemId  = String(data.itemId || '');
+        const serials = (data.serials || []).map(s => (s || '').trim()).filter(Boolean);
+        if (!serials.length) return { success: true, results: [], blocked: [], warned: [], hasBlocking: false };
+
+        const unique = Array.from(new Set(serials.map(s => s.toUpperCase())));
+        const found  = {}; // SERIAL(UPPER) -> { [itemId]: { itemName, qoh } }
+        const BATCH  = 50;
+        for (let off = 0; off < unique.length; off += BATCH) {
+            const batch = unique.slice(off, off + BATCH);
+            const filterExpr = [];
+            batch.forEach((s, i) => { if (i > 0) filterExpr.push('OR'); filterExpr.push(['inventorynumber', 'is', s]); });
+            try {
+                // No item filter: we want to know if the serial is on hand under
+                // ANY item, not just the one being received.
+                search.create({
+                    type: 'inventorynumber',
+                    filters: filterExpr,
+                    columns: [
+                        search.createColumn({ name: 'inventorynumber' }),
+                        search.createColumn({ name: 'item' }),
+                        search.createColumn({ name: 'quantityonhand' })
+                    ]
+                }).run().each(r => {
+                    const sn   = (r.getValue({ name: 'inventorynumber' }) || '').trim().toUpperCase();
+                    const itId = String(r.getValue({ name: 'item' }));
+                    const itTx = r.getText({ name: 'item' }) || itId;
+                    const qoh  = parseFloat(r.getValue({ name: 'quantityonhand' })) || 0;
+                    if (!sn) return true;
+                    if (!found[sn]) found[sn] = {};
+                    if (!found[sn][itId]) found[sn][itId] = { itemName: itTx, qoh: 0 };
+                    found[sn][itId].qoh += qoh;
+                    return true;
+                });
+            } catch (e) { log.debug('validateReceiptSerials batch error', e.message); }
+        }
+
+        const results = [];
+        serials.forEach(orig => {
+            const key = orig.trim().toUpperCase();
+            const byItem = found[key];
+            if (!byItem) { results.push({ serial: orig, status: 'ok' }); return; }
+
+            // Same item, in stock -> hard block
+            if (itemId && byItem[itemId] && byItem[itemId].qoh > 0) {
+                results.push({ serial: orig, status: 'in_stock_same', qoh: byItem[itemId].qoh, itemName: byItem[itemId].itemName });
+                return;
+            }
+            // Different item, in stock -> soft warn
+            const otherInStock = Object.keys(byItem).filter(id => byItem[id].qoh > 0 && id !== itemId);
+            if (otherInStock.length) {
+                const oid = otherInStock[0];
+                results.push({ serial: orig, status: 'in_stock_other', qoh: byItem[oid].qoh, belongsToItemId: oid, belongsToItemName: byItem[oid].itemName });
+                return;
+            }
+            // Exists only depleted (qoh <= 0) -> fine to re-receive
+            results.push({ serial: orig, status: 'ok' });
+        });
+
+        const blocked = results.filter(r => r.status === 'in_stock_same');
+        const warned  = results.filter(r => r.status === 'in_stock_other');
+        return { success: true, results, blocked, warned, hasBlocking: blocked.length > 0 };
+    };
+
+    // ═══════════════════════════════════════════════════════════
     //  FULFILL SALES ORDER
     //  Create item fulfillment from SO using serials on a plate
     // ═══════════════════════════════════════════════════════════
@@ -1547,6 +1641,38 @@ define([
             let counted = [];
             try { items = JSON.parse(itemsJson); } catch(e) {}
             try { counted = JSON.parse(countedJson); } catch(e) {}
+
+            // Resolve the linked correction transaction (inventory adjustment OR
+            // bin transfer — whichever was stored as the primary record) into a
+            // displayable {id, recordType, tranId, typeLabel, url} so the review
+            // screen can render a real link to it after approval.
+            const adjLinkId = rec.getValue({ fieldId: 'custrecord_sc_adj_id' }) || null;
+            let correction = null;
+            if (adjLinkId) {
+                try {
+                    const lk = search.lookupFields({
+                        type: search.Type.TRANSACTION,
+                        id: adjLinkId,
+                        columns: ['recordtype', 'tranid', 'type']
+                    });
+                    const recType  = lk.recordtype || '';
+                    const typeText = Array.isArray(lk.type) ? (lk.type[0] && lk.type[0].text) : lk.type;
+                    let linkUrl = '';
+                    try { linkUrl = url.resolveRecord({ recordType: recType, recordId: adjLinkId }); }
+                    catch (ue) { log.debug('resolveRecord failed', ue.message); }
+                    correction = {
+                        id: String(adjLinkId),
+                        recordType: recType,
+                        tranId: lk.tranid || String(adjLinkId),
+                        typeLabel: typeText || recType || 'Transaction',
+                        url: linkUrl
+                    };
+                } catch (le) {
+                    log.debug('getStockCountById correction resolve failed', le.message);
+                    correction = { id: String(adjLinkId), recordType: '', tranId: String(adjLinkId), typeLabel: 'Transaction', url: '' };
+                }
+            }
+
             return {
                 success: true,
                 data: {
@@ -1558,7 +1684,8 @@ define([
                     assignedToId: rec.getValue({ fieldId: 'custrecord_sc_assigned_to' }),
                     assignedTo: rec.getText({ fieldId: 'custrecord_sc_assigned_to' }),
                     status: rec.getValue({ fieldId: 'custrecord_sc_status' }),
-                    adjustmentId: rec.getValue({ fieldId: 'custrecord_sc_adj_id' }) || null,
+                    adjustmentId: adjLinkId,
+                    correction: correction,
                     items: items,
                     counted: counted
                 }
@@ -1579,6 +1706,13 @@ define([
             if (data.adjustmentId !== undefined) rec.setValue({ fieldId: 'custrecord_sc_adj_id', value: data.adjustmentId });
             rec.save({ enableSourcing: true, ignoreMandatoryFields: false });
             log.audit('Stock Count Updated', 'ID: ' + id + ', Status: ' + (data.status || 'unchanged'));
+
+            // If this update is the approval (no-adjustment finalize path),
+            // stamp every counted item with the approval date (best-effort).
+            if (data.status === 'approved') {
+                stampLastStockCountDate(id, new Date());
+            }
+
             return { success: true, id, message: 'Stock count updated successfully.' };
         } catch (e) {
             log.error('updateStockCount Error', e.message);
@@ -1586,13 +1720,12 @@ define([
         }
     };
 
-    const createStockCountAdjustment = (data) => {
-        try {
-            const { stockCountId, locationId, binId, adjustments } = data;
-            if (!stockCountId) return { success: false, message: 'Stock count ID required.' };
-            if (!locationId)   return { success: false, message: 'Location ID required.' };
-            if (!adjustments || adjustments.length === 0) return { success: false, message: 'No adjustments provided.' };
-
+    // ═══════════════════════════════════════════════════════════
+    //  STOCK COUNT — shared classifier. Used by BOTH the approval
+    //  preview and the real adjustment creation so what the reviewer
+    //  is shown is exactly what will be posted.
+    // ═══════════════════════════════════════════════════════════
+    const classifyStockCountChanges = (stockCountId, locationId, binId, adjustments) => {
             // Load the SC snapshot. Used to restore each serial's *original*
             // inventory status on adj-out, and to apportion non-serial losses
             // across the correct status buckets instead of dumping everything
@@ -1638,6 +1771,168 @@ define([
                 }
                 return out;
             });
+
+            return { classified, snapshotById };
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  STOCK COUNT — approval impact preview (dry run, creates nothing)
+    // ═══════════════════════════════════════════════════════════
+    const previewStockCountAdjustment = (data) => {
+        try {
+            const { stockCountId, locationId, binId, adjustments } = data;
+            if (!stockCountId) return { success: false, message: 'Stock count ID required.' };
+            if (!locationId)   return { success: false, message: 'Location ID required.' };
+            if (!adjustments || adjustments.length === 0) return { success: true, items: [], totals: { transferUnits: 0, addUnits: 0, addValue: 0, removeUnits: 0, removeValue: 0, cancelledUnits: 0, blockedUnits: 0, netUnits: 0, netValue: 0 } };
+
+            const { classified } = classifyStockCountChanges(stockCountId, locationId, binId, adjustments);
+
+            const items = [];
+            const totals = { transferUnits: 0, addUnits: 0, addValue: 0, removeUnits: 0, removeValue: 0, cancelledUnits: 0, blockedUnits: 0, netUnits: 0, netValue: 0 };
+
+            classified.forEach(c => {
+                let unitCost = 0;
+                try {
+                    const cl = search.lookupFields({ type: search.Type.ITEM, id: c.itemId, columns: ['averagecost'] });
+                    unitCost = parseFloat(cl.averagecost) || 0;
+                } catch (e) { /* cost unknown -> 0 */ }
+
+                const row = {
+                    itemId: c.itemId, itemName: c.itemName, serialized: c.serialized, unitCost: unitCost,
+                    transferIn: [], trueAdd: [], realRemove: [], cancelled: [], blocked: [],
+                    adjustQty: 0, addValue: 0, removeValue: 0
+                };
+
+                if (c.serialized) {
+                    row.transferIn = c.addPlan.transferIn.map(t => ({ serial: t.serial, fromBinName: t.fromBinName }));
+                    row.trueAdd    = c.addPlan.trueAdd.slice();
+                    row.realRemove = c.removePlan.realRemove.slice();
+                    row.cancelled  = c.removePlan.cancelled.map(x => ({ serial: x.serial, reason: x.reason }));
+                    row.blocked    = c.addPlan.blocked.concat(c.removePlan.blocked).map(x => ({ serial: x.serial, reason: x.reason }));
+                    row.addValue    = row.trueAdd.length    * unitCost;
+                    row.removeValue = row.realRemove.length * unitCost;
+                    totals.transferUnits += row.transferIn.length;
+                    totals.addUnits      += row.trueAdd.length;
+                    totals.removeUnits   += row.realRemove.length;
+                    totals.cancelledUnits+= row.cancelled.length;
+                    totals.blockedUnits  += row.blocked.length;
+                } else {
+                    row.adjustQty = c.adjustQty;
+                    if (c.adjustQty > 0) { row.addValue    = c.adjustQty * unitCost;            totals.addUnits    += c.adjustQty; }
+                    if (c.adjustQty < 0) { row.removeValue = Math.abs(c.adjustQty) * unitCost;  totals.removeUnits += Math.abs(c.adjustQty); }
+                }
+                totals.addValue    += row.addValue;
+                totals.removeValue += row.removeValue;
+                items.push(row);
+            });
+
+            totals.netUnits = totals.addUnits - totals.removeUnits;
+            totals.netValue = totals.addValue - totals.removeValue;
+            return { success: true, items: items, totals: totals };
+        } catch (e) {
+            log.error('previewStockCountAdjustment Error', e.message);
+            return { success: false, message: e.message };
+        }
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  STOCK COUNT — stamp custitem_last_stock_count on every item
+    //  in the count with the approval date.
+    //
+    //  Best-effort by design: this runs AFTER the inventory
+    //  adjustment / approval has already been committed, so it must
+    //  never throw. A bad item type or a missing field on one item
+    //  is logged and skipped — it can never roll back the approval.
+    //
+    //  Source of "all those items" = the count snapshot
+    //  (custrecordsc_items_json), so items that matched and needed no
+    //  adjustment are stamped too, not just the adjusted ones.
+    // ═══════════════════════════════════════════════════════════
+    const stampLastStockCountDate = (stockCountId, approvedDate) => {
+        try {
+            if (!stockCountId) return;
+            const when = approvedDate || new Date();
+
+            // Pull the full item set from the snapshot.
+            let itemIds = [];
+            try {
+                const snapRec = record.load({ type: 'customrecord_wh_stock_count', id: stockCountId });
+                const snapItems = JSON.parse(snapRec.getValue('custrecordsc_items_json') || '[]');
+                itemIds = snapItems.map(it => String(it.itemId)).filter(Boolean);
+            } catch (snapErr) {
+                log.error('stampLastStockCountDate snapshot load failed', snapErr.message);
+                return;
+            }
+            // De-dupe.
+            itemIds = Array.from(new Set(itemIds));
+            if (!itemIds.length) return;
+
+            // Resolve the correct SuiteScript record type per item in one search.
+            // submitFields requires the exact subtype (e.g. serializedinventoryitem),
+            // so we derive it from the item's flags rather than guessing.
+            const typeById = {};
+            try {
+                search.create({
+                    type: 'item',
+                    filters: [['internalid', 'anyof', itemIds]],
+                    columns: [
+                        search.createColumn({ name: 'internalid' }),
+                        search.createColumn({ name: 'type' }),
+                        search.createColumn({ name: 'isserialitem' }),
+                        search.createColumn({ name: 'islotitem' })
+                    ]
+                }).run().each(r => {
+                    const id      = r.getValue({ name: 'internalid' });
+                    const t       = String(r.getValue({ name: 'type' }) || '');
+                    const isSer   = r.getValue({ name: 'isserialitem' }) === true || r.getValue({ name: 'isserialitem' }) === 'T';
+                    const isLot   = r.getValue({ name: 'islotitem' })    === true || r.getValue({ name: 'islotitem' })    === 'T';
+                    let rt = null;
+                    if (t === 'InvtPart') {
+                        rt = isLot ? 'lotnumberedinventoryitem' : (isSer ? 'serializedinventoryitem' : 'inventoryitem');
+                    } else if (t === 'Assembly') {
+                        rt = isLot ? 'lotnumberedassemblyitem' : (isSer ? 'serializedassemblyitem' : 'assemblyitem');
+                    }
+                    // Other types (Kit, NonInvtPart, etc.) carry no inventory and are skipped.
+                    if (id && rt) typeById[String(id)] = rt;
+                    return true;
+                });
+            } catch (typeErr) {
+                log.error('stampLastStockCountDate type resolution failed', typeErr.message);
+                return;
+            }
+
+            let stamped = 0, skipped = 0;
+            itemIds.forEach(id => {
+                const rt = typeById[id];
+                if (!rt) { skipped++; return; }
+                try {
+                    record.submitFields({
+                        type: rt,
+                        id: id,
+                        values: { custitem_last_stock_count: when },
+                        options: { enableSourcing: false, ignoreMandatoryFields: true }
+                    });
+                    stamped++;
+                } catch (oneErr) {
+                    skipped++;
+                    log.error('stampLastStockCountDate item ' + id + ' (' + rt + ')', oneErr.message);
+                }
+            });
+            log.audit('Stock Count Last-Count Stamp', 'SC#' + stockCountId + ' stamped ' + stamped + ' item(s), skipped ' + skipped);
+        } catch (e) {
+            // Truly never let this break the approval.
+            log.error('stampLastStockCountDate Error', e.message + '\n' + e.stack);
+        }
+    };
+
+    const createStockCountAdjustment = (data) => {
+        try {
+            const { stockCountId, locationId, binId, adjustments } = data;
+            if (!stockCountId) return { success: false, message: 'Stock count ID required.' };
+            if (!locationId)   return { success: false, message: 'Location ID required.' };
+            if (!adjustments || adjustments.length === 0) return { success: false, message: 'No adjustments provided.' };
+
+            const { classified, snapshotById } = classifyStockCountChanges(stockCountId, locationId, binId, adjustments);
 
             const transferCount    = classified.reduce((n, c) => n + (c.serialized ? c.addPlan.transferIn.length    : 0), 0);
             const trueAddCount     = classified.reduce((n, c) => n + (c.serialized ? c.addPlan.trueAdd.length       : 0), 0);
@@ -1819,6 +2114,9 @@ define([
             scRec.setValue({ fieldId: 'custrecord_sc_adj_id', value: String(adjId || btId || '') });
             scRec.setValue({ fieldId: 'custrecord_sc_status', value: 'approved' });
             scRec.save({ enableSourcing: true, ignoreMandatoryFields: false });
+
+            // ── Stamp every counted item with the approval date (best-effort) ──
+            stampLastStockCountDate(stockCountId, new Date());
 
             // ── Build the user-facing message ──
             const parts = [];
@@ -2286,9 +2584,16 @@ define([
         const lineCount = soRec.getLineCount({ sublistId: 'item' });
 
         const itemIds = [];
+        // SO line UNIQUE ID (`line` field) -> 0-based sublist position. The IF's
+        // `orderline` field references this unique id, NOT the sublist position,
+        // so we need this dictionary to attribute open-IF quantities correctly
+        // when lines were added/removed/reordered or the same item is on >1 line.
+        const lineIdToIdx = {};
         for (let i = 0; i < lineCount; i++) {
             const itemId = String(soRec.getSublistValue({ sublistId: 'item', fieldId: 'item', line: i }));
             if (!itemIds.includes(itemId)) itemIds.push(itemId);
+            const _lid = String(soRec.getSublistValue({ sublistId: 'item', fieldId: 'line', line: i }) || '');
+            if (_lid) lineIdToIdx[_lid] = i;
         }
 
         // Inventory-tracked item types. Anything outside this set (and not a Kit)
@@ -2427,10 +2732,19 @@ define([
                         // Skip unchecked lines (they're not actually being fulfilled by this IF).
                         if (receive === false || receive === 'F') continue;
                         const qty        = Math.abs(parseFloat(ifRec.getSublistValue({ sublistId: 'item', fieldId: 'quantity',  line: li })) || 0);
-                        const orderLine  = parseFloat(ifRec.getSublistValue({ sublistId: 'item', fieldId: 'orderline', line: li }));
                         const lineItemId = String(ifRec.getSublistValue({ sublistId: 'item', fieldId: 'item', line: li }) || '');
-                        // orderline on the IF sublist is 1-based; SO sublist is 0-based.
-                        const idx = (!isNaN(orderLine)) ? (orderLine - 1) : null;
+                        // `orderline` returns the SO line's UNIQUE LINE ID (the `line`
+                        // field), NOT the 0-based sublist position. The old (orderLine - 1)
+                        // math only worked when line ids happened to equal position+1; it
+                        // broke whenever a line was added/removed/reordered or the same item
+                        // sat on two lines (e.g. line id 25 living at sublist position 2),
+                        // dumping that line's picked qty onto a phantom index and leaving the
+                        // real line showing as still-to-pick. Map via the SO line-id table.
+                        const orderLineId = String(ifRec.getSublistValue({ sublistId: 'item', fieldId: 'orderline', line: li }) || '');
+                        const idx = lineIdToIdx.hasOwnProperty(orderLineId) ? lineIdToIdx[orderLineId] : null;
+                        if (idx === null) {
+                            log.debug({ title: 'loadSOForPicking: unmatched orderline', details: 'IF ' + info.id + ' line ' + li + ' orderline=' + orderLineId });
+                        }
                         if (qty > 0 && idx !== null) {
                             openIFByLine[idx] = (openIFByLine[idx] || 0) + qty;
                         }
@@ -3381,6 +3695,477 @@ define([
         return { success: true, bins: bins, isKit: isKit };
     };
 
+    // Item Lookup helper — every ON-HAND serial for an item, grouped by bin,
+    // each tagged with whether it is currently available (not committed).
+    // Unlike getSerialsInBins (picking-oriented, available-only), this returns
+    // the full on-hand picture so the serial count in the popup reconciles with
+    // the "On Hand" column shown in the lookup table. Read-only copy reference.
+    const getItemBinSerials = (params) => {
+        const itemId = params.itemId;
+        const locationId = params.locationId;
+        if (!itemId || !locationId) return { success: false, message: 'Item and location are required.' };
+
+        // Detect kit and expand to components, mirroring getBinInventory.
+        let itemType = '';
+        try {
+            const meta = search.lookupFields({ type: search.Type.ITEM, id: itemId, columns: ['type'] });
+            itemType = (meta && meta.type && meta.type[0] && meta.type[0].value) || '';
+        } catch (e) { /* treat as regular item */ }
+        const isKit = (itemType === 'Kit' || itemType === 'kit');
+
+        const lookupItems = [];
+        const itemLabel = {};
+        if (isKit) {
+            try {
+                const kitRec = record.load({ type: 'kititem', id: parseInt(itemId) });
+                const memberCount = kitRec.getLineCount({ sublistId: 'member' });
+                for (let m = 0; m < memberCount; m++) {
+                    const compId = String(kitRec.getSublistValue({ sublistId: 'member', fieldId: 'item', line: m }));
+                    const compText = kitRec.getSublistText({ sublistId: 'member', fieldId: 'item', line: m }) || compId;
+                    if (!lookupItems.includes(compId)) lookupItems.push(compId);
+                    itemLabel[compId] = compText;
+                }
+            } catch (e) {
+                return { success: false, message: 'Could not load kit components: ' + e.message };
+            }
+            if (!lookupItems.length) return { success: true, bins: [], isKit: true };
+        } else {
+            lookupItems.push(String(itemId));
+        }
+
+        // binName -> { bin, component, onHand, available, serials: [{ sn, qty, avail }] }
+        const binMap = {};
+        try {
+            const srch = search.create({
+                type: 'inventorybalance',
+                filters: [
+                    ['item', 'anyof', lookupItems], 'AND',
+                    ['location', 'anyof', [locationId]], 'AND',
+                    ['onhand', 'greaterthan', 0]
+                ],
+                columns: [
+                    search.createColumn({ name: 'item' }),
+                    search.createColumn({ name: 'inventorynumber' }),
+                    search.createColumn({ name: 'binnumber' }),
+                    search.createColumn({ name: 'onhand' }),
+                    search.createColumn({ name: 'available' })
+                ]
+            });
+            const paged = srch.runPaged({ pageSize: 1000 });
+            paged.pageRanges.forEach(pr => {
+                paged.fetch({ index: pr.index }).data.forEach(r => {
+                    const serial = (r.getText({ name: 'inventorynumber' }) || '').trim();
+                    if (!serial) return; // skip non-serialized / lot-less rows
+                    const binName = r.getText({ name: 'binnumber' }) || r.getValue({ name: 'binnumber' }) || '(No Bin)';
+                    const onhand = parseFloat(r.getValue({ name: 'onhand' })) || 0;
+                    if (onhand <= 0) return;
+                    // Mirror getBinInventory: trust `available` when present; a real 0
+                    // means fully committed. Only fall back to on-hand when the
+                    // column is genuinely absent (null/empty/NaN).
+                    const availRaw = r.getValue({ name: 'available' });
+                    const availNum = parseFloat(availRaw);
+                    const availKnown = (availRaw !== '' && availRaw !== null && !isNaN(availNum));
+                    const rowAvail = availKnown ? availNum : onhand;
+                    const rowItemId = String(r.getValue({ name: 'item' }));
+
+                    if (!binMap[binName]) {
+                        binMap[binName] = { bin: binName, component: itemLabel[rowItemId] || '', onHand: 0, available: 0, serials: [] };
+                    }
+                    const slot = binMap[binName];
+                    slot.onHand += onhand;
+                    slot.available += rowAvail;
+                    slot.serials.push({ sn: serial, qty: onhand, avail: (rowAvail > 0) });
+                });
+            });
+        } catch (e) {
+            log.debug('getItemBinSerials error', e.message);
+            return { success: false, message: 'Could not retrieve serials: ' + e.message };
+        }
+
+        const bins = Object.keys(binMap).map(b => {
+            const slot = binMap[b];
+            slot.serials.sort((a, c) => String(a.sn).localeCompare(String(c.sn), undefined, { numeric: true, sensitivity: 'base' }));
+            return slot;
+        }).sort((a, c) => c.onHand - a.onHand);
+
+        return { success: true, bins: bins, isKit: isKit };
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  BIN CONSOLIDATION
+    //  - getFragmentedItems: items whose AVAILABLE stock sits in 2+
+    //    bins at a location, grouped per inventory status (statuses
+    //    are never merged).
+    //  - getConsolidationSerials: serials per bin for one item
+    //    (status-filtered) so the client can verify/move them.
+    //  - executeConsolidation: one Bin Transfer pulling from many
+    //    source bins into a single target. Re-validates against the
+    //    live balance at post time and skips whatever moved away.
+    // ═══════════════════════════════════════════════════════════
+    const getFragmentedItems = (params) => {
+        const locationId = params.locationId;
+        if (!locationId) return { success: false, message: 'Location is required.' };
+        const excludeRaw = (params.excludeBins || '').trim();
+        const excludePrefixes = excludeRaw
+            ? excludeRaw.split(',').map(s => s.trim().toUpperCase()).filter(Boolean)
+            : [];
+        const includeRaw = (params.includeBins || '').trim();
+        const includePrefixes = includeRaw
+            ? includeRaw.split(',').map(s => s.trim().toUpperCase()).filter(Boolean)
+            : [];
+        const itemFilter = (params.itemFilter || '').trim();
+        const binFilterRaw = (params.binFilter || '').trim();
+        const binFilterNames = binFilterRaw
+            ? binFilterRaw.split(',').map(s => s.trim().toUpperCase()).filter(Boolean)
+            : [];
+
+        const map = {}; // itemId|statusId -> { itemId, itemName, isSerialized, statusId, statusName, bins: {binId: {...}} }
+        try {
+            const filters = [
+                ['location', 'anyof', [locationId]], 'AND',
+                ['onhand', 'greaterthan', 0], 'AND',
+                ['item.isinactive', 'is', 'F']
+            ];
+            if (itemFilter) { filters.push('AND'); filters.push(['item.itemid', 'contains', itemFilter]); }
+            const srch = search.create({
+                type: 'inventorybalance',
+                filters: filters,
+                columns: [
+                    search.createColumn({ name: 'item',         summary: search.Summary.GROUP }),
+                    search.createColumn({ name: 'binnumber',    summary: search.Summary.GROUP }),
+                    search.createColumn({ name: 'status',       summary: search.Summary.GROUP }),
+                    search.createColumn({ name: 'isserialitem', join: 'item', summary: search.Summary.GROUP }),
+                    search.createColumn({ name: 'available',    summary: search.Summary.SUM })
+                ]
+            });
+            const paged = srch.runPaged({ pageSize: 1000 });
+            paged.pageRanges.forEach(pr => {
+                paged.fetch({ index: pr.index }).data.forEach(r => {
+                    const binId = String(r.getValue({ name: 'binnumber', summary: search.Summary.GROUP }) || '');
+                    if (!binId) return; // unbinned stock can't be bin-transferred
+                    const binName = r.getText({ name: 'binnumber', summary: search.Summary.GROUP }) || binId;
+                    const binUpper = binName.toUpperCase();
+                    if (includePrefixes.length && !includePrefixes.some(p => binUpper.indexOf(p) === 0)) return;
+                    if (excludePrefixes.length && excludePrefixes.some(p => binUpper.indexOf(p) === 0)) return;
+                    const qty = parseFloat(r.getValue({ name: 'available', summary: search.Summary.SUM })) || 0;
+                    if (qty <= 0) return; // fully committed pile -> not movable
+                    const itemId   = String(r.getValue({ name: 'item', summary: search.Summary.GROUP }));
+                    const itemName = r.getText({ name: 'item', summary: search.Summary.GROUP }) || itemId;
+                    const statusId   = String(r.getValue({ name: 'status', summary: search.Summary.GROUP }) || '');
+                    const statusName = r.getText({ name: 'status', summary: search.Summary.GROUP }) || '';
+                    const serialRaw = r.getValue({ name: 'isserialitem', join: 'item', summary: search.Summary.GROUP });
+                    const isSerialized = (serialRaw === true || serialRaw === 'T');
+                    const key = itemId + '|' + statusId;
+                    if (!map[key]) map[key] = { itemId: itemId, itemName: itemName, isSerialized: isSerialized, statusId: statusId, statusName: statusName, bins: {} };
+                    if (!map[key].bins[binId]) map[key].bins[binId] = { binId: binId, binName: binName, qty: 0 };
+                    map[key].bins[binId].qty += qty;
+                });
+            });
+        } catch (e) {
+            log.error('getFragmentedItems error', e.message + '\n' + e.stack);
+            return { success: false, message: 'Could not scan for scattered items: ' + e.message };
+        }
+
+        const items = [];
+        Object.keys(map).forEach(k => {
+            const entry = map[k];
+            const bins = Object.keys(entry.bins).map(b => entry.bins[b])
+                .sort((a, b) => (b.qty - a.qty) || a.binName.localeCompare(b.binName));
+            if (bins.length < 2) return;
+            // Exact-bin filter ("has stock in bin X"): the item must have a pile
+            // in one of the named bins, but ALL of its bins are returned so the
+            // user can consolidate into or out of that bin.
+            if (binFilterNames.length && !bins.some(b => binFilterNames.indexOf(b.binName.toUpperCase()) !== -1)) return;
+            items.push({
+                itemId: entry.itemId,
+                itemName: entry.itemName,
+                isSerialized: entry.isSerialized,
+                statusId: entry.statusId,
+                statusName: entry.statusName,
+                binCount: bins.length,
+                totalQty: bins.reduce((s, b) => s + b.qty, 0),
+                bins: bins
+            });
+        });
+        items.sort((a, b) => (b.binCount - a.binCount) || (b.totalQty - a.totalQty));
+        return { success: true, items: items, count: items.length };
+    };
+
+    const getConsolidationSerials = (params) => {
+        const itemId = params.itemId;
+        const locationId = params.locationId;
+        const statusId = params.statusId || '';
+        if (!itemId || !locationId) return { success: false, message: 'Item and location are required.' };
+
+        const filters = [
+            ['item', 'anyof', [itemId]], 'AND',
+            ['location', 'anyof', [locationId]], 'AND',
+            ['onhand', 'greaterthan', 0]
+        ];
+        if (statusId) { filters.push('AND'); filters.push(['status', 'anyof', [statusId]]); }
+
+        const binMap = {};
+        try {
+            const srch = search.create({
+                type: 'inventorybalance',
+                filters: filters,
+                columns: ['inventorynumber', 'binnumber', 'available', 'onhand']
+            });
+            const paged = srch.runPaged({ pageSize: 1000 });
+            paged.pageRanges.forEach(pr => {
+                paged.fetch({ index: pr.index }).data.forEach(r => {
+                    const serial = (r.getText({ name: 'inventorynumber' }) || '').trim();
+                    if (!serial) return; // non-serialized row
+                    const binId = String(r.getValue({ name: 'binnumber' }) || '');
+                    if (!binId) return;
+                    const binName = r.getText({ name: 'binnumber' }) || binId;
+                    const availRaw = r.getValue({ name: 'available' });
+                    const avail = parseFloat(availRaw);
+                    const availIsKnown = (availRaw !== '' && availRaw !== null && !isNaN(avail));
+                    if (availIsKnown) { if (avail <= 0) return; }
+                    else if ((parseFloat(r.getValue({ name: 'onhand' })) || 0) <= 0) return;
+                    if (!binMap[binId]) binMap[binId] = { binId: binId, binName: binName, serials: [] };
+                    if (binMap[binId].serials.indexOf(serial) === -1) binMap[binId].serials.push(serial);
+                });
+            });
+        } catch (e) {
+            log.error('getConsolidationSerials error', e.message);
+            return { success: false, message: 'Could not retrieve serials: ' + e.message };
+        }
+        // ── License plate awareness ──────────────────────────────
+        // Map serials to active LP records so the client can move whole
+        // plates via the LP transfer (keeping the plate record in sync)
+        // and warn when loose moves would leave a plate record stale.
+        const plates = []; // { plateId, plateName, serialList }
+        try {
+            search.create({
+                type: RECORD_TYPE,
+                filters: [
+                    ['custrecord_tq_license_place_item', 'anyof', [itemId]], 'AND',
+                    ['isinactive', 'is', 'F']
+                ],
+                columns: ['name', 'custrecord_tq_license_plate_serial_num']
+            }).run().each(r => {
+                const raw = r.getValue('custrecord_tq_license_plate_serial_num') || '';
+                const list = raw.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+                if (list.length) plates.push({ plateId: r.id, plateName: r.getValue('name') || ('Plate #' + r.id), serialList: list });
+                return true;
+            });
+        } catch (e) { log.debug('getConsolidationSerials: plate lookup failed', e.message); }
+
+        const bins = Object.keys(binMap).map(b => binMap[b]);
+        const serialToPlate = {};
+        plates.forEach(p => p.serialList.forEach(s => { if (!serialToPlate[s]) serialToPlate[s] = p; }));
+
+        // Where do each plate's IN-STOCK serials actually sit? Needed to tell
+        // a clean "whole plate in one bin" from a split/stale plate.
+        const plateSpread = {}; // plateId -> { bins: {binId:true}, inStock: n }
+        bins.forEach(b => {
+            b.serials.forEach(s => {
+                const p = serialToPlate[s];
+                if (!p) return;
+                if (!plateSpread[p.plateId]) plateSpread[p.plateId] = { bins: {}, inStock: 0 };
+                plateSpread[p.plateId].bins[b.binId] = true;
+                plateSpread[p.plateId].inStock++;
+            });
+        });
+
+        bins.forEach(b => {
+            const groups = {};
+            const loose = [];
+            b.serials.forEach(s => {
+                const p = serialToPlate[s];
+                if (!p) { loose.push(s); return; }
+                if (!groups[p.plateId]) groups[p.plateId] = { plateId: p.plateId, plateName: p.plateName, serials: [], plateSerialCount: p.serialList.length, whole: false };
+                groups[p.plateId].serials.push(s);
+            });
+            b.plates = Object.keys(groups).map(k => {
+                const g = groups[k];
+                const spread = plateSpread[g.plateId] || { bins: {}, inStock: 0 };
+                // "whole" = the plate's entire serial list is in stock, in THIS
+                // bin, and nowhere else. Anything less is a split/stale plate.
+                g.whole = (Object.keys(spread.bins).length === 1) && (g.serials.length === g.plateSerialCount);
+                return g;
+            });
+            b.looseSerials = loose;
+        });
+
+        return { success: true, bins: bins };
+    };
+
+    const executeConsolidation = (data) => {
+        if (!data.locationId) return { success: false, message: 'Location is required.' };
+        if (!data.toBinId)    return { success: false, message: 'Target bin is required.' };
+        if (!data.itemId)     return { success: false, message: 'Item is required.' };
+        const sources = (data.sources || []).filter(s => s && s.binId && String(s.binId) !== String(data.toBinId));
+        const plateMoves = (data.isSerialized ? (data.plates || []) : []).filter(p => p && p.plateId);
+        if (!sources.length && !plateMoves.length) return { success: false, message: 'No source bins to consolidate.' };
+
+        const skipped = [];
+        const plateLines = [];
+        let plateUnits = 0;
+        let movedUnits = 0;
+        let btId = null;
+        let btTranId = '';
+
+        // ── Whole license plates first ───────────────────────────
+        // Reuse the LP transfer so the plate record's bin stays in sync
+        // with the inventory move. One Bin Transfer per plate (that is
+        // how the LP module audits its moves).
+        plateMoves.forEach(p => {
+            const label = p.plateName || ('Plate #' + p.plateId);
+            try {
+                const res = executeBinTransfer({ plateId: p.plateId, destinationBinId: data.toBinId });
+                if (res.success) {
+                    plateLines.push(label + ' (' + res.tranId + ')');
+                    plateUnits += (res.serialCount || 0);
+                } else {
+                    skipped.push(label + ': ' + (res.message || 'plate transfer failed'));
+                }
+            } catch (e) {
+                skipped.push(label + ': ' + e.message);
+            }
+        });
+
+        // ── Loose inventory (serials not on a plate / non-serialized) ──
+        const hasLoose = sources.some(s => data.isSerialized
+            ? ((s.serials || []).length > 0)
+            : ((parseFloat(s.qty) || 0) > 0));
+
+        if (hasLoose) {
+            const bt = record.create({ type: record.Type.BIN_TRANSFER, isDynamic: true });
+            bt.setValue({ fieldId: 'subsidiary', value: '1' });
+            bt.setValue({ fieldId: 'location',   value: parseInt(data.locationId) });
+            bt.setValue({ fieldId: 'memo',       value: data.memo || ('Bin Consolidation -> ' + (data.toBinName || data.toBinId)) });
+
+            let lineCommitted = false;
+
+            if (data.isSerialized) {
+                // Re-validate against live balances: only move serials that are
+                // STILL sitting in the source bin they were planned from.
+                const fresh = getConsolidationSerials({ itemId: data.itemId, locationId: data.locationId, statusId: data.statusId || '' });
+                if (!fresh.success && !plateLines.length) return fresh;
+                const freshByBin = {};
+                ((fresh && fresh.bins) || []).forEach(b => {
+                    const set = {};
+                    b.serials.forEach(s => { set[String(s).trim()] = true; });
+                    freshByBin[String(b.binId)] = set;
+                });
+
+                const toMove = [];
+                sources.forEach(src => {
+                    const live = freshByBin[String(src.binId)] || {};
+                    (src.serials || []).forEach(sn => {
+                        const t = (sn || '').trim();
+                        if (!t) return;
+                        if (live[t]) { if (toMove.indexOf(t) === -1) toMove.push(t); }
+                        else skipped.push(t + ' (no longer in ' + (src.binName || src.binId) + ')');
+                    });
+                });
+
+                if (toMove.length) {
+                    bt.selectNewLine({ sublistId: 'inventory' });
+                    bt.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'item',     value: parseInt(data.itemId) });
+                    bt.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'quantity', value: toMove.length });
+                    const invDetail = bt.getCurrentSublistSubrecord({ sublistId: 'inventory', fieldId: 'inventorydetail' });
+                    toMove.forEach(s => {
+                        invDetail.selectNewLine({ sublistId: 'inventoryassignment' });
+                        invDetail.setCurrentSublistText({  sublistId: 'inventoryassignment', fieldId: 'issueinventorynumber', text: s });
+                        invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity',             value: 1 });
+                        invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'tobinnumber',          value: parseInt(data.toBinId) });
+                        invDetail.commitLine({ sublistId: 'inventoryassignment' });
+                    });
+                    bt.commitLine({ sublistId: 'inventory' });
+                    movedUnits = toMove.length;
+                    lineCommitted = true;
+                }
+            } else {
+                // Re-validate: fresh per-bin availability, clamp each requested qty.
+                const liveQty = {};
+                const filters = [
+                    ['item', 'anyof', [data.itemId]], 'AND',
+                    ['location', 'anyof', [data.locationId]], 'AND',
+                    ['onhand', 'greaterthan', 0]
+                ];
+                if (data.statusId) { filters.push('AND'); filters.push(['status', 'anyof', [data.statusId]]); }
+                try {
+                    const srch = search.create({
+                        type: 'inventorybalance',
+                        filters: filters,
+                        columns: [
+                            search.createColumn({ name: 'binnumber', summary: search.Summary.GROUP }),
+                            search.createColumn({ name: 'available', summary: search.Summary.SUM })
+                        ]
+                    });
+                    srch.run().each(r => {
+                        const binId = String(r.getValue({ name: 'binnumber', summary: search.Summary.GROUP }) || '');
+                        if (binId) liveQty[binId] = parseFloat(r.getValue({ name: 'available', summary: search.Summary.SUM })) || 0;
+                        return true;
+                    });
+                } catch (e) {
+                    return { success: false, message: 'Could not re-validate quantities: ' + e.message };
+                }
+
+                const lines = [];
+                sources.forEach(src => {
+                    const want = parseFloat(src.qty) || 0;
+                    const have = liveQty[String(src.binId)] || 0;
+                    const move = Math.min(want, have);
+                    if (move <= 0) { skipped.push((src.binName || src.binId) + ' (nothing available)'); return; }
+                    if (move < want) skipped.push((src.binName || src.binId) + ' (only ' + move + ' of ' + want + ' available)');
+                    lines.push({ binId: src.binId, qty: move });
+                });
+
+                if (lines.length) {
+                    const total = lines.reduce((s, l) => s + l.qty, 0);
+                    bt.selectNewLine({ sublistId: 'inventory' });
+                    bt.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'item',     value: parseInt(data.itemId) });
+                    bt.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'quantity', value: total });
+                    const invDetail = bt.getCurrentSublistSubrecord({ sublistId: 'inventory', fieldId: 'inventorydetail' });
+                    lines.forEach(l => {
+                        invDetail.selectNewLine({ sublistId: 'inventoryassignment' });
+                        invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity',    value: l.qty });
+                        invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber',   value: parseInt(l.binId) });
+                        invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'tobinnumber', value: parseInt(data.toBinId) });
+                        if (data.statusId) {
+                            invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'inventorystatus', value: parseInt(data.statusId) });
+                        }
+                        invDetail.commitLine({ sublistId: 'inventoryassignment' });
+                    });
+                    bt.commitLine({ sublistId: 'inventory' });
+                    movedUnits = total;
+                    lineCommitted = true;
+                }
+            }
+
+            if (lineCommitted) {
+                btId = bt.save({ enableSourcing: true, ignoreMandatoryFields: false });
+                btTranId = String(btId);
+                try {
+                    const lk = search.lookupFields({ type: record.Type.BIN_TRANSFER, id: btId, columns: ['tranid'] });
+                    btTranId = lk.tranid || String(btId);
+                } catch (e) { /* fall back to internal id */ }
+            }
+        }
+
+        if (!movedUnits && !plateLines.length) {
+            return { success: false, message: 'Nothing left to move - the source bins changed since loading. ' + (skipped.length ? 'Skipped: ' + skipped.join('; ') : '') };
+        }
+
+        const parts = [];
+        if (btTranId) parts.push('Bin transfer ' + btTranId + ' created (' + movedUnits + ' loose unit(s))');
+        if (plateLines.length) parts.push(plateLines.length + ' plate(s) moved: ' + plateLines.join(', '));
+        return {
+            success: true,
+            message: parts.join('. ') + '. Total ' + (movedUnits + plateUnits) + ' unit(s) consolidated into ' + (data.toBinName || 'the target bin') + '.' + (skipped.length ? ' Skipped: ' + skipped.join('; ') : ''),
+            transferId: btId,
+            tranId: btTranId,
+            movedUnits: movedUnits + plateUnits,
+            plates: plateLines,
+            skipped: skipped
+        };
+    };
+
     // ═══════════════════════════════════════════════════════════
     //  SHARED CLIENT-SIDE HELPER — duplicate-serial detection
     // ───────────────────────────────────────────────────────────
@@ -3525,6 +4310,7 @@ define([
         const RETURN_TO_VENDOR_STATUS_ID = 21;
         const NOT_COUNTED_BIN_ID = 4278;
         const NOT_COUNTED_STATUS_ID = 14;
+        const AMAZON_PICK_BIN_ID = 4809;
 
         // ====================================================================
         // UTILITY FUNCTIONS
@@ -5415,8 +6201,52 @@ define([
                     }
 
                     function clearForm() {
-                        if (currentMode === 'serialized') { var f = document.getElementById('custpage_serial_numbers'); if (f) f.value = ''; updateCount(); }
+                        if (currentMode === 'serialized') { var f = document.getElementById('custpage_serial_numbers'); if (f) f.value = ''; updateCount(); whClearStockMsg(); }
                         else if (currentMode === 'nonserialized') { clearNsGrid(); }
+                    }
+
+                    // ── Live "not in stock" check (serialized) ──────────────
+                    // As serials are scanned/typed we ask the server which ones are
+                    // NOT on hand and surface them immediately, instead of waiting
+                    // for Submit to bounce back with a "Not found" block.
+                    var _whStockTimer = null;
+                    var _whLastStockSig = '';
+                    function _whEsc(s){ return String(s==null?'':s).replace(/[&<>"']/g,function(c){return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c];}); }
+                    function whClearStockMsg() {
+                        var m = document.getElementById('wh_serial_stock_msg');
+                        if (m) { m.classList.remove('show'); m.innerHTML = ''; }
+                        _whLastStockSig = '';
+                    }
+                    function whScheduleStockCheck() {
+                        if (_whStockTimer) clearTimeout(_whStockTimer);
+                        _whStockTimer = setTimeout(whCheckSerialsInStock, 400);
+                    }
+                    async function whCheckSerialsInStock() {
+                        var field = document.getElementById('custpage_serial_numbers');
+                        var msgEl = document.getElementById('wh_serial_stock_msg');
+                        if (!field || !msgEl) return;
+                        var raw = field.value || '';
+                        var serials = raw.split(/[\\r\\n]+/).map(function(s){return s.trim();}).filter(Boolean);
+                        if (!serials.length) { whClearStockMsg(); return; }
+                        var data;
+                        try {
+                            var resp = await fetch(nsBinsApiUrl + '&action=validateSerialsExist&serials=' + encodeURIComponent(raw));
+                            data = await resp.json();
+                        } catch (e) { return; } // live hint only — never block on a transient error
+                        // Stale guard: textarea changed since the request fired.
+                        var now = document.getElementById('custpage_serial_numbers');
+                        if (!now || (now.value || '') !== raw) return;
+                        if (!data || !data.success) return;
+                        var invalid = data.invalid || [];
+                        if (!invalid.length) { whClearStockMsg(); return; }
+                        msgEl.innerHTML = '<span class="icon">\u26D4</span>Not in stock: ' + invalid.map(_whEsc).join(', ');
+                        msgEl.classList.add('show');
+                        var sig = invalid.join('|').toUpperCase();
+                        if (sig !== _whLastStockSig) {
+                            _whLastStockSig = sig;
+                            // brief re-trigger of the shake animation on a changed set
+                            msgEl.style.animation = 'none'; void msgEl.offsetWidth; msgEl.style.animation = '';
+                        }
                     }
 
                     document.addEventListener('DOMContentLoaded', function() {
@@ -5426,7 +6256,8 @@ define([
                         var field = document.getElementById('custpage_serial_numbers');
                         if (field) {
                             field.addEventListener('input', updateCount);
-                            field.addEventListener('paste', function() { setTimeout(updateCount, 50); });
+                            field.addEventListener('input', whScheduleStockCheck);
+                            field.addEventListener('paste', function() { setTimeout(updateCount, 50); setTimeout(whScheduleStockCheck, 60); });
                             field.focus();
                         }
                     });
@@ -5675,6 +6506,7 @@ define([
                                     <label class="custom-label">Serial Numbers <span class="badge-count"><span id="serial_count">0</span> scanned</span></label>
                                     <div id="serial-field-wrap"></div>
                                     <div class="serial-dupe-msg" id="wh_serial_dupe_msg"></div>
+                                    <div class="serial-dupe-msg" id="wh_serial_stock_msg"></div>
                                 </div>
                             </div>
 
@@ -7674,6 +8506,26 @@ define([
                     return { success: false, message: invalidMsg, failed: (serialData.invalid || []) };
                 }
 
+                // Reject serials that already live in the destination bin so
+                // the operator sees exactly which scans to fix, instead of a
+                // generic "from bin / to bin must be different" save error.
+                var sameBin = [];
+                var keepValid = [];
+                serialData.valid.forEach(function(s) {
+                    if (s.binId && String(s.binId) === String(toBin.id)) sameBin.push(s.serialNumber);
+                    else keepValid.push(s);
+                });
+                if (sameBin.length > 0) {
+                    return {
+                        success: false,
+                        message: sameBin.length + ' serial(s) already in ' + (toBin.name || toBinNumber) + ' — remove or rescan them.',
+                        sameBin: sameBin,
+                        toBinName: toBin.name || toBinNumber,
+                        failed: (serialData.invalid || [])
+                    };
+                }
+                serialData.valid = keepValid;
+
                 var groupMap = {};
                 serialData.valid.forEach(function(s) {
                     var key = s.itemId + '_' + s.locationId;
@@ -7735,6 +8587,7 @@ define([
 
                 var locationId = '1';
                 var errors = [];
+                var sameBinRows = [];
                 var transferRows = [];
                 var itemCache = {}, binCache = {};
 
@@ -7750,6 +8603,12 @@ define([
                     if (!binCache[fromBinNumber]) { var fb = findBinByNumber(fromBinNumber, locationId); if (fb) binCache[fromBinNumber] = fb; else { errors.push(rowLabel + ': from bin not found "' + fromBinNumber + '"'); return; } }
                     if (!binCache[toBinNumber]) { var tb = findBinByNumber(toBinNumber, locationId); if (tb) binCache[toBinNumber] = tb; else { errors.push(rowLabel + ': to bin not found "' + toBinNumber + '"'); return; } }
 
+                    if (String(binCache[fromBinNumber].id) === String(binCache[toBinNumber].id)) {
+                        sameBinRows.push(idx);
+                        errors.push(rowLabel + ': from-bin and to-bin are the same (' + (binCache[toBinNumber].name || toBinNumber) + ')');
+                        return;
+                    }
+
                     transferRows.push({
                         itemId: itemCache[itemName].id, itemText: itemCache[itemName].displayname || itemCache[itemName].itemid,
                         description: itemCache[itemName].description, locationId: locationId, quantity: quantity,
@@ -7758,6 +8617,14 @@ define([
                     });
                 });
 
+                if (sameBinRows.length > 0) {
+                    return {
+                        success: false,
+                        message: sameBinRows.length + ' row(s) have the same from-bin and to-bin — fix the highlighted row(s).',
+                        sameBinRows: sameBinRows,
+                        errors: errors
+                    };
+                }
                 if (transferRows.length === 0) return { success: false, message: errors.length > 0 ? 'Errors: ' + errors.join('; ') : 'No valid items.', errors: errors };
 
                 var r = createNonSerializedBinTransferMulti(transferRows, 'Bin Putaway via WH Assistant');
@@ -7773,6 +8640,182 @@ define([
             } catch (e) {
                 log.error('apiBinPutawayNonSerialized', e.message + '\n' + (e.stack || ''));
                 return { success: false, message: 'Bin putaway failed: ' + e.message };
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        //  PICK AMAZON SHIPMENTS — JSON endpoints for the native SPA view
+        //  Mirrors Bin Putaway, but the destination bin is locked to
+        //  AMAZON_PICK_BIN_ID. An optional toStatusId overrides the destination
+        //  inventory status; when empty, serialized preserves each serial's
+        //  current status and non-serialized lets NetSuite source it.
+        // ═══════════════════════════════════════════════════════════════
+        function apiPickAmazonSerialized(body) {
+            try {
+                body = body || {};
+                var serialsRaw = body.serials;
+                if (Array.isArray(serialsRaw)) serialsRaw = serialsRaw.join('\n');
+                serialsRaw = serialsRaw || '';
+                var toStatusId = (body.toStatusId != null ? String(body.toStatusId) : '').trim();
+
+                var serialTexts = cleanSerialInput(serialsRaw);
+                if (serialTexts.length === 0) return { success: false, message: 'Enter or scan at least one serial number.' };
+
+                var toBinName = '';
+                try {
+                    var binLk = search.lookupFields({ type: 'bin', id: AMAZON_PICK_BIN_ID, columns: ['binnumber'] });
+                    toBinName = binLk.binnumber || String(AMAZON_PICK_BIN_ID);
+                } catch (e) { toBinName = String(AMAZON_PICK_BIN_ID); }
+
+                var serialData = lookupSerialDetails(serialTexts);
+                if (serialData.valid.length === 0) {
+                    var invalidMsg = serialData.invalid.length > 0 ? 'Not found: ' + serialData.invalid.join(', ') : 'None of the serials were found in stock.';
+                    return { success: false, message: invalidMsg, failed: (serialData.invalid || []) };
+                }
+
+                // Reject serials already sitting in the Amazon pick bin so the
+                // operator can spot and rescan the bad ones instead of getting
+                // a generic Bin Transfer save error.
+                var sameBin = [];
+                var keepValid = [];
+                serialData.valid.forEach(function(s) {
+                    if (s.binId && String(s.binId) === String(AMAZON_PICK_BIN_ID)) sameBin.push(s.serialNumber);
+                    else keepValid.push(s);
+                });
+                if (sameBin.length > 0) {
+                    return {
+                        success: false,
+                        message: sameBin.length + ' serial(s) already in ' + toBinName + ' — remove or rescan them.',
+                        sameBin: sameBin,
+                        toBinName: toBinName,
+                        failed: (serialData.invalid || [])
+                    };
+                }
+                serialData.valid = keepValid;
+
+                var groupMap = {};
+                serialData.valid.forEach(function(s) {
+                    var key = s.itemId + '_' + s.locationId;
+                    if (!groupMap[key]) groupMap[key] = { itemId: s.itemId, itemText: s.itemText, locationId: s.locationId, serials: [] };
+                    groupMap[key].serials.push({ serialNumber: s.serialNumber, serialId: s.serialId, binId: s.binId, statusId: s.statusId });
+                });
+                var groups = Object.keys(groupMap).map(function(k) { return groupMap[k]; });
+
+                var transferRecord = record.create({ type: record.Type.BIN_TRANSFER, isDynamic: true });
+                transferRecord.setValue({ fieldId: 'subsidiary', value: '1' });
+                transferRecord.setValue({ fieldId: 'memo', value: 'Pick Amazon Shipment via WH Assistant' });
+                if (groups.length > 0) transferRecord.setValue({ fieldId: 'location', value: groups[0].locationId });
+
+                groups.forEach(function(group) {
+                    transferRecord.selectNewLine({ sublistId: 'inventory' });
+                    transferRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'item', value: group.itemId });
+                    transferRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'quantity', value: group.serials.length });
+                    var invDetail = transferRecord.getCurrentSublistSubrecord({ sublistId: 'inventory', fieldId: 'inventorydetail' });
+                    group.serials.forEach(function(serial) {
+                        invDetail.selectNewLine({ sublistId: 'inventoryassignment' });
+                        invDetail.setCurrentSublistText({ sublistId: 'inventoryassignment', fieldId: 'issueinventorynumber', text: serial.serialNumber });
+                        invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity', value: 1 });
+                        if (serial.binId) invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', value: serial.binId });
+                        invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'tobinnumber', value: AMAZON_PICK_BIN_ID });
+                        var destStatus = toStatusId || serial.statusId || '';
+                        if (destStatus) {
+                            invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'toinventorystatus', value: parseInt(destStatus) });
+                        }
+                        invDetail.commitLine({ sublistId: 'inventoryassignment' });
+                    });
+                    transferRecord.commitLine({ sublistId: 'inventory' });
+                });
+
+                var transferId = transferRecord.save({ enableSourcing: true, ignoreMandatoryFields: false });
+                var tranId = String(transferId);
+                try { var l = search.lookupFields({ type: record.Type.BIN_TRANSFER, id: transferId, columns: ['tranid'] }); tranId = l.tranid || String(transferId); } catch (e) {}
+
+                var labelGroups = groups.map(function(g) {
+                    return { itemId: g.itemId, itemText: g.itemText, description: '', action: 'pick_amazon', serialNumbers: g.serials.map(function(s) { return s.serialNumber; }) };
+                });
+                var totalSerials = groups.reduce(function(sum, g) { return sum + g.serials.length; }, 0);
+
+                return {
+                    success: true,
+                    tranId: tranId,
+                    toBinName: toBinName,
+                    labelGroups: labelGroups,
+                    failed: (serialData.invalid || []),
+                    message: 'Picked ' + totalSerials + ' serial(s) into ' + toBinName + '.'
+                };
+            } catch (e) {
+                log.error('apiPickAmazonSerialized', e.message + '\n' + (e.stack || ''));
+                return { success: false, message: 'Pick Amazon failed: ' + e.message };
+            }
+        }
+
+        function apiPickAmazonNonSerialized(body) {
+            try {
+                body = body || {};
+                var cartRows = body.rows || body.cartRows || [];
+                if (!cartRows.length) return { success: false, message: 'No items in the grid.' };
+                var toStatusId = (body.toStatusId != null ? String(body.toStatusId) : '').trim();
+
+                var locationId = '1';
+                var errors = [];
+                var sameBinRows = [];
+                var transferRows = [];
+                var itemCache = {}, binCache = {};
+
+                var amazonBinName = '';
+                try {
+                    var amzLk = search.lookupFields({ type: 'bin', id: AMAZON_PICK_BIN_ID, columns: ['binnumber'] });
+                    amazonBinName = amzLk.binnumber || String(AMAZON_PICK_BIN_ID);
+                } catch (e) { amazonBinName = String(AMAZON_PICK_BIN_ID); }
+
+                cartRows.forEach(function(row, idx) {
+                    var itemName = (row.itemName || '').trim();
+                    var fromBinNumber = (row.fromBinNumber || '').trim();
+                    var quantity = parseInt(row.quantity, 10) || 0;
+                    var rowLabel = 'Row ' + (idx + 1);
+
+                    if (!itemName || !fromBinNumber || quantity <= 0) { errors.push(rowLabel + ': missing fields'); return; }
+                    if (!itemCache[itemName]) { var it = findItemByName(itemName); if (it) itemCache[itemName] = it; else { errors.push(rowLabel + ': item not found "' + itemName + '"'); return; } }
+                    if (!binCache[fromBinNumber]) { var fb = findBinByNumber(fromBinNumber, locationId); if (fb) binCache[fromBinNumber] = fb; else { errors.push(rowLabel + ': from bin not found "' + fromBinNumber + '"'); return; } }
+
+                    if (String(binCache[fromBinNumber].id) === String(AMAZON_PICK_BIN_ID)) {
+                        sameBinRows.push(idx);
+                        errors.push(rowLabel + ': from-bin is already the Amazon pick bin (' + amazonBinName + ')');
+                        return;
+                    }
+
+                    transferRows.push({
+                        itemId: itemCache[itemName].id, itemText: itemCache[itemName].displayname || itemCache[itemName].itemid,
+                        description: itemCache[itemName].description, locationId: locationId, quantity: quantity,
+                        fromBinId: binCache[fromBinNumber].id, toBinId: AMAZON_PICK_BIN_ID,
+                        toStatusId: (toStatusId ? parseInt(toStatusId) : null), action: 'pick_amazon'
+                    });
+                });
+
+                if (sameBinRows.length > 0) {
+                    return {
+                        success: false,
+                        message: sameBinRows.length + ' row(s) already source from ' + amazonBinName + ' — fix the highlighted row(s).',
+                        sameBinRows: sameBinRows,
+                        toBinName: amazonBinName,
+                        errors: errors
+                    };
+                }
+                if (transferRows.length === 0) return { success: false, message: errors.length > 0 ? 'Errors: ' + errors.join('; ') : 'No valid items.', errors: errors };
+
+                var r = createNonSerializedBinTransferMulti(transferRows, 'Pick Amazon Shipment via WH Assistant');
+                var processedItems = transferRows.map(function(row) { return { itemText: row.itemText, description: row.description, quantity: row.quantity, action: 'pick_amazon' }; });
+
+                return {
+                    success: true,
+                    tranId: r.tranId,
+                    processedItems: processedItems,
+                    errors: errors,
+                    message: 'Bin transfer ' + (r.tranId || '') + ' created — ' + processedItems.length + ' item(s) moved.'
+                };
+            } catch (e) {
+                log.error('apiPickAmazonNonSerialized', e.message + '\n' + (e.stack || ''));
+                return { success: false, message: 'Pick Amazon failed: ' + e.message };
             }
         }
 
@@ -8148,6 +9191,20 @@ define([
                     </div>
                 </div>
             </div>
+
+            <!-- Serial copy popup (Item Lookup) -->
+            <div class="il-modal-overlay" id="il-serial-modal" onclick="if(event.target===this)ilCloseSerialModal()">
+                <div class="il-modal" role="dialog" aria-modal="true" aria-labelledby="il-modal-title">
+                    <div class="il-modal-head">
+                        <div style="min-width:0;">
+                            <div class="il-modal-title" id="il-modal-title">Serials</div>
+                            <div class="il-modal-sub" id="il-modal-sub"></div>
+                        </div>
+                        <button type="button" class="il-modal-x" onclick="ilCloseSerialModal()" aria-label="Close">&times;</button>
+                    </div>
+                    <div class="il-modal-body" id="il-modal-body"></div>
+                </div>
+            </div>
         `;
 
         const scriptField = form.addField({ id: 'custpage_il_script', type: serverWidget.FieldType.INLINEHTML, label: ' ' });
@@ -8255,10 +9312,89 @@ define([
                         border-bottom:1px solid #f1f3f5; flex-wrap:wrap; gap:6px;
                     }
                 }
+
+                /* ── Serial popup (copy reference) ───────────────────────── */
+                .il-serbtn {
+                    background:#eef4fb; color:#1e5fad; border:1px solid #cfe0f3;
+                    border-radius:8px; padding:5px 10px; font-size:12px; font-weight:700;
+                    cursor:pointer; white-space:nowrap; transition:all .15s;
+                }
+                .il-serbtn:hover { background:#1e5fad; color:#fff; border-color:#1e5fad; }
+                .il-sernone { color:#cbd2da; }
+                .il-serloading { color:#9aa3ad; font-style:italic; }
+                .il-copyall {
+                    background:#0D1F4E; color:#fff; border:none; border-radius:8px;
+                    padding:6px 12px; font-size:12px; font-weight:700; cursor:pointer;
+                    white-space:nowrap; transition:filter .15s;
+                }
+                .il-copyall:hover { filter:brightness(1.18); }
+                .il-copyall.il-copied { background:#2A9D58; }
+
+                .il-modal-overlay {
+                    position:fixed; inset:0; background:rgba(13,31,78,.45);
+                    display:none; align-items:center; justify-content:center;
+                    padding:16px; z-index:9999;
+                }
+                .il-modal-overlay.open { display:flex; }
+                .il-modal {
+                    background:#fff; border-radius:14px; width:100%; max-width:460px;
+                    max-height:85vh; display:flex; flex-direction:column; overflow:hidden;
+                    box-shadow:0 18px 50px rgba(13,31,78,.35);
+                }
+                .il-modal-head {
+                    display:flex; align-items:flex-start; justify-content:space-between; gap:10px;
+                    padding:16px 18px; border-bottom:1px solid #eef1f5;
+                }
+                .il-modal-title { font-size:16px; font-weight:800; color:#0D1F4E; word-break:break-all; }
+                .il-modal-sub { font-size:12px; color:#6b7280; margin-top:2px; }
+                .il-modal-x {
+                    background:transparent; border:none; font-size:26px; line-height:1;
+                    color:#9aa3ad; cursor:pointer; padding:0 4px; flex-shrink:0;
+                }
+                .il-modal-x:hover { color:#374151; }
+                .il-modal-body { padding:14px 18px 18px; overflow-y:auto; }
+                .il-modal-tools { display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-bottom:10px; }
+                .il-modal-copyall { padding:8px 14px !important; font-size:13px !important; }
+                .il-modal-copyall.il-copied { background:#2A9D58 !important; border-color:#2A9D58 !important; }
+                .il-modal-hint { font-size:11px; color:#9aa3ad; }
+                .il-sn-list { border:1px solid #e5e7eb; border-radius:10px; overflow:hidden; }
+                .il-sn-row {
+                    display:flex; align-items:center; justify-content:space-between; gap:10px;
+                    padding:9px 12px; border-bottom:1px solid #f1f3f5; cursor:pointer;
+                    font-family:monospace; transition:background .12s;
+                }
+                .il-sn-row:last-child { border-bottom:none; }
+                .il-sn-row:hover { background:#f3f8fe; }
+                .il-sn-row.il-copied { background:#e7f6ee; }
+                .il-sn { font-size:13px; color:#111827; font-weight:600; word-break:break-all; }
+                .il-sn-qty { color:#6b7280; font-weight:600; margin-left:6px; }
+                .il-sn-right { display:flex; align-items:center; gap:8px; flex-shrink:0; }
+                .il-sn-committed {
+                    font-family:inherit; font-size:10px; font-weight:700; text-transform:uppercase;
+                    letter-spacing:.3px; color:#92400e; background:#fef3c7; border-radius:8px; padding:2px 7px;
+                }
+                .il-sn-copy { color:#9aa3ad; font-size:14px; }
+                .il-sn-row:hover .il-sn-copy { color:#1e5fad; }
+                .il-modal-plainwrap { margin-top:14px; }
+                .il-modal-plainlabel { font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.3px; color:#9aa3ad; margin-bottom:5px; }
+                .il-sn-textarea {
+                    width:100%; min-height:84px; resize:vertical; box-sizing:border-box;
+                    border:1px solid #d1d5db; border-radius:10px; padding:10px 12px;
+                    font-family:monospace; font-size:12px; color:#111827; background:#f9fafb;
+                }
+                .il-toast {
+                    position:fixed; left:50%; bottom:22px; transform:translateX(-50%) translateY(20px);
+                    background:#0D1F4E; color:#fff; padding:11px 18px; border-radius:10px;
+                    font-size:13px; font-weight:600; box-shadow:0 8px 24px rgba(13,31,78,.35);
+                    opacity:0; pointer-events:none; transition:opacity .2s, transform .2s; z-index:10000;
+                }
+                .il-toast.show { opacity:1; transform:translateX(-50%) translateY(0); }
+                @media screen and (max-width:768px) { .il-modal { max-width:100%; } }
             </style>
             <script>
                 var ilApiUrl = '${(suiteletUrl || '').replace(/'/g, "\\\\'")}';
                 var ilMode = 'item';
+                var ilModalBins = [];   // serial-bearing bins for the currently rendered item card
 
                 function ilSetMode(mode) {
                     ilMode = mode;
@@ -8311,6 +9447,7 @@ define([
                     document.getElementById('il-serial-input').value = '';
                     document.getElementById('il_serial_count').textContent = '0';
                     document.getElementById('il-results').innerHTML = '';
+                    ilCloseSerialModal();
                     var msgEl = document.getElementById('il_serial_dupe_msg');
                     if (msgEl) msgEl.classList.remove('show');
                     var f = (ilMode === 'item') ? document.getElementById('il-item-input') : document.getElementById('il-serial-input');
@@ -8327,6 +9464,7 @@ define([
                     var results = document.getElementById('il-results');
                     var sku = (input.value || '').trim();
                     if (!sku) { input.focus(); return; }
+                    ilCloseSerialModal();
                     results.innerHTML = '<div class="il-loading">Looking up\u2026</div>';
                     try {
                         // Resolve SKU -> itemId via existing getItems endpoint
@@ -8352,7 +9490,23 @@ define([
                             results.innerHTML = '<div class="il-error">' + _ilEsc(binData.message || 'Error loading inventory.') + '</div>';
                             return;
                         }
-                        results.innerHTML = _ilRenderItemCard(match, binData.results || []);
+                        var bins = binData.results || [];
+                        // Paint the bin table immediately (serials = undefined -> "loading").
+                        results.innerHTML = _ilRenderItemCard(match, bins, undefined);
+                        // Then pull the on-hand serials per bin and re-render with copy buttons.
+                        try {
+                            var sResp = await fetch(ilApiUrl + '&action=getItemBinSerials&itemId=' + encodeURIComponent(match.id) + '&locationId=1');
+                            var sData = await sResp.json();
+                            var serialMap = null;
+                            if (sData && sData.success) {
+                                serialMap = {};
+                                (sData.bins || []).forEach(function(b) { serialMap[b.bin] = b; });
+                            }
+                            results.innerHTML = _ilRenderItemCard(match, bins, serialMap);
+                        } catch (se) {
+                            // Serial lookup failed — keep the bin table without serials.
+                            results.innerHTML = _ilRenderItemCard(match, bins, null);
+                        }
                     } catch (e) {
                         results.innerHTML = '<div class="il-error">Error: ' + _ilEsc(e.message) + '</div>';
                     }
@@ -8391,31 +9545,184 @@ define([
                     }
                 }
 
-                function _ilRenderItemCard(itemMeta, bins) {
+                function _ilRenderItemCard(itemMeta, bins, serialMap) {
                     var totalOH = bins.reduce(function(a, b) { return a + (b.qtyOH || 0); }, 0);
                     var totalAv = bins.reduce(function(a, b) { return a + (b.qtyAvail || 0); }, 0);
                     bins = bins.slice().sort(function(a, b) { return (b.qtyOH || 0) - (a.qtyOH || 0); });
+
+                    // serialMap: undefined = still loading, null = none/failed, object = ready
+                    var serialsLoading = (typeof serialMap === 'undefined');
+                    var serialMapObj = (serialMap && typeof serialMap === 'object') ? serialMap : null;
+                    var hasAnySerials = false, totalSerials = 0;
+                    if (serialMapObj) {
+                        bins.forEach(function(b) {
+                            var sb = serialMapObj[b.bin];
+                            if (sb && sb.serials && sb.serials.length) { hasAnySerials = true; totalSerials += sb.serials.length; }
+                        });
+                    }
+                    var showSerialCol = !!serialMapObj && hasAnySerials;
+                    var loadingNote = serialsLoading ? ' <span class="il-serloading">loading serials\u2026</span>' : '';
+                    var copyAllBtn = showSerialCol
+                        ? '<button type="button" class="il-copyall" onclick="ilCopyAllSerials(this)">\u29C9 Copy all ' + totalSerials + ' serials</button>'
+                        : '';
+
                     var head = '<div class="il-card"><div class="il-card-head">'
-                             + '<div><div class="il-card-title">' + _ilEsc(itemMeta.name) + (itemMeta.display && itemMeta.display !== itemMeta.name ? ' \u2014 ' + _ilEsc(itemMeta.display) : '') + '</div>'
-                             + '<div class="il-card-sub">Across ' + bins.length + ' bin' + (bins.length === 1 ? '' : 's') + '</div></div>'
+                             + '<div style="min-width:0;"><div class="il-card-title">' + _ilEsc(itemMeta.name) + (itemMeta.display && itemMeta.display !== itemMeta.name ? ' \u2014 ' + _ilEsc(itemMeta.display) : '') + '</div>'
+                             + '<div class="il-card-sub">Across ' + bins.length + ' bin' + (bins.length === 1 ? '' : 's') + loadingNote + '</div></div>'
+                             + '<div style="display:flex;flex-direction:column;align-items:flex-end;gap:6px;">'
                              + '<div class="il-card-total">' + totalOH + ' OH \u00b7 ' + totalAv + ' Avail</div>'
-                             + '</div>';
+                             + copyAllBtn
+                             + '</div></div>';
                     if (!bins.length) {
                         return head + '<div class="il-empty">No bin inventory for this item.</div></div>';
                     }
+
+                    ilModalBins = [];
                     var rows = bins.map(function(b, idx) {
                         var badge = idx === 0 && bins.length > 1 ? '<span class="il-badge largest">LARGEST PILE</span>' : '';
+                        var serialCell = '';
+                        if (showSerialCol) {
+                            var sb = serialMapObj[b.bin];
+                            if (sb && sb.serials && sb.serials.length) {
+                                var bi = ilModalBins.length;
+                                ilModalBins.push(sb);
+                                serialCell = '<td data-label="Serials" style="text-align:right;"><button type="button" class="il-serbtn" onclick="ilShowBinSerials(' + bi + ')">View ' + sb.serials.length + '</button></td>';
+                            } else {
+                                serialCell = '<td data-label="Serials" style="text-align:right;"><span class="il-sernone">\u2014</span></td>';
+                            }
+                        }
                         return '<tr>'
                              + '<td class="il-bin-name" data-label="Bin">' + _ilEsc(b.bin) + badge + '</td>'
                              + '<td data-label="On Hand" style="text-align:right;font-weight:700;">' + b.qtyOH + '</td>'
                              + '<td data-label="Avail" style="text-align:right;color:#6b7280;">' + b.qtyAvail + '</td>'
+                             + serialCell
                              + '</tr>';
                     }).join('');
+
+                    var serialTh = showSerialCol ? '<th style="text-align:right;">Serials</th>' : '';
                     return head
                          + '<table class="il-bin-table">'
-                         + '<thead><tr><th>Bin</th><th style="text-align:right;">On Hand</th><th style="text-align:right;">Available</th></tr></thead>'
+                         + '<thead><tr><th>Bin</th><th style="text-align:right;">On Hand</th><th style="text-align:right;">Available</th>' + serialTh + '</tr></thead>'
                          + '<tbody>' + rows + '</tbody>'
                          + '</table></div>';
+                }
+
+                // ── Serial popup + copy helpers ───────────────────────────────
+                function ilShowBinSerials(idx) {
+                    var sb = ilModalBins[idx];
+                    if (!sb) return;
+                    var overlay = document.getElementById('il-serial-modal');
+                    var titleEl = document.getElementById('il-modal-title');
+                    var subEl   = document.getElementById('il-modal-sub');
+                    var bodyEl  = document.getElementById('il-modal-body');
+                    if (!overlay || !bodyEl) return;
+                    var serials = sb.serials || [];
+                    var oh = (sb.onHand != null) ? sb.onHand : serials.length;
+                    var av = (sb.available != null) ? sb.available : oh;
+
+                    titleEl.textContent = 'Bin ' + sb.bin;
+                    var sub = serials.length + ' serial' + (serials.length === 1 ? '' : 's') + ' \u00b7 ' + oh + ' on hand';
+                    if (av !== oh) sub += ' \u00b7 ' + av + ' available';
+                    subEl.textContent = sub;
+
+                    var plain = serials.map(function(s) { return s.sn; }).join('\\n');
+                    var listHtml = serials.map(function(s, i) {
+                        var committed = s.avail ? '' : '<span class="il-sn-committed" title="Committed / reserved \u2014 not free to pick">committed</span>';
+                        var qty = (s.qty && s.qty > 1) ? '<span class="il-sn-qty">\u00d7' + s.qty + '</span>' : '';
+                        return '<div class="il-sn-row" title="Click to copy" onclick="ilCopySerial(' + idx + ',' + i + ',this)">'
+                             + '<span class="il-sn">' + _ilEsc(s.sn) + qty + '</span>'
+                             + '<span class="il-sn-right">' + committed + '<span class="il-sn-copy">\u29C9</span></span>'
+                             + '</div>';
+                    }).join('');
+
+                    bodyEl.innerHTML =
+                        '<div class="il-modal-tools">'
+                        + '<button type="button" class="custom-btn btn-success il-modal-copyall" onclick="ilCopyBinAll(' + idx + ',this)">\u29C9 Copy all ' + serials.length + '</button>'
+                        + '<span class="il-modal-hint">Tap a serial to copy just that one</span>'
+                        + '</div>'
+                        + '<div class="il-sn-list">' + (listHtml || '<div class="il-empty">No serials.</div>') + '</div>'
+                        + '<div class="il-modal-plainwrap"><div class="il-modal-plainlabel">Plain list (select all \u2192 copy)</div>'
+                        + '<textarea class="il-sn-textarea" readonly onclick="this.select()">' + _ilEsc(plain) + '</textarea></div>';
+
+                    overlay.classList.add('open');
+                }
+
+                function ilCloseSerialModal() {
+                    var o = document.getElementById('il-serial-modal');
+                    if (o) o.classList.remove('open');
+                }
+
+                function ilCopySerial(bi, si, el) {
+                    var sb = ilModalBins[bi];
+                    if (!sb || !sb.serials || !sb.serials[si]) return;
+                    ilCopyText(sb.serials[si].sn, el, 'Copied');
+                }
+
+                function ilCopyBinAll(bi, el) {
+                    var sb = ilModalBins[bi];
+                    if (!sb || !sb.serials) return;
+                    var txt = sb.serials.map(function(s) { return s.sn; }).join('\\n');
+                    ilCopyText(txt, el, '\u2713 Copied ' + sb.serials.length);
+                }
+
+                function ilCopyAllSerials(el) {
+                    var all = [];
+                    ilModalBins.forEach(function(sb) {
+                        (sb.serials || []).forEach(function(s) { all.push(s.sn); });
+                    });
+                    if (!all.length) return;
+                    ilCopyText(all.join('\\n'), el, '\u2713 Copied ' + all.length);
+                }
+
+                function _ilFallbackCopy(text) {
+                    try {
+                        var ta = document.createElement('textarea');
+                        ta.value = text;
+                        ta.style.position = 'fixed';
+                        ta.style.top = '-2000px';
+                        ta.style.left = '-2000px';
+                        ta.setAttribute('readonly', 'readonly');
+                        document.body.appendChild(ta);
+                        ta.focus();
+                        ta.select();
+                        var ok = false;
+                        try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+                        document.body.removeChild(ta);
+                        return ok;
+                    } catch (e) { return false; }
+                }
+
+                function ilCopyText(text, el, okLabel) {
+                    function feedback(ok) {
+                        if (el) {
+                            if (!el.hasAttribute('data-orig')) el.setAttribute('data-orig', el.innerHTML);
+                            el.innerHTML = ok ? (okLabel || '\u2713 Copied') : 'Press Ctrl+C';
+                            el.classList.add('il-copied');
+                            setTimeout(function() {
+                                if (el.hasAttribute('data-orig')) { el.innerHTML = el.getAttribute('data-orig'); el.removeAttribute('data-orig'); }
+                                el.classList.remove('il-copied');
+                            }, 1300);
+                        }
+                        ilToast(ok ? 'Copied to clipboard' : 'Copy failed \u2014 use the text box below');
+                    }
+                    try {
+                        if (navigator.clipboard && navigator.clipboard.writeText) {
+                            navigator.clipboard.writeText(text).then(function() { feedback(true); }, function() { feedback(_ilFallbackCopy(text)); });
+                        } else {
+                            feedback(_ilFallbackCopy(text));
+                        }
+                    } catch (e) {
+                        feedback(_ilFallbackCopy(text));
+                    }
+                }
+
+                function ilToast(msg) {
+                    var t = document.getElementById('il-toast');
+                    if (!t) { t = document.createElement('div'); t.id = 'il-toast'; t.className = 'il-toast'; document.body.appendChild(t); }
+                    t.textContent = msg;
+                    t.classList.add('show');
+                    clearTimeout(window._ilToastT);
+                    window._ilToastT = setTimeout(function() { t.classList.remove('show'); }, 1700);
                 }
 
                 function _ilRenderSerialItemCard(item) {
@@ -8469,6 +9776,9 @@ define([
                         ii.addEventListener('keydown', function(e) { if (e.key === 'Enter') { e.preventDefault(); ilLookup(); } });
                         ii.focus();
                     }
+                    document.addEventListener('keydown', function(e) {
+                        if (e.key === 'Escape') ilCloseSerialModal();
+                    });
                 });
             </script>
         `;
@@ -10095,6 +11405,10 @@ textarea.dupe-shake { animation:porcvShake .45s ease; }
 }
 .serial-dupe-msg.show { display:block; }
 .serial-dupe-msg .icon { display:inline-block; margin-right:4px; }
+/* The "Not in stock" warning is the one operators most need to catch at a
+   glance while scanning, so it's larger than the duplicate notice. */
+#wh_serial_stock_msg { font-size:18px; font-weight:700; padding:12px 16px; line-height:1.4; }
+#wh_serial_stock_msg .icon { font-size:22px; margin-right:8px; vertical-align:-2px; }
 
 /* ─── SO PICKING LINE CARDS ─── */
 .sopick-line {
@@ -10143,6 +11457,23 @@ textarea.dupe-shake { animation:porcvShake .45s ease; }
 .sopick-serial-issues-clear { background:transparent; border:none; color:#7a1414; cursor:pointer; font-size:11px; padding:2px 6px; text-decoration:underline; }
 .sopick-serial-issue { font-family:var(--mono,monospace); font-size:11.5px; line-height:1.4; }
 .sopick-serial-issue code { background:rgba(220,38,38,.15); padding:0 4px; border-radius:3px; font-weight:700; }
+#pamz-serials.sopick-has-error { border-color:#dc2626 !important; background:rgba(220,38,38,.06) !important; box-shadow:0 0 0 3px rgba(220,38,38,.25) !important; }
+/* Bin Putaway scan box keeps the red border + ring but NO background fill, so the
+   in-field highlight backdrop (bad serials painted red) shows through cleanly. */
+#bpaw-serials.sopick-has-error { border-color:#dc2626 !important; box-shadow:0 0 0 3px rgba(220,38,38,.25) !important; }
+.bpaw-hl-wrap { position:relative; display:block; }
+.bpaw-hl-wrap > textarea { position:relative; z-index:2; background:transparent; }
+.bpaw-hl-wrap.has-bad > textarea, .bpaw-hl-wrap.has-bad > #bpaw-serials.sopick-has-error { background:transparent !important; }
+.bpaw-hl-backdrop {
+    position:absolute; top:0; left:0; right:0; bottom:0; z-index:1; margin:0;
+    overflow:hidden; pointer-events:none; color:transparent; background:transparent;
+    white-space:pre-wrap; word-wrap:break-word; overflow-wrap:break-word;
+    border:1px solid transparent;
+}
+.bpaw-hl-backdrop mark.bpaw-hl-bad {
+    background:rgba(239,68,68,.30); color:transparent; border-radius:3px;
+    box-shadow:inset 0 0 0 1px rgba(239,68,68,.65);
+}
 .sopick-picked-list { margin:8px 0; padding:8px 10px; background:rgba(22,163,74,.07); border:1px solid rgba(22,163,74,.32); border-radius:8px; }
 .sopick-picked-head { font-size:11.5px; font-weight:700; color:var(--success, #16a34a); display:flex; align-items:center; gap:6px; margin-bottom:4px; }
 .sopick-picked-serials { font-family:var(--mono, monospace); font-size:11.5px; line-height:1.55; color:var(--text-dim); max-height:96px; overflow-y:auto; word-break:break-all; }
@@ -10760,6 +12091,10 @@ button.stock-sheet-row-pick:active { background:var(--primary-soft, #e3edff); }
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/><rect x="9" y="9" width="6" height="6" rx="1"/></svg>
         Bin Transfer (All)
     </div>
+    <div class="mob-more-item" data-view="consolidate" onclick="mobNavTo('consolidate')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 3h16l-6 8v7l-4 3v-10z"/></svg>
+        Bin Consolidation
+    </div>
     <div class="mob-more-item" data-view="itemlookup" onclick="mobNavTo('itemlookup')">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="11" y1="8" x2="11" y2="14"/><line x1="8" y1="11" x2="14" y2="11"/></svg>
         Item Lookup
@@ -10848,6 +12183,10 @@ button.stock-sheet-row-pick:active { background:var(--primary-soft, #e3edff); }
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12"/><path d="M8 11l4 4 4-4"/><rect x="3" y="17" width="18" height="4" rx="1"/></svg>
         Bin Putaway
     </div>
+    <div class="nav-item" data-view="pickamazon">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7h11v10H3z"/><path d="M14 10h4l3 3v4h-7z"/><circle cx="7" cy="19" r="2"/><circle cx="18" cy="19" r="2"/></svg>
+        Pick Amazon Shipments
+    </div>
     <div class="nav-item" data-view="inventorystatuschange">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/><path d="M3 21v-5h5"/></svg>
         Inventory Status Change
@@ -10855,6 +12194,10 @@ button.stock-sheet-row-pick:active { background:var(--primary-soft, #e3edff); }
     <div class="nav-item" data-view="bintransferall">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/><rect x="9" y="9" width="6" height="6" rx="1"/></svg>
         Bin Transfer (All)
+    </div>
+    <div class="nav-item" data-view="consolidate">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 3h16l-6 8v7l-4 3v-10z"/></svg>
+        Bin Consolidation
     </div>
     <div class="nav-item" data-view="itemlookup">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="11" y1="8" x2="11" y2="14"/><line x1="8" y1="11" x2="14" y2="11"/></svg>
@@ -10956,6 +12299,10 @@ button.stock-sheet-row-pick:active { background:var(--primary-soft, #e3edff); }
                 <div class="home-tile-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12"/><path d="M8 11l4 4 4-4"/><rect x="3" y="17" width="18" height="4" rx="1"/></svg></div>
                 <div class="home-tile-title">Bin Putaway</div>
             </button>
+            <button class="home-tile tile-pick" onclick="navigateTo('pickamazon')">
+                <div class="home-tile-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7h11v10H3z"/><path d="M14 10h4l3 3v4h-7z"/><circle cx="7" cy="19" r="2"/><circle cx="18" cy="19" r="2"/></svg></div>
+                <div class="home-tile-title">Pick Amazon Shipments</div>
+            </button>
             <button class="home-tile" onclick="navigateTo('inventorystatuschange')">
                 <div class="home-tile-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/><path d="M3 21v-5h5"/></svg></div>
                 <div class="home-tile-title">Inventory Status Change</div>
@@ -10963,6 +12310,10 @@ button.stock-sheet-row-pick:active { background:var(--primary-soft, #e3edff); }
             <button class="home-tile" onclick="navigateTo('bintransferall')">
                 <div class="home-tile-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/><rect x="9" y="9" width="6" height="6" rx="1"/></svg></div>
                 <div class="home-tile-title">Bin Transfer (All)</div>
+            </button>
+            <button class="home-tile" onclick="navigateTo('consolidate')">
+                <div class="home-tile-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 3h16l-6 8v7l-4 3v-10z"/></svg></div>
+                <div class="home-tile-title">Bin Consolidation</div>
             </button>
             <button class="home-tile" onclick="navigateTo('itemlookup')">
                 <div class="home-tile-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="11" y1="8" x2="11" y2="14"/><line x1="8" y1="11" x2="14" y2="11"/></svg></div>
@@ -11070,13 +12421,18 @@ button.stock-sheet-row-pick:active { background:var(--primary-soft, #e3edff); }
                 <label class="form-label">Serial Numbers
                     <span class="porcv-serial-count" id="bpaw-serial-count" style="font-weight:600;margin-left:6px;">0 scanned</span>
                 </label>
-                <textarea id="bpaw-serials" rows="6" placeholder="Scan serial numbers, one per line\u2026" oninput="bpawSerialCount()" style="font-family:var(--mono);font-size:13px;width:100%;"></textarea>
+                <textarea id="bpaw-serials" rows="6" placeholder="Scan serial numbers, one per line\u2026" oninput="bpawSerialCount()" onblur="bpawValidateOnBlur()" style="font-family:var(--mono);font-size:13px;width:100%;"></textarea>
                 <div class="porcv-serial-count" id="bpaw-serial-dupe" style="display:none;color:#dc2626;margin-top:4px;"></div>
+                <div class="sopick-serial-issues" id="bpaw-serial-issues" style="display:none;"></div>
             </div>
         </div>
-        <button class="btn btn-success" id="bpaw-ser-submit-btn" onclick="bpawSubmit()" style="width:100%;justify-content:center;padding:14px;margin-top:12px;" disabled>
-            Put Away (<span id="bpaw-ser-count-badge">0</span>)
-        </button>
+        <div id="bpaw-draft-note" style="display:none;font-size:12px;color:var(--text-muted);margin-top:10px;text-align:center;"></div>
+        <div style="display:flex;gap:8px;margin-top:12px;">
+            <button class="btn" id="bpaw-ser-save-btn" onclick="bpawSaveDraft()" style="flex:0 0 38%;justify-content:center;padding:14px;">Save</button>
+            <button class="btn btn-success" id="bpaw-ser-submit-btn" onclick="bpawSubmit()" style="flex:1;justify-content:center;padding:14px;" disabled>
+                Put Away (<span id="bpaw-ser-count-badge">0</span>)
+            </button>
+        </div>
     </div>
 
     <!-- ── NON-SERIALIZED ── -->
@@ -11103,6 +12459,82 @@ button.stock-sheet-row-pick:active { background:var(--primary-soft, #e3edff); }
             <div style="display:flex;gap:10px;justify-content:center;margin-top:16px;flex-wrap:wrap;">
                 <button class="btn btn-success" id="bpaw-print-btn" onclick="bpawPrintLabels()" style="min-width:150px;display:none;">Print Labels</button>
                 <button class="btn btn-primary" onclick="bpawReset()" style="min-width:150px;">New Putaway</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- ═══════ PICK AMAZON SHIPMENTS VIEW ═══════ -->
+<div class="view" id="view-pickamazon">
+    <div class="page-header">
+        <div><div class="page-title">Pick Amazon Shipments</div><div class="page-subtitle">Move stock into the Amazon staging bin</div></div>
+    </div>
+
+    <datalist id="pamz-bin-datalist"></datalist>
+
+    <!-- Optional target status (applies to the whole submission, both modes) -->
+    <div class="card" style="margin-top:8px;">
+        <div class="form-group" style="margin-bottom:0;">
+            <label class="form-label">New Status <span style="color:var(--text-muted);font-weight:500;">(optional)</span></label>
+            <select id="pamz-to-status" style="width:100%;">
+                <option value="">— Keep current status —</option>
+            </select>
+        </div>
+    </div>
+
+    <!-- Mode toggle -->
+    <div class="card" id="pamz-mode-card" style="margin-top:12px;padding:10px;">
+        <div style="display:flex;gap:8px;">
+            <button type="button" id="pamz-mode-serialized-btn" class="btn btn-primary" style="flex:1;justify-content:center;" onclick="pamzSwitchMode('serialized')">Serialized</button>
+            <button type="button" id="pamz-mode-nonserialized-btn" class="btn" style="flex:1;justify-content:center;" onclick="pamzSwitchMode('nonserialized')">Non-Serialized</button>
+        </div>
+    </div>
+
+    <!-- ── SERIALIZED ── -->
+    <div id="pamz-serialized-section">
+        <div class="card" style="margin-top:12px;">
+            <div class="form-group" style="margin-bottom:0;">
+                <label class="form-label">Serial Numbers
+                    <span class="porcv-serial-count" id="pamz-serial-count" style="font-weight:600;margin-left:6px;">0 scanned</span>
+                </label>
+                <textarea id="pamz-serials" rows="6" placeholder="Scan serial numbers, one per line…" oninput="pamzSerialCount()" onblur="pamzValidateOnBlur()" style="font-family:var(--mono);font-size:13px;width:100%;"></textarea>
+                <div class="porcv-serial-count" id="pamz-serial-dupe" style="display:none;color:#dc2626;margin-top:4px;"></div>
+                <div class="sopick-serial-issues" id="pamz-serial-issues" style="display:none;"></div>
+            </div>
+        </div>
+        <div id="pamz-draft-note" style="display:none;font-size:12px;color:var(--text-muted);margin-top:10px;text-align:center;"></div>
+        <div style="display:flex;gap:8px;margin-top:12px;">
+            <button class="btn" id="pamz-ser-save-btn" onclick="pamzSaveDraft()" style="flex:0 0 38%;justify-content:center;padding:14px;">Save</button>
+            <button class="btn btn-success" id="pamz-ser-submit-btn" onclick="pamzSubmit()" style="flex:1;justify-content:center;padding:14px;" disabled>
+                Pick (<span id="pamz-ser-count-badge">0</span>)
+            </button>
+        </div>
+    </div>
+
+    <!-- ── NON-SERIALIZED ── -->
+    <div id="pamz-nonserialized-section" style="display:none;">
+        <div class="card" style="margin-top:12px;">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+                <label class="form-label" style="margin-bottom:0;">Items &middot; <span id="pamz-ns-row-count" style="color:var(--text-muted);font-weight:600;">1</span> row(s)</label>
+                <button type="button" class="btn" style="padding:6px 12px;" onclick="pamzAddRow()">+ Add Row</button>
+            </div>
+            <div id="pamz-ns-rows"></div>
+        </div>
+        <button class="btn btn-success" id="pamz-ns-submit-btn" onclick="pamzSubmit()" style="width:100%;justify-content:center;padding:14px;margin-top:12px;">
+            Pick
+        </button>
+    </div>
+
+    <!-- ── SUCCESS ── -->
+    <div class="card" id="pamz-success" style="display:none;margin-top:12px;">
+        <div style="text-align:center;padding:8px;">
+            <div style="font-size:18px;font-weight:700;margin-bottom:4px;">Bin Transfer Created</div>
+            <div style="font-size:22px;font-weight:800;color:var(--primary);margin:8px 0;" id="pamz-success-num"></div>
+            <div style="color:var(--text-muted);font-size:14px;" id="pamz-success-msg"></div>
+            <div id="pamz-success-failed" style="display:none;margin-top:12px;"></div>
+            <div style="display:flex;gap:10px;justify-content:center;margin-top:16px;flex-wrap:wrap;">
+                <button class="btn btn-success" id="pamz-print-btn" onclick="pamzPrintLabels()" style="min-width:150px;display:none;">Print Labels</button>
+                <button class="btn btn-primary" onclick="pamzReset()" style="min-width:150px;">New Pick</button>
             </div>
         </div>
     </div>
@@ -11347,6 +12779,63 @@ button.stock-sheet-row-pick:active { background:var(--primary-soft, #e3edff); }
 </div>
 
 <!-- ═══════ BIN TRANSFER (ALL) VIEW ═══════ -->
+<!-- ═══════ BIN CONSOLIDATION VIEW ═══════ -->
+<div class="view" id="view-consolidate">
+    <div class="page-header">
+        <div><div class="page-title">Bin Consolidation</div><div class="page-subtitle">Find items scattered across multiple bins and merge them into one</div></div>
+    </div>
+    <div class="card" id="cons-filter-card">
+        <div class="form-grid">
+            <div class="form-group">
+                <label class="form-label">Warehouse (Location)</label>
+                <select id="cons-location"></select>
+            </div>
+            <div class="form-group">
+                <label class="form-label">Item contains (optional)</label>
+                <input type="text" id="cons-item-filter" placeholder="e.g. C9200L, CP-8851, ZD220" onkeydown="consFilterKey(event)">
+            </div>
+            <div class="form-group">
+                <label class="form-label">Has stock in bin (optional)</label>
+                <input type="text" id="cons-bin-filter" list="cons-bin-datalist" autocomplete="off" placeholder="Scan or type an exact bin, e.g. 03-B-11" onkeydown="consFilterKey(event)">
+                <datalist id="cons-bin-datalist"></datalist>
+            </div>
+            <div class="form-group">
+                <label class="form-label">Only bins starting with (optional)</label>
+                <input type="text" id="cons-include" placeholder="e.g. 01, 02-A" onkeydown="consFilterKey(event)">
+            </div>
+            <div class="form-group">
+                <label class="form-label">Exclude bins starting with (optional)</label>
+                <input type="text" id="cons-exclude" placeholder="e.g. STAGE, RECV, RMA" onkeydown="consFilterKey(event)">
+            </div>
+        </div>
+        <div style="font-size:11px;color:var(--text-dim);margin-top:6px;">\u201cHas stock in bin\u201d takes exact bin numbers (comma-separated) and shows every item with a pile there, plus all its other bins \u2014 handy for emptying a specific bin. The \u201cstarting with\u201d filters take comma-separated prefixes; scoping to an aisle (e.g. \u201c01\u201d) finds items scattered within that zone only.</div>
+        <div style="margin-top:14px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+            <button class="btn btn-primary" id="cons-load-btn" onclick="consLoad()">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+                Find Scattered Items
+            </button>
+            <input type="text" id="cons-search" placeholder="Filter items\u2026" style="flex:1;min-width:160px;display:none;" oninput="consRenderList()">
+            <span id="cons-count-badge" class="badge badge-info" style="display:none;font-size:11px;"></span>
+        </div>
+    </div>
+    <div class="card" id="cons-list-card" style="display:none;">
+        <div id="cons-list"></div>
+        <div id="cons-empty" style="display:none;text-align:center;padding:24px;color:var(--text-dim);font-size:13px;">Nothing is scattered \u2014 every item already lives in a single bin.</div>
+    </div>
+    <div class="card" id="cons-success" style="display:none;">
+        <div style="text-align:center;padding:24px;">
+            <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="var(--success)" stroke-width="2" style="margin-bottom:12px;"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg>
+            <div style="font-size:18px;font-weight:700;margin-bottom:4px;">Bin Transfer Created!</div>
+            <div style="font-size:22px;font-weight:800;color:var(--primary);margin:8px 0;" id="cons-success-num"></div>
+            <div id="cons-success-plates" style="font-size:14px;font-weight:600;margin-bottom:6px;"></div>
+            <div style="color:var(--text-muted);font-size:14px;" id="cons-success-msg"></div>
+            <div style="display:flex;gap:10px;justify-content:center;margin-top:16px;flex-wrap:wrap;">
+                <button class="btn" onclick="consSuccessDone()" style="min-width:160px;">Back to Scattered Items</button>
+            </div>
+        </div>
+    </div>
+</div>
+
 <div class="view" id="view-bintransferall">
     <div class="page-header">
         <div><div class="page-title">Bin Transfer (All)</div><div class="page-subtitle">Scan a bin, pick items, and move them to a different bin in one shot</div></div>
@@ -11675,13 +13164,14 @@ button.stock-sheet-row-pick:active { background:var(--primary-soft, #e3edff); }
                     <label class="form-label">Serial Numbers (one per line)</label>
                     <textarea id="porcv-item-serials" rows="5" placeholder="Scan serial numbers, one per line…" oninput="porcvItemSerialCount()"></textarea>
                     <div class="porcv-serial-count" id="porcv-item-serial-count">0 of 0 serials entered</div>
+                    <div id="porcv-item-stock-warn" style="display:none;margin-top:6px;font-size:12.5px;font-weight:600;word-break:break-all;"></div>
                 </div>
                 <div class="form-group" id="porcv-item-qty-group" style="display:none;">
                     <label class="form-label">Quantity to Receive</label>
                     <input type="number" id="porcv-item-qty" min="1" value="1">
                 </div>
                 <div style="display:flex;gap:10px;flex-wrap:wrap;">
-                    <button class="btn btn-success" onclick="porcvDoneItem()" style="flex:1 1 120px;justify-content:center;padding:13px;">Done</button>
+                    <button class="btn btn-success" id="porcv-item-done-btn" onclick="porcvDoneItem()" style="flex:1 1 120px;justify-content:center;padding:13px;">Done</button>
                     <button class="btn btn-primary" onclick="porcvPrintItemLabels()" style="flex:1 1 120px;justify-content:center;padding:13px;">Print labels</button>
                 </div>
             </div>
@@ -11990,8 +13480,9 @@ button.stock-sheet-row-pick:active { background:var(--primary-soft, #e3edff); }
                 <div id="sce-scanned-serials" class="sce-chip-list">
                     <span style="color:var(--text-dim);font-size:12px;">No serials scanned yet</span>
                 </div>
-                <details class="sce-expected" id="sce-expected-wrap" style="display:none;">
-                    <summary>Show snapshot serials (<span id="sce-expected-count">0</span>)</summary>
+                <!-- Blind count: snapshot serials are never shown during execution -->
+                <details class="sce-expected" id="sce-expected-wrap" style="display:none !important;">
+                    <summary>Snapshot hidden</summary>
                     <div id="sce-expected-list" class="sce-expected-list"></div>
                 </details>
             </div>
@@ -12000,7 +13491,7 @@ button.stock-sheet-row-pick:active { background:var(--primary-soft, #e3edff); }
             <div id="sce-qty-section" style="display:none;">
                 <label class="form-label" style="margin-top:12px;">Counted quantity</label>
                 <input type="number" id="sce-qty-input" min="0" placeholder="0" inputmode="numeric" pattern="[0-9]*" style="max-width:220px;">
-                <div class="sce-scan-counter" style="margin-top:6px;">Snapshot expected <span id="sce-qty-expected">0</span></div>
+
             </div>
 
             <div class="sce-detail-actions">
@@ -12026,6 +13517,7 @@ button.stock-sheet-row-pick:active { background:var(--primary-soft, #e3edff); }
             <div><div style="font-size:12px; color:var(--text-dim);">Location</div><div style="font-weight:600;" id="scr-location">—</div></div>
             <div><div style="font-size:12px; color:var(--text-dim);">Bin</div><div style="font-weight:600;" id="scr-bin">—</div></div>
             <div><div style="font-size:12px; color:var(--text-dim);">Status</div><div style="font-weight:600;" id="scr-status">—</div></div>
+            <div><div style="font-size:12px; color:var(--text-dim);">Correction</div><div style="font-weight:600;" id="scr-correction">—</div></div>
         </div>
     </div>
 
@@ -12046,6 +13538,14 @@ button.stock-sheet-row-pick:active { background:var(--primary-soft, #e3edff); }
                 <div style="font-size:12px; color:var(--text-dim);">Discrepancies</div>
             </div>
         </div>
+    </div>
+
+    <!-- Approval Impact (dry-run of the exact classification the finalize step will use) -->
+    <div class="card" id="scr-impact-card" style="max-width:1200px; margin-top:16px; display:none;">
+        <div class="card-title">Approval Impact — what finalizing will actually do</div>
+        <div id="scr-impact-totals" style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px;"></div>
+        <div id="scr-impact-body"></div>
+        <div style="font-size:11px;color:var(--text-dim);margin-top:10px;">Values at item average cost. Rejected items are excluded. "Transfer in" serials were found in another bin and will be moved, not adjusted. "Cancelled" write-offs are serials that turned out to have moved elsewhere.</div>
     </div>
 
     <!-- Discrepancy Table -->
@@ -12131,6 +13631,21 @@ button.stock-sheet-row-pick:active { background:var(--primary-soft, #e3edff); }
     <div class="stock-sheet-foot" style="display:flex;gap:10px;">
         <button class="btn" onclick="closePorcvAnomaly()" style="flex:1;justify-content:center;">Go back &amp; fix</button>
         <button class="btn" onclick="porcvAnomalyConfirm()" style="flex:1;justify-content:center;background:var(--warning);border-color:var(--warning);color:#fff;">Receive anyway</button>
+    </div>
+</div>
+
+<!-- ═══ PO RECEIVING: ALREADY-IN-STOCK GUARD ═══ -->
+<div class="stock-sheet-overlay" id="porcv-instock-overlay" onclick="closePorcvInStock()"></div>
+<div class="stock-sheet" id="porcv-instock-sheet">
+    <div class="mob-more-handle"></div>
+    <div class="stock-sheet-head">
+        <div class="stock-sheet-title" id="porcv-instock-title" style="color:var(--danger);">\u26D4 Already in stock</div>
+        <div class="stock-sheet-sub" id="porcv-instock-sub"></div>
+    </div>
+    <div class="stock-sheet-body" id="porcv-instock-body"></div>
+    <div class="stock-sheet-foot" style="display:flex;gap:10px;">
+        <button class="btn" onclick="closePorcvInStock()" style="flex:1;justify-content:center;">Go back &amp; remove</button>
+        <button class="btn" id="porcv-instock-anyway" onclick="porcvInStockConfirm()" style="flex:1;justify-content:center;display:none;background:var(--warning);border-color:var(--warning);color:#fff;">Receive anyway</button>
     </div>
 </div>
 
@@ -12697,9 +14212,11 @@ document.querySelectorAll('.nav-item[data-view]').forEach(el => {
         if (el.dataset.view === 'transfer') document.getElementById('transfer-plate-input').focus();
         if (el.dataset.view === 'poreceive') document.getElementById('porcv-po-input').focus();
         if (el.dataset.view === 'sopick') document.getElementById('sopick-so-input').focus();
-        if (el.dataset.view === 'binputaway') { bpawInit(); if (bpawMode === 'serialized') { const b = document.getElementById('bpaw-to-bin'); if (b) b.focus(); } }
+        if (el.dataset.view === 'binputaway') { bpawInit(); bpawRestoreDraft(); if (bpawMode === 'serialized') { const b = document.getElementById('bpaw-to-bin'); if (b) b.focus(); } }
+        if (el.dataset.view === 'pickamazon') { pamzInit(); pamzRestoreDraft(); if (pamzMode === 'serialized') { const t = document.getElementById('pamz-serials'); if (t) t.focus(); } }
         if (el.dataset.view === 'inventorystatuschange') { iscInit(); }
         if (el.dataset.view === 'irimport') document.getElementById('ir-number-input').focus();
+        if (el.dataset.view === 'consolidate') consInit();
     });
 });
 
@@ -13457,6 +14974,485 @@ async function initBinTransferAllForm() {
 }
 
 // ═══════════════════════════════════════════════════════════
+//  BIN CONSOLIDATION
+// ═══════════════════════════════════════════════════════════
+let _consItems = [];          // fragmented (item,status) entries from the server
+let _consOpenIdx = -1;        // index in _consItems currently expanded
+let _consTargetBinId = null;  // chosen target bin for the open entry
+let _consSerialBins = null;   // serialized: [{binId, binName, serials}] for the open entry
+let _consVerifyMode = false;  // verification on/off for the open entry
+let _consVerified = {};       // serial -> true (verify-by-scan)
+let _consVerifiedPlates = {}; // plateId -> true (verify-by-scan, whole plates)
+let _consQtyOverride = {};    // binId -> qty (non-serialized verify)
+let _consSkipBins = {};       // binId -> true (source bins left out of the move)
+let _consInitDone = false;
+
+async function consInit() {
+    if (_consInitDone) return;
+    _consInitDone = true;
+    const locs = await loadLocations();
+    populateSelect(document.getElementById('cons-location'), locs);
+    document.getElementById('cons-location').value = '1';
+    consRefreshBinList('1');
+    document.getElementById('cons-location').addEventListener('change', function() { consRefreshBinList(this.value); });
+}
+
+async function consRefreshBinList(locationId) {
+    if (!locationId) return;
+    const bins = await loadBins(locationId);
+    const dl = document.getElementById('cons-bin-datalist');
+    if (!dl) return;
+    dl.innerHTML = '';
+    bins.forEach(b => { const opt = document.createElement('option'); opt.value = b.name; dl.appendChild(opt); });
+}
+
+function consFilterKey(e) {
+    if (e.key === 'Enter') { e.preventDefault(); consLoad(); }
+}
+
+async function consLoad() {
+    const locationId = document.getElementById('cons-location').value;
+    if (!locationId) { toast('Select a warehouse.', 'error'); return; }
+    const btn = document.getElementById('cons-load-btn');
+    btn.disabled = true;
+    showProcessing('Scanning bins\u2026', 'Looking for items in 2+ bins');
+    try {
+        const data = await apiGet('getFragmentedItems', {
+            locationId: locationId,
+            itemFilter: document.getElementById('cons-item-filter').value.trim(),
+            binFilter: document.getElementById('cons-bin-filter').value.trim(),
+            includeBins: document.getElementById('cons-include').value.trim(),
+            excludeBins: document.getElementById('cons-exclude').value.trim()
+        });
+        if (!data.success) { toast(data.message || 'Scan failed.', 'error'); return; }
+        _consItems = data.items || [];
+        _consOpenIdx = -1;
+        document.getElementById('cons-success').style.display = 'none';
+        document.getElementById('cons-list-card').style.display = 'block';
+        document.getElementById('cons-search').style.display = '';
+        const badge = document.getElementById('cons-count-badge');
+        badge.style.display = '';
+        badge.textContent = _consItems.length + ' scattered';
+        consRenderList();
+    } catch (err) { toast('Error: ' + err.message, 'error'); }
+    finally { hideProcessing(); btn.disabled = false; }
+}
+
+function consSuccessDone() {
+    document.getElementById('cons-success').style.display = 'none';
+    document.getElementById('cons-filter-card').style.display = 'block';
+    consLoad(); // refresh against live data
+}
+
+function consRenderList() {
+    const list = document.getElementById('cons-list');
+    const q = (document.getElementById('cons-search').value || '').trim().toUpperCase();
+    const rows = [];
+    _consItems.forEach((it, idx) => {
+        if (q && it.itemName.toUpperCase().indexOf(q) === -1) return;
+        const isOpen = (idx === _consOpenIdx);
+        let html = '<div style="border:1px solid var(--border);border-radius:10px;margin-bottom:10px;overflow:hidden;">';
+        html += '<div onclick="consToggle(' + idx + ')" style="display:flex;align-items:center;gap:10px;padding:12px 14px;cursor:pointer;flex-wrap:wrap;' + (isOpen ? 'background:var(--bg-hover, rgba(59,130,246,.06));' : '') + '">';
+        html += '<div style="flex:1;min-width:0;">';
+        html += '<div style="font-weight:600;font-size:14px;word-break:break-word;">' + escHtml(it.itemName) + '</div>';
+        html += '<div style="font-size:12px;color:var(--text-muted);margin-top:2px;">' + it.binCount + ' bins \u00b7 ' + it.totalQty + ' unit(s)';
+        if (it.statusName) html += ' \u00b7 ' + escHtml(it.statusName);
+        if (it.isSerialized) html += ' \u00b7 serialized';
+        html += '</div></div>';
+        html += '<span class="badge ' + (it.binCount >= 3 ? 'badge-warning' : 'badge-info') + '" style="font-size:11px;">' + it.binCount + ' bins</span>';
+        html += '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="transition:transform .2s;' + (isOpen ? 'transform:rotate(180deg);' : '') + '"><polyline points="6 9 12 15 18 9"/></svg>';
+        html += '</div>';
+        if (isOpen) html += consRenderDetail(it);
+        html += '</div>';
+        rows.push(html);
+    });
+    list.innerHTML = rows.join('');
+    document.getElementById('cons-empty').style.display = (_consItems.length === 0) ? 'block' : 'none';
+}
+
+async function consToggle(idx) {
+    if (_consOpenIdx === idx) { _consOpenIdx = -1; consRenderList(); return; }
+    _consOpenIdx = idx;
+    const it = _consItems[idx];
+    _consTargetBinId = it.bins[0].binId; // biggest pile pre-selected
+    _consVerifyMode = false;
+    _consVerified = {};
+    _consVerifiedPlates = {};
+    _consQtyOverride = {};
+    _consSkipBins = {};
+    _consSerialBins = null;
+    if (it.isSerialized) {
+        showProcessing('Loading serials\u2026', escHtml(it.itemName));
+        try {
+            const data = await apiGet('getConsolidationSerials', {
+                itemId: it.itemId,
+                locationId: document.getElementById('cons-location').value,
+                statusId: it.statusId || ''
+            });
+            if (data.success) _consSerialBins = data.bins || [];
+            else toast(data.message || 'Could not load serials.', 'error');
+        } catch (err) { toast('Error: ' + err.message, 'error'); }
+        finally { hideProcessing(); }
+    }
+    consRenderList();
+    if (_consVerifyMode) { const inp = document.getElementById('cons-scan-input'); if (inp) inp.focus(); }
+}
+
+function _consSerialsForBin(binId) {
+    if (!_consSerialBins) return [];
+    const b = _consSerialBins.find(x => String(x.binId) === String(binId));
+    return b ? b.serials : [];
+}
+
+function _consBinData(binId) {
+    if (!_consSerialBins) return null;
+    return _consSerialBins.find(x => String(x.binId) === String(binId)) || null;
+}
+
+// Whole plates fully contained in this bin (moved via LP transfer, record stays in sync).
+function _consWholePlates(binId) {
+    const b = _consBinData(binId);
+    return b ? (b.plates || []).filter(p => p.whole) : [];
+}
+
+// Split/stale plates in this bin (their serials move loose; plate record goes stale).
+function _consSplitPlates(binId) {
+    const b = _consBinData(binId);
+    return b ? (b.plates || []).filter(p => !p.whole) : [];
+}
+
+// Serials in this bin that will move as LOOSE inventory: true loose + split-plate serials.
+function _consLooseSerials(binId) {
+    const b = _consBinData(binId);
+    if (!b) return [];
+    if (b.looseSerials === undefined) return b.serials || [];
+    const out = (b.looseSerials || []).slice();
+    (b.plates || []).filter(p => !p.whole).forEach(p => p.serials.forEach(s => out.push(s)));
+    return out;
+}
+
+function _consActiveSources(it) {
+    return it.bins.filter(b => String(b.binId) !== String(_consTargetBinId) && !_consSkipBins[String(b.binId)]);
+}
+
+function consRenderDetail(it) {
+    const target = it.bins.find(b => String(b.binId) === String(_consTargetBinId)) || it.bins[0];
+    const sources = _consActiveSources(it);
+    const moveQty = sources.reduce((s, b) => {
+        if (it.isSerialized) {
+            const wholeUnits = _consWholePlates(b.binId).reduce((n, p) => {
+                return n + ((!_consVerifyMode || _consVerifiedPlates[p.plateId]) ? p.serials.length : 0);
+            }, 0);
+            const loose = _consLooseSerials(b.binId);
+            const looseUnits = _consVerifyMode ? loose.filter(x => _consVerified[x]).length : loose.length;
+            return s + wholeUnits + looseUnits;
+        }
+        const ov = _consQtyOverride[String(b.binId)];
+        return s + ((_consVerifyMode && ov !== undefined) ? (parseFloat(ov) || 0) : b.qty);
+    }, 0);
+
+    let html = '<div style="padding:12px 14px;border-top:1px solid var(--border);">';
+
+    // ── Bin rows: tap a row to make it the target, untick to leave a bin alone ──
+    html += '<div style="font-size:12px;color:var(--text-muted);margin-bottom:6px;">Tap a bin to make it the target. Untick the bins you want to leave alone.</div>';
+    it.bins.forEach(b => {
+        const isTarget = String(b.binId) === String(target.binId);
+        const isSkipped = !isTarget && !!_consSkipBins[String(b.binId)];
+        const serialCount = it.isSerialized ? _consSerialsForBin(b.binId).length : null;
+        const binPlates = it.isSerialized ? (_consBinData(b.binId) ? (_consBinData(b.binId).plates || []) : []) : [];
+        html += '<div onclick="consSetTarget(' + b.binId + ')" style="display:flex;align-items:center;gap:10px;padding:9px 12px;margin-bottom:6px;border-radius:8px;cursor:pointer;border:1.5px solid ' + (isTarget ? 'var(--success)' : 'var(--border)') + ';' + (isTarget ? 'background:rgba(34,197,94,.08);' : '') + (isSkipped ? 'opacity:.5;' : '') + '">';
+        if (!isTarget) {
+            html += '<input type="checkbox" ' + (isSkipped ? '' : 'checked') + ' onclick="event.stopPropagation();consToggleSkip(' + b.binId + ')" style="width:17px;height:17px;flex-shrink:0;cursor:pointer;" title="Include this bin in the move">';
+        } else {
+            html += '<span style="width:17px;flex-shrink:0;"></span>';
+        }
+        html += '<span style="font-weight:600;font-size:13px;">' + escHtml(b.binName) + '</span>';
+        html += '<span style="font-size:12px;color:var(--text-muted);">' + b.qty + ' unit(s)' + (serialCount !== null ? ' \u00b7 ' + serialCount + ' serial(s)' : '') + (binPlates.length ? ' \u00b7 ' + binPlates.length + ' plate(s)' : '') + '</span>';
+        html += '<span style="margin-left:auto;font-size:11px;font-weight:700;' + (isTarget ? 'color:var(--success);' : (isSkipped ? 'color:var(--text-dim);' : 'color:var(--text-dim);')) + '">' + (isTarget ? 'TARGET' : (isSkipped ? 'stays put' : '\u2192 moves')) + '</span>';
+        html += '</div>';
+    });
+
+    // ── License plates involved in this move ──
+    if (it.isSerialized) {
+        let plateHtml = '';
+        sources.forEach(b => {
+            _consWholePlates(b.binId).forEach(p => {
+                const ok = !!_consVerifiedPlates[p.plateId];
+                plateHtml += '<div ' + (_consVerifyMode ? 'onclick="consTogglePlate(' + p.plateId + ')" ' : '') + 'style="display:flex;align-items:center;gap:8px;padding:7px 10px;margin-bottom:5px;border-radius:8px;border:1.5px solid ' + ((_consVerifyMode && ok) ? 'var(--success)' : 'var(--border)') + ';' + ((_consVerifyMode && ok) ? 'background:rgba(34,197,94,.08);' : '') + (_consVerifyMode ? 'cursor:pointer;' : '') + '">';
+                plateHtml += '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="flex-shrink:0;"><rect x="2" y="7" width="20" height="14" rx="2"/><path d="M16 7V4a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v3"/></svg>';
+                plateHtml += '<span style="font-weight:600;font-size:13px;">' + ((_consVerifyMode && ok) ? '\u2713 ' : '') + escHtml(p.plateName) + '</span>';
+                plateHtml += '<span style="font-size:12px;color:var(--text-muted);">' + escHtml(b.binName) + ' \u00b7 ' + p.serials.length + ' serial(s)</span>';
+                plateHtml += '<span style="margin-left:auto;font-size:11px;font-weight:700;color:var(--success);">moves as plate</span>';
+                plateHtml += '</div>';
+            });
+            _consSplitPlates(b.binId).forEach(p => {
+                plateHtml += '<div style="display:flex;align-items:center;gap:8px;padding:7px 10px;margin-bottom:5px;border-radius:8px;border:1.5px solid var(--warning);background:var(--warning-bg);">';
+                plateHtml += '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="flex-shrink:0;"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>';
+                plateHtml += '<span style="font-weight:600;font-size:13px;">' + escHtml(p.plateName) + '</span>';
+                plateHtml += '<span style="font-size:12px;">' + escHtml(b.binName) + ' \u00b7 ' + p.serials.length + ' of ' + p.plateSerialCount + ' here</span>';
+                plateHtml += '<span style="margin-left:auto;font-size:11px;font-weight:700;">split plate \u2014 serials move loose</span>';
+                plateHtml += '</div>';
+            });
+        });
+        if (plateHtml) {
+            html += '<div style="font-size:12px;font-weight:600;margin:10px 0 5px;">License plates in this move' + (_consVerifyMode ? ' \u00b7 tap or scan a plate ID to verify it' : '') + '</div>';
+            html += plateHtml;
+        }
+    }
+
+    // ── Verification mode toggle ──
+    html += '<div style="display:flex;gap:8px;margin:12px 0 10px;flex-wrap:wrap;">';
+    html += '<button class="btn btn-sm' + (!_consVerifyMode ? ' btn-primary' : '') + '" onclick="consSetVerify(false)">Quick move (trust system)</button>';
+    html += '<button class="btn btn-sm' + (_consVerifyMode ? ' btn-primary' : '') + '" onclick="consSetVerify(true)">' + (it.isSerialized ? 'Verify by scanning' : 'Verify quantities') + '</button>';
+    html += '</div>';
+
+    if (_consVerifyMode && it.isSerialized) {
+        const expected = [];
+        sources.forEach(b => _consLooseSerials(b.binId).forEach(s => expected.push(s)));
+        const verifiedCount = expected.filter(s => _consVerified[s]).length;
+        let plateTotal = 0, plateOk = 0;
+        sources.forEach(b => _consWholePlates(b.binId).forEach(p => { plateTotal++; if (_consVerifiedPlates[p.plateId]) plateOk++; }));
+        html += '<div style="display:flex;gap:8px;margin-bottom:8px;">';
+        html += '<input type="text" id="cons-scan-input" placeholder="Scan a serial or plate ID" autocomplete="off" autocorrect="off" autocapitalize="characters" spellcheck="false" style="flex:1;" onkeydown="consScanKey(event)">';
+        html += '<button class="btn" onclick="consScan()" style="min-width:64px;">Check</button>';
+        html += '</div>';
+        html += '<div style="font-size:12px;color:var(--text-muted);margin-bottom:8px;">' + (plateTotal ? ('Plates verified <b>' + plateOk + '</b> of ' + plateTotal + ' \u00b7 ') : '') + 'Serials verified <b>' + verifiedCount + '</b> of ' + expected.length + ' \u00b7 tap to toggle manually</div>';
+        sources.forEach(b => {
+            const serials = _consLooseSerials(b.binId);
+            if (!serials.length) return;
+            html += '<div style="font-size:12px;font-weight:600;margin:6px 0 4px;">' + escHtml(b.binName) + '</div>';
+            html += '<div style="display:flex;flex-wrap:wrap;gap:6px;">';
+            serials.forEach(s => {
+                const ok = !!_consVerified[s];
+                html += '<span onclick="consTogglePill(this)" data-sn="' + escHtml(s) + '" style="cursor:pointer;font-size:12px;padding:4px 10px;border-radius:999px;border:1.5px solid ' + (ok ? 'var(--success)' : 'var(--border)') + ';' + (ok ? 'background:rgba(34,197,94,.12);color:var(--success);font-weight:600;' : 'color:var(--text-muted);') + '">' + (ok ? '\u2713 ' : '') + escHtml(s) + '</span>';
+            });
+            html += '</div>';
+        });
+    }
+
+    if (_consVerifyMode && !it.isSerialized) {
+        html += '<div style="font-size:12px;color:var(--text-muted);margin-bottom:6px;">Confirm what you actually find in each source bin (adjust down if a pile is short):</div>';
+        sources.forEach(b => {
+            const val = (_consQtyOverride[String(b.binId)] !== undefined) ? _consQtyOverride[String(b.binId)] : b.qty;
+            html += '<div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;">';
+            html += '<span style="font-size:13px;min-width:110px;">' + escHtml(b.binName) + '</span>';
+            html += '<input type="number" min="0" max="' + b.qty + '" value="' + val + '" inputmode="numeric" style="max-width:110px;" oninput="consQtyChange(' + b.binId + ', this.value)">';
+            html += '<span style="font-size:12px;color:var(--text-dim);">of ' + b.qty + '</span>';
+            html += '</div>';
+        });
+    }
+
+    // ── Consolidate ──
+    const noSources = (sources.length === 0);
+    html += '<button class="btn btn-success" id="cons-go-btn" onclick="consConsolidate()" ' + (noSources ? 'disabled ' : '') + 'style="width:100%;justify-content:center;padding:13px;margin-top:10px;' + (noSources ? 'opacity:.5;' : '') + '">';
+    html += noSources ? 'Tick at least one source bin' : ('Consolidate ' + moveQty + ' unit(s) from ' + sources.length + ' bin(s) into ' + escHtml(target.binName));
+    html += '</button>';
+    html += '</div>';
+    return html;
+}
+
+function consToggleSkip(binId) {
+    const key = String(binId);
+    if (_consSkipBins[key]) delete _consSkipBins[key];
+    else _consSkipBins[key] = true;
+    consRenderList();
+}
+
+function consSetTarget(binId) {
+    _consTargetBinId = String(binId);
+    delete _consSkipBins[String(binId)]; // the target can't be a skipped bin
+    _consVerified = {};
+    _consVerifiedPlates = {};
+    _consQtyOverride = {};
+    consRenderList();
+}
+
+function consTogglePlate(plateId) {
+    const key = String(plateId);
+    if (_consVerifiedPlates[key]) delete _consVerifiedPlates[key];
+    else _consVerifiedPlates[key] = true;
+    consRenderList();
+}
+
+function consSetVerify(on) {
+    _consVerifyMode = !!on;
+    consRenderList();
+    if (on) { const inp = document.getElementById('cons-scan-input'); if (inp) setTimeout(() => inp.focus(), 100); }
+}
+
+function consQtyChange(binId, value) {
+    _consQtyOverride[String(binId)] = value;
+    // Update the button label without a full re-render (keeps input focus).
+    const it = _consItems[_consOpenIdx];
+    if (!it) return;
+    const sources = _consActiveSources(it);
+    const total = sources.reduce((s, b) => {
+        const ov = _consQtyOverride[String(b.binId)];
+        return s + ((ov !== undefined) ? (parseFloat(ov) || 0) : b.qty);
+    }, 0);
+    const target = it.bins.find(b => String(b.binId) === String(_consTargetBinId));
+    const btn = document.getElementById('cons-go-btn');
+    if (btn && target) btn.textContent = 'Consolidate ' + total + ' unit(s) from ' + sources.length + ' bin(s) into ' + target.binName;
+}
+
+function consScanKey(e) {
+    if (e.key === 'Enter') { e.preventDefault(); consScan(); }
+}
+
+function consScan() {
+    const input = document.getElementById('cons-scan-input');
+    if (!input) return;
+    const sn = (input.value || '').trim();
+    if (!sn) return;
+    const it = _consItems[_consOpenIdx];
+    if (!it) return;
+    const active = _consActiveSources(it);
+
+    // Plate ID scan: verifying a plate verifies all its serials at once.
+    let plateHit = null;
+    active.forEach(b => _consWholePlates(b.binId).forEach(p => {
+        if (!plateHit && String(p.plateName).toUpperCase() === sn.toUpperCase()) plateHit = p;
+    }));
+    if (plateHit) {
+        if (_consVerifiedPlates[String(plateHit.plateId)]) {
+            input.style.background = 'rgba(220,38,38,.12)';
+            setTimeout(() => { input.style.background = ''; }, 250);
+            input.value = '';
+            return;
+        }
+        _consVerifiedPlates[String(plateHit.plateId)] = true;
+        input.value = '';
+        consRenderList();
+        const fresh1 = document.getElementById('cons-scan-input');
+        if (fresh1) fresh1.focus();
+        return;
+    }
+
+    const expected = [];
+    active.forEach(b => _consLooseSerials(b.binId).forEach(s => expected.push(s)));
+    const match = expected.find(s => s.toUpperCase() === sn.toUpperCase());
+    if (!match) {
+        input.style.background = 'rgba(220,38,38,.12)';
+        setTimeout(() => { input.style.background = ''; }, 300);
+        toast('"' + sn + '" is not an expected serial or plate ID from the source bins.', 'error');
+        input.select();
+        return;
+    }
+    if (_consVerified[match]) {
+        input.style.background = 'rgba(220,38,38,.12)';
+        setTimeout(() => { input.style.background = ''; }, 250);
+        input.value = '';
+        return;
+    }
+    _consVerified[match] = true;
+    input.value = '';
+    consRenderList();
+    const fresh = document.getElementById('cons-scan-input');
+    if (fresh) fresh.focus();
+}
+
+function consTogglePill(el) {
+    const sn = el.getAttribute('data-sn');
+    if (!sn) return;
+    if (_consVerified[sn]) delete _consVerified[sn];
+    else _consVerified[sn] = true;
+    consRenderList();
+}
+
+async function consConsolidate() {
+    const it = _consItems[_consOpenIdx];
+    if (!it) return;
+    const target = it.bins.find(b => String(b.binId) === String(_consTargetBinId));
+    if (!target) { toast('Pick a target bin.', 'error'); return; }
+    const sourceBins = _consActiveSources(it);
+    if (!sourceBins.length) { toast('Tick at least one source bin to move.', 'error'); return; }
+    const skippedBinCount = it.bins.length - 1 - sourceBins.length;
+
+    const sources = [];
+    const plateMoves = [];
+    const stalePlateNames = [];
+    let totalUnits = 0;
+    let unverifiedCount = 0;
+
+    if (it.isSerialized) {
+        sourceBins.forEach(b => {
+            // Whole plates: move via the LP transfer so the plate record stays in sync.
+            _consWholePlates(b.binId).forEach(p => {
+                if (_consVerifyMode && !_consVerifiedPlates[String(p.plateId)]) { unverifiedCount += p.serials.length; return; }
+                plateMoves.push({ plateId: p.plateId, plateName: p.plateName });
+                totalUnits += p.serials.length;
+            });
+            // Loose serials (incl. split-plate serials).
+            const all = _consLooseSerials(b.binId);
+            const use = _consVerifyMode ? all.filter(s => _consVerified[s]) : all;
+            unverifiedCount += (all.length - use.length);
+            if (use.length) {
+                sources.push({ binId: b.binId, binName: b.binName, serials: use });
+                totalUnits += use.length;
+                // Which split plates lose serials in this move? Their records go stale.
+                _consSplitPlates(b.binId).forEach(p => {
+                    if (p.serials.some(s => use.indexOf(s) !== -1) && stalePlateNames.indexOf(p.plateName) === -1) {
+                        stalePlateNames.push(p.plateName);
+                    }
+                });
+            }
+        });
+        if (!totalUnits) { toast(_consVerifyMode ? 'Nothing verified yet.' : 'No serials to move.', 'error'); return; }
+        if (_consVerifyMode && unverifiedCount > 0) {
+            if (!confirm('Move only the ' + totalUnits + ' verified unit(s)? ' + unverifiedCount + ' unverified unit(s) will stay where they are.')) return;
+        }
+        if (stalePlateNames.length) {
+            if (!confirm('Heads up: this move takes serials off split plate(s) ' + stalePlateNames.join(', ') + '. Those plate records will no longer match their contents and should be fixed up afterwards. Continue?')) return;
+        }
+    } else {
+        sourceBins.forEach(b => {
+            const ov = _consQtyOverride[String(b.binId)];
+            const qty = (_consVerifyMode && ov !== undefined) ? Math.min(parseFloat(ov) || 0, b.qty) : b.qty;
+            if (qty > 0) { sources.push({ binId: b.binId, binName: b.binName, qty: qty }); totalUnits += qty; }
+        });
+        if (!totalUnits) { toast('Nothing to move.', 'error'); return; }
+    }
+
+    if (!confirm('Consolidate ' + totalUnits + ' unit(s) of ' + it.itemName + ' from ' + sourceBins.length + ' bin(s) into ' + target.binName + '?' + (plateMoves.length ? ' (' + plateMoves.length + ' license plate(s) move as whole plates.)' : '') + (skippedBinCount > 0 ? ' (' + skippedBinCount + ' unticked bin(s) will stay put.)' : ''))) return;
+
+    const btn = document.getElementById('cons-go-btn');
+    if (btn) btn.disabled = true;
+    showProcessing('Creating Bin Transfer\u2026', 'Consolidating into ' + target.binName);
+    try {
+        const result = await apiPost('executeConsolidation', {
+            locationId: document.getElementById('cons-location').value,
+            itemId: it.itemId,
+            itemName: it.itemName,
+            isSerialized: it.isSerialized,
+            statusId: it.statusId || '',
+            toBinId: target.binId,
+            toBinName: target.binName,
+            sources: sources,
+            plates: plateMoves
+        });
+        if (result.success) {
+            _consOpenIdx = -1;
+            document.getElementById('cons-filter-card').style.display = 'none';
+            document.getElementById('cons-list-card').style.display = 'none';
+            const plateCount = (result.plates && result.plates.length) || 0;
+            document.getElementById('cons-success-num').textContent =
+                result.tranId || (plateCount ? plateCount + ' plate transfer(s)' : '');
+            document.getElementById('cons-success-plates').textContent =
+                plateCount ? ('Plates moved: ' + result.plates.join(' \u00b7 ')) : '';
+            document.getElementById('cons-success-msg').textContent = result.message || '';
+            document.getElementById('cons-success').style.display = 'block';
+            toast(result.tranId ? ('Bin transfer ' + result.tranId + ' created.') : (plateCount + ' plate transfer(s) created.'), 'success');
+            if (result.skipped && result.skipped.length) {
+                toast(result.skipped.length + ' line(s) skipped - inventory changed since loading.', 'warning');
+            }
+        } else {
+            toast(result.message || 'Consolidation failed.', 'error');
+        }
+    } catch (err) { toast('Error: ' + err.message, 'error'); }
+    finally { hideProcessing(); if (btn) btn.disabled = false; }
+}
+
+// ═══════════════════════════════════════════════════════════
 //  FULFILL SALES ORDER
 // ═══════════════════════════════════════════════════════════
 document.getElementById('fulfill-plate-input').addEventListener('keydown', e => {
@@ -13867,6 +15863,11 @@ function porcvOpenItem(idx) {
     if (!line || line.quantityRemaining <= 0) return;
     porcvActiveIdx = idx;
 
+    // reset the live "already in stock" hint for the newly opened item
+    _porcvLastStockSig = '';
+    var _swReset = document.getElementById('porcv-item-stock-warn');
+    if (_swReset) { _swReset.style.display = 'none'; _swReset.textContent = ''; }
+
     document.getElementById('porcv-item-name').textContent = line.itemText;
     const descEl = document.getElementById('porcv-item-desc');
     descEl.textContent = line.description || '';
@@ -13954,6 +15955,157 @@ function porcvItemSerialCount() {
         countEl.classList.remove('has-dupe');
     }
     countEl.textContent = (dupes.length ? countEl.textContent + '  \u2014  ' : '') + kept.length + ' of ' + max + ' serials entered';
+
+    // Kick off the debounced "already in stock" lookup for what's currently typed.
+    porcvScheduleStockCheck();
+}
+
+// ─── PO RECEIVING: already-in-stock guard ────────────────────
+// As serials are scanned we ask the server whether each one is already on
+// hand. Same-item-on-hand is a hard block (NetSuite rejects re-receiving an
+// on-hand serial); other-item-on-hand is a soft warning (likely mis-scan).
+var _porcvStockTimer   = null;
+var _porcvLastStockSig = '';
+var _porcvInStockConfirmFn = null;
+
+function porcvScheduleStockCheck() {
+    if (_porcvStockTimer) clearTimeout(_porcvStockTimer);
+    _porcvStockTimer = setTimeout(porcvLiveStockCheck, 350);
+}
+
+async function porcvLiveStockCheck() {
+    if (porcvActiveIdx === null || !currentPORcvData) return;
+    const line = currentPORcvData.lines[porcvActiveIdx];
+    const warnEl = document.getElementById('porcv-item-stock-warn');
+    if (!line || !line.isSerialized || !warnEl) return;
+
+    const serials = (document.getElementById('porcv-item-serials').value || '')
+        .split('\\n').map(s => s.trim().toUpperCase()).filter(Boolean);
+    if (!serials.length) { warnEl.style.display = 'none'; warnEl.textContent = ''; _porcvLastStockSig = ''; return; }
+
+    let res;
+    try { res = await apiPost('validateReceiptSerials', { itemId: line.itemId, serials }); }
+    catch (e) { return; } // live hint only — never break scanning on a transient error
+    if (porcvActiveIdx === null || !currentPORcvData) return;          // navigated away mid-flight
+    if (currentPORcvData.lines[porcvActiveIdx] !== line) return;       // switched item mid-flight
+    if (!res || !res.success) return;
+
+    const hard = res.blocked || [];
+    const soft = res.warned  || [];
+
+    // Already in stock for THIS item → it can never be received. Auto-clear it
+    // from the scan box (same as a duplicate) so the receiver doesn't have to.
+    if (hard.length) {
+        porcvStripSerials(hard.map(b => b.serial));
+        porcvDing();
+        warnEl.textContent = '\u26D4 Already in stock \u2014 removed: ' + hard.map(b => b.serial).join(', ');
+        warnEl.style.color = 'var(--danger)';
+        warnEl.style.display = 'block';
+        _porcvLastStockSig = '';
+        porcvScheduleStockCheck(); // re-evaluate the remaining serials
+        return;
+    }
+
+    if (!soft.length) { warnEl.style.display = 'none'; warnEl.textContent = ''; _porcvLastStockSig = ''; return; }
+
+    // Other-item matches stay in the box (overridable) — surface as a warning.
+    warnEl.textContent = '\u26A0 ' + soft.length + ' in stock under another item: ' + soft.map(b => b.serial).join(', ');
+    warnEl.style.color = 'var(--warning)';
+    warnEl.style.display = 'block';
+
+    // Ding once when the flagged set changes, not on every keystroke.
+    const sig = soft.map(b => b.serial).join('|');
+    if (sig !== _porcvLastStockSig) { porcvDing(); _porcvLastStockSig = sig; }
+}
+
+// Remove specific serials (by value, case-insensitive) from the scan box and
+// refresh the count. Returns the serials actually removed.
+function porcvStripSerials(toRemove) {
+    const ta = document.getElementById('porcv-item-serials');
+    if (!ta) return [];
+    const rm = new Set((toRemove || []).map(s => (s || '').trim().toUpperCase()));
+    if (!rm.size) return [];
+    const removed = [], kept = [];
+    ta.value.split('\\n').forEach(s => {
+        const t = s.trim();
+        if (!t) return;
+        (rm.has(t.toUpperCase()) ? removed : kept).push(t.toUpperCase());
+    });
+    if (removed.length) {
+        ta.value = kept.join('\\n') + (kept.length ? '\\n' : '');
+        const line = currentPORcvData ? currentPORcvData.lines[porcvActiveIdx] : null;
+        const countEl = document.getElementById('porcv-item-serial-count');
+        if (countEl && line) {
+            countEl.classList.remove('has-dupe');
+            countEl.textContent = kept.length + ' of ' + line.quantityRemaining + ' serials entered';
+        }
+    }
+    return removed;
+}
+
+// Bottom sheet for the Done-gate. Hard blocks (same item) offer no override;
+// soft warnings (other item) allow "Receive anyway" via onConfirm.
+function porcvShowInStockSheet(hard, soft, itemText, onConfirm) {
+    hard = hard || []; soft = soft || [];
+    const hardN = hard.length, softN = soft.length;
+    _porcvInStockConfirmFn = hardN ? null : (onConfirm || null);
+
+    const title   = document.getElementById('porcv-instock-title');
+    const sub     = document.getElementById('porcv-instock-sub');
+    const body    = document.getElementById('porcv-instock-body');
+    const overlay = document.getElementById('porcv-instock-overlay');
+    const sheet   = document.getElementById('porcv-instock-sheet');
+    const anyway  = document.getElementById('porcv-instock-anyway');
+    if (!sub || !body || !overlay || !sheet) {
+        toast('Some serials are already in stock — remove them and rescan.', 'error');
+        return;
+    }
+
+    if (title) {
+        title.textContent = hardN ? '\u26D4 Already in stock' : '\u26A0 In stock under another item';
+        title.style.color = hardN ? 'var(--danger)' : 'var(--warning)';
+    }
+    sub.textContent = hardN
+        ? (hardN + ' serial' + (hardN === 1 ? '' : 's') + ' for ' + itemText + ' ' + (hardN === 1 ? 'is' : 'are') + ' already on hand and cannot be received again.')
+        : (softN + ' serial' + (softN === 1 ? '' : 's') + ' ' + (softN === 1 ? 'is' : 'are') + ' in stock under a different item — likely a mis-scan.');
+
+    let rows = '';
+    hard.forEach(b => {
+        rows += '<div class="stock-sheet-row" style="align-items:flex-start;">'
+             +  '<div class="stock-sheet-bin" style="font-family:var(--mono);color:#991b1b;word-break:break-all;">' + escHtml(b.serial) + '</div>'
+             +  '<div style="text-align:right;font-size:11px;color:var(--text-muted);max-width:55%;">on hand: ' + (b.qoh || 0) + (b.itemName ? '<br>' + escHtml(b.itemName) : '') + '</div>'
+             +  '</div>';
+    });
+    soft.forEach(b => {
+        rows += '<div class="stock-sheet-row" style="align-items:flex-start;">'
+             +  '<div class="stock-sheet-bin" style="font-family:var(--mono);color:#92400e;word-break:break-all;">' + escHtml(b.serial) + '</div>'
+             +  '<div style="text-align:right;font-size:11px;color:var(--text-muted);max-width:55%;">in stock under<br>' + escHtml(b.belongsToItemName || b.belongsToItemId || '') + '</div>'
+             +  '</div>';
+    });
+    body.innerHTML = '<div style="padding:12px 16px;font-size:12.5px;color:var(--text-muted);background:' + (hardN ? 'var(--danger-bg)' : 'var(--warning-bg)') + ';border-bottom:1px solid var(--border);">'
+                   + (hardN
+                        ? 'Remove these from the scan box — NetSuite will reject the receipt while they are still on hand.'
+                        : 'Double-check the scan. Receive anyway only if this is intentional.')
+                   + '</div>' + rows;
+
+    if (anyway) anyway.style.display = (!hardN && onConfirm) ? 'block' : 'none';
+    porcvDing();
+    overlay.classList.add('open');
+    sheet.classList.add('open');
+}
+
+function closePorcvInStock() {
+    const overlay = document.getElementById('porcv-instock-overlay');
+    const sheet   = document.getElementById('porcv-instock-sheet');
+    if (sheet)   sheet.classList.remove('open');
+    if (overlay) overlay.classList.remove('open');
+    _porcvInStockConfirmFn = null;
+}
+
+function porcvInStockConfirm() {
+    const fn = _porcvInStockConfirmFn;
+    closePorcvInStock();
+    if (typeof fn === 'function') fn();
 }
 
 // Detect serials that don't fit the rest of the batch's pattern (length / prefix).
@@ -14060,7 +16212,7 @@ function _porcvFinishStage(line, statusId) {
 }
 
 // Done: validate, stage (or un-stage if cleared), return to list.
-function porcvDoneItem() {
+async function porcvDoneItem() {
     if (porcvActiveIdx === null || !currentPORcvData) { porcvBackToList(); return; }
     const line = currentPORcvData.lines[porcvActiveIdx];
     const statusId = document.getElementById('porcv-item-status').value;
@@ -14086,13 +16238,54 @@ function porcvDoneItem() {
             _porcvFinishStage(line, statusId);
         };
 
-        // Soft pattern check: warn (don't block) if some serials look unlike the rest.
-        const anomalies = porcvDetectSerialAnomalies(serials);
-        if (anomalies.length) {
-            porcvShowAnomalySheet(anomalies, line.itemText, commit); // commit only runs on "Receive anyway"
+        // Anomaly soft-check, then stage. Pulled into a helper so it can run
+        // either immediately or after the "receive anyway" override below.
+        const proceedAfterStock = function() {
+            const anomalies = porcvDetectSerialAnomalies(serials);
+            if (anomalies.length) {
+                porcvShowAnomalySheet(anomalies, line.itemText, commit); // commit only runs on "Receive anyway"
+                return;
+            }
+            commit();
+        };
+
+        // Authoritative already-in-stock guard (server-side). A serial that
+        // NetSuite still shows on hand for THIS item can't be received again;
+        // one on hand under another item is flagged as a likely mis-scan.
+        const btn = document.getElementById('porcv-item-done-btn');
+        _btnWait(btn);
+        let stockRes = null;
+        try {
+            stockRes = await apiPost('validateReceiptSerials', { itemId: line.itemId, serials });
+        } catch (e) {
+            toast('Could not verify serials against inventory: ' + e.message, 'error');
             return;
+        } finally { _btnReset(btn); }
+
+        if (stockRes && stockRes.success) {
+            const hard = stockRes.blocked || [];
+            const soft = stockRes.warned  || [];
+            // Hard (already in stock for this item): auto-clear and stop — never stage.
+            if (hard.length) {
+                const removed = porcvStripSerials(hard.map(b => b.serial));
+                porcvDing();
+                const warnEl = document.getElementById('porcv-item-stock-warn');
+                if (warnEl) {
+                    warnEl.textContent = '\u26D4 Already in stock \u2014 removed: ' + hard.map(b => b.serial).join(', ');
+                    warnEl.style.color = 'var(--danger)';
+                    warnEl.style.display = 'block';
+                }
+                toast(removed.length + ' serial' + (removed.length === 1 ? '' : 's') + ' already in stock \u2014 removed. Review and tap Done again.', 'error');
+                return;
+            }
+            // Soft (other item): overridable confirmation.
+            if (soft.length) {
+                porcvShowInStockSheet([], soft, line.itemText, proceedAfterStock);
+                return;
+            }
         }
-        commit();
+
+        proceedAfterStock();
         return;
     }
 
@@ -14264,7 +16457,11 @@ function bpawSwitchMode(mode) {
     const nBtn = document.getElementById('bpaw-mode-nonserialized-btn');
     if (sBtn) sBtn.className = 'btn' + (mode === 'serialized' ? ' btn-primary' : '');
     if (nBtn) nBtn.className = 'btn' + (mode === 'nonserialized' ? ' btn-primary' : '');
-    if (mode === 'serialized') { const t = document.getElementById('bpaw-to-bin'); if (t) t.focus(); }
+    if (mode === 'serialized') {
+        bpawEnsureHighlightLayer();
+        bpawRefreshHighlight();
+        const t = document.getElementById('bpaw-to-bin'); if (t) t.focus();
+    }
     else { bpawInit(); }
 }
 
@@ -14287,6 +16484,8 @@ function bpawSerialCount() {
     countEl.textContent = kept.length + ' scanned';
     const badge = document.getElementById('bpaw-ser-count-badge'); if (badge) badge.textContent = kept.length;
     bpawSyncSubmit();
+    bpawQueueValidate();
+    bpawRefreshHighlight();
 }
 
 function bpawSyncSubmit() {
@@ -14295,7 +16494,9 @@ function bpawSyncSubmit() {
     const bin = binEl ? (binEl.value || '').trim() : '';
     const n = taEl ? (taEl.value || '').split(/\\r?\\n/).map(s => s.trim()).filter(Boolean).length : 0;
     const btn = document.getElementById('bpaw-ser-submit-btn');
-    if (btn) btn.disabled = !(bin && n > 0);
+    // Also blocked while any invalid serial is still sitting in the box.
+    const hasErr = (typeof _bpawErrorSerials !== 'undefined') && _bpawErrorSerials.size > 0;
+    if (btn) btn.disabled = !(bin && n > 0) || hasErr;
 }
 
 function bpawAddRow() {
@@ -14440,11 +16641,15 @@ async function bpawSubmit() {
         try {
             const r = await apiPost('binPutawaySerialized', { toBinNumber: toBin, serials: serials });
             if (r.success) bpawShowSuccess(r);
-            else toast(r.message || 'Putaway failed.', 'error');
+            else {
+                if (r.sameBin && r.sameBin.length) bpawFlagSameBinSerials(r.sameBin, r.toBinName || toBin);
+                toast(r.message || 'Putaway failed.', 'error');
+            }
         } catch (e) { toast('Error: ' + e.message, 'error'); }
         finally { hideProcessing(); _btnReset(btn); }
     } else {
         const rows = [];
+        const rowDomIds = [];
         let bad = false;
         const setErr = (elId, on) => { const el = document.getElementById(elId); if (el) el.style.borderColor = on ? '#ef4444' : ''; };
         document.querySelectorAll('#bpaw-ns-rows [data-bpaw-row]').forEach(div => {
@@ -14461,6 +16666,7 @@ async function bpawSubmit() {
             setErr('bpaw-qty-' + id, q <= 0); if (q <= 0) rowBad = true;
             if (rowBad) { bad = true; return; }
             rows.push({ itemName: sku, fromBinNumber: fb, toBinNumber: tb, quantity: q });
+            rowDomIds.push(id);
         });
         if (!rows.length) { toast('Fill in at least one row.', 'error'); return; }
         if (bad) { toast('Fix the highlighted fields.', 'error'); return; }
@@ -14471,13 +16677,49 @@ async function bpawSubmit() {
         try {
             const r = await apiPost('binPutawayNonSerialized', { rows: rows });
             if (r.success) bpawShowSuccess(r);
-            else toast(r.message || 'Putaway failed.', 'error');
+            else {
+                if (r.sameBinRows && r.sameBinRows.length) {
+                    r.sameBinRows.forEach(idx => {
+                        const dom = rowDomIds[idx]; if (!dom) return;
+                        setErr('bpaw-frombin-' + dom, true);
+                        setErr('bpaw-tobin-' + dom, true);
+                    });
+                    if (typeof porcvDing === 'function') porcvDing();
+                }
+                toast(r.message || 'Putaway failed.', 'error');
+            }
         } catch (e) { toast('Error: ' + e.message, 'error'); }
         finally { hideProcessing(); _btnReset(btn); }
     }
 }
 
+// Highlight serials the server flagged as already in the destination bin.
+// Adds each one to the rejected-serial panel in red and shakes the textarea.
+function bpawFlagSameBinSerials(serials, toBinName) {
+    if (!serials || !serials.length) return;
+    const ta = document.getElementById('bpaw-serials');
+    if (ta) {
+        ta.classList.add('sopick-has-error');
+        ta.classList.remove('dupe-shake'); void ta.offsetWidth; ta.classList.add('dupe-shake');
+    }
+    if (typeof porcvDing === 'function') porcvDing();
+    const label = 'ALREADY IN ' + ((toBinName || 'DEST BIN') + '').toUpperCase();
+    serials.forEach(s => {
+        const t = (s || '').trim(); if (!t) return;
+        _bpawErrorSerials.add(t);
+        _bpawValIssues = _bpawValIssues.filter(it => it.serial !== t);
+        _bpawValIssues.push({ serial: t, label: label, detail: 'already in destination bin \u2014 remove or rescan' });
+    });
+    bpawRenderIssuesPanel();
+    if (_bpawIssuesTimer) { clearTimeout(_bpawIssuesTimer); _bpawIssuesTimer = null; }
+    bpawRefreshHighlight();
+    bpawSyncSubmit();
+}
+
 function bpawShowSuccess(r) {
+    bpawClearDraft();
+    bpawShowDraftNote('');
+    bpawResetValidation();
     lastBpawLabelData = r.labelGroups || [];
     lastBpawTranId = r.tranId || '';
     document.getElementById('bpaw-serialized-section').style.display = 'none';
@@ -14519,7 +16761,761 @@ function bpawReset() {
     bpawAddRow();
     lastBpawLabelData = []; lastBpawTranId = '';
     bpawSwitchMode(bpawMode);
+    bpawClearDraft();
+    bpawShowDraftNote('');
+    bpawResetValidation();
     bpawSyncSubmit();
+}
+
+
+// ═══════════════════════════════════════════════════════════
+//  BIN PUTAWAY — inline serial validation (mirrors SO Picking)
+//  No item context here (a putaway scan can mix items), so the only
+//  check is: does this serial exist in stock right now? Bad serials are
+//  highlighted and kept in the box; new scans are blocked until removed.
+// ═══════════════════════════════════════════════════════════
+let _bpawValCache = {};            // serial -> { state: 'pending'|'valid'|'invalid' }
+let _bpawErrorSerials = new Set(); // serials currently flagged invalid
+let _bpawValIssues = [];           // [{ serial, label, detail }]
+let _bpawValTimer = null;
+let _bpawIssuesTimer = null;
+
+function bpawResetValidation() {
+    _bpawValCache = {};
+    _bpawErrorSerials = new Set();
+    _bpawValIssues = [];
+    if (_bpawValTimer) { clearTimeout(_bpawValTimer); _bpawValTimer = null; }
+    if (_bpawIssuesTimer) { clearTimeout(_bpawIssuesTimer); _bpawIssuesTimer = null; }
+    const ta = document.getElementById('bpaw-serials'); if (ta) ta.classList.remove('sopick-has-error');
+    bpawRenderIssuesPanel();
+    bpawRefreshHighlight();
+}
+
+function bpawRecount() {
+    const ta = document.getElementById('bpaw-serials');
+    const n = ta ? ta.value.split(/\\r?\\n/).map(s => s.trim()).filter(Boolean).length : 0;
+    const c = document.getElementById('bpaw-serial-count'); if (c) c.textContent = n + ' scanned';
+    const b = document.getElementById('bpaw-ser-count-badge'); if (b) b.textContent = n;
+}
+
+function bpawQueueValidate(opts) {
+    if (_bpawValTimer) clearTimeout(_bpawValTimer);
+    const delay = (opts && opts.immediate) ? 0 : 250;
+    _bpawValTimer = setTimeout(() => bpawRunValidate(!!(opts && opts.includeTrailing)), delay);
+}
+
+async function bpawRunValidate(includeTrailing) {
+    const ta = document.getElementById('bpaw-serials');
+    if (!ta) return;
+    const cache = _bpawValCache;
+    const countEl = document.getElementById('bpaw-serial-count');
+
+    const text = ta.value;
+    const rawLines = text.split('\\n').map(s => s.trim());
+    // Last line (no trailing newline) is treated as still being typed, unless
+    // includeTrailing is set (blur handler) so typed-then-tabbed entries check.
+    const completeLines = (includeTrailing || text.endsWith('\\n'))
+        ? rawLines.filter(Boolean)
+        : rawLines.slice(0, -1).filter(Boolean);
+
+    // Re-flag anything already cached invalid (e.g. user re-scanned it).
+    completeLines.forEach(s => {
+        const e = cache[s];
+        if (e && e.state === 'invalid') {
+            if (_bpawErrorSerials.has(s)) ta.classList.add('sopick-has-error');
+            else bpawRejectBadSerial(s);
+        }
+    });
+
+    // Error gate: while a bad serial sits in the box, strip any new scans.
+    if (_bpawErrorSerials.size > 0) {
+        for (const s of [..._bpawErrorSerials]) {
+            if (!completeLines.includes(s)) _bpawErrorSerials.delete(s);
+        }
+        if (_bpawErrorSerials.size > 0) {
+            const newScans = completeLines.filter(s => !_bpawErrorSerials.has(s) && !(cache[s] && cache[s].state === 'valid'));
+            if (newScans.length) {
+                const set = new Set(newScans);
+                const hadTrailing = ta.value.endsWith('\\n');
+                const filtered = ta.value.split('\\n').filter(l => !set.has(l.trim()));
+                ta.value = filtered.join('\\n') + (hadTrailing && filtered.length ? '\\n' : '');
+                toast('\u26A0 Fix invalid serial first: <code>' + escHtml([..._bpawErrorSerials].join(', ')) + '</code>', 'error');
+                ta.classList.remove('dupe-shake'); void ta.offsetWidth; ta.classList.add('dupe-shake');
+                porcvDing();
+                bpawRecount();
+            }
+            if (countEl) countEl.classList.remove('validating');
+            bpawRefreshHighlight();
+            bpawSyncSubmit();
+            return;
+        } else {
+            ta.classList.remove('sopick-has-error');
+            bpawRefreshHighlight();
+        }
+    }
+
+    const toCheck = completeLines.filter(s => !cache[s]);
+    if (!toCheck.length) { bpawRefreshHighlight(); bpawSyncSubmit(); return; }
+    toCheck.forEach(s => { cache[s] = { state: 'pending' }; });
+    if (countEl) countEl.classList.add('validating');
+
+    let result;
+    try {
+        result = await apiGet('validateSerialsExist', { serials: toCheck.join('\\n') });
+    } catch (e) {
+        toCheck.forEach(s => delete cache[s]); // allow retry
+        if (countEl) countEl.classList.remove('validating');
+        return;
+    }
+    if (countEl) countEl.classList.remove('validating');
+    if (!result || !result.success) { toCheck.forEach(s => delete cache[s]); return; }
+
+    const invalidSet = new Set((result.invalid || []).map(s => String(s).trim()));
+    toCheck.forEach(s => {
+        if (invalidSet.has(s)) { cache[s] = { state: 'invalid' }; bpawRejectBadSerial(s); }
+        else cache[s] = { state: 'valid' };
+    });
+    bpawRefreshHighlight();
+    bpawSyncSubmit();
+}
+
+function bpawRejectBadSerial(serial) {
+    const ta = document.getElementById('bpaw-serials');
+    if (!ta) return;
+    const t = (serial || '').trim();
+    if (!t) return;
+    _bpawErrorSerials.add(t);
+    ta.classList.add('sopick-has-error');
+    ta.classList.remove('dupe-shake'); void ta.offsetWidth; ta.classList.add('dupe-shake');
+    porcvDing();
+    toast('\u26A0 <strong>NOT IN STOCK</strong>: <code>' + escHtml(t) + '</code> \u2014 not found in NetSuite stock', 'error');
+    _bpawValIssues = _bpawValIssues.filter(it => it.serial !== t);
+    _bpawValIssues.push({ serial: t, label: 'NOT IN STOCK', detail: 'serial is not in NetSuite stock' });
+    bpawRenderIssuesPanel();
+    bpawRefreshHighlight();
+    bpawSyncSubmit();
+}
+
+function bpawRenderIssuesPanel() {
+    const panel = document.getElementById('bpaw-serial-issues');
+    if (!panel) return;
+    const issues = _bpawValIssues || [];
+    if (!issues.length) { panel.style.display = 'none'; panel.innerHTML = ''; return; }
+    // Compact summary only — the offending serials are shown in red inside the
+    // scan box, so we no longer print a long per-serial list here (that list got
+    // hard to read once a handful of serials were flagged).
+    const byLabel = {};
+    issues.forEach(function (it) { byLabel[it.label] = (byLabel[it.label] || 0) + 1; });
+    const parts = Object.keys(byLabel).map(function (lbl) {
+        return '<strong>' + byLabel[lbl] + ' ' + escHtml(lbl) + '</strong>';
+    });
+    panel.innerHTML =
+        '<div class="sopick-serial-issues-head">' +
+            '<span>\u26A0 ' + parts.join(' \u00B7 ') + '</span>' +
+            '<button type="button" class="sopick-serial-issues-clear" onclick="bpawClearIssues()">clear</button>' +
+        '</div>' +
+        '<div class="sopick-serial-issue">Highlighted in red below \u2014 remove or rescan to continue.</div>';
+    panel.style.display = 'block';
+    if (_bpawIssuesTimer) clearTimeout(_bpawIssuesTimer);
+    _bpawIssuesTimer = setTimeout(bpawClearIssues, 8000);
+}
+
+function bpawClearIssues() {
+    _bpawValIssues = [];
+    if (_bpawIssuesTimer) { clearTimeout(_bpawIssuesTimer); _bpawIssuesTimer = null; }
+    bpawRenderIssuesPanel();
+}
+
+// ── In-field highlight: paints bad serials red INSIDE the scan box ──
+// A transparent-text "backdrop" div sits behind the textarea, mirroring its
+// content with <mark> around any serial currently in _bpawErrorSerials (whether
+// it's "not in stock" or "already in the destination bin"). The textarea itself
+// is transparent, so the red blocks show through behind the real text. This is
+// the per-serial signal — the issues panel below is only a short summary now.
+function bpawEnsureHighlightLayer() {
+    const ta = document.getElementById('bpaw-serials');
+    if (!ta) return null;
+    let backdrop = document.getElementById('bpaw-hl-backdrop');
+    if (backdrop) return backdrop;
+    const wrap = document.createElement('div');
+    wrap.className = 'bpaw-hl-wrap';
+    ta.parentNode.insertBefore(wrap, ta);
+    backdrop = document.createElement('div');
+    backdrop.id = 'bpaw-hl-backdrop';
+    backdrop.className = 'bpaw-hl-backdrop';
+    backdrop.setAttribute('aria-hidden', 'true');
+    wrap.appendChild(backdrop);
+    wrap.appendChild(ta); // move the textarea on top of the backdrop
+    ta.addEventListener('scroll', function () {
+        backdrop.scrollTop = ta.scrollTop;
+        backdrop.scrollLeft = ta.scrollLeft;
+    });
+    return backdrop;
+}
+
+function bpawRefreshHighlight() {
+    const ta = document.getElementById('bpaw-serials');
+    if (!ta) return;
+    const backdrop = bpawEnsureHighlightLayer();
+    if (!backdrop) return;
+    // Mirror the textarea's exact text metrics so lines align pixel-for-pixel.
+    const cs = window.getComputedStyle(ta);
+    ['fontFamily', 'fontSize', 'fontWeight', 'fontStyle', 'letterSpacing', 'lineHeight',
+     'textTransform', 'wordSpacing', 'textIndent', 'tabSize', 'boxSizing', 'borderRadius',
+     'paddingTop', 'paddingRight', 'paddingBottom', 'paddingLeft',
+     'borderTopWidth', 'borderRightWidth', 'borderBottomWidth', 'borderLeftWidth'
+    ].forEach(function (p) { backdrop.style[p] = cs[p]; });
+    backdrop.style.borderStyle = 'solid';
+    backdrop.style.borderColor = 'transparent';
+
+    const bad = _bpawErrorSerials || new Set();
+    const lines = (ta.value || '').split('\\n');
+    const html = lines.map(function (line) {
+        const safe = escHtml(line);
+        const key = line.trim();
+        if (key && bad.has(key)) return '<mark class="bpaw-hl-bad">' + (safe || ' ') + '</mark>';
+        return safe;
+    }).join('\\n');
+    backdrop.innerHTML = html;
+
+    const wrap = ta.parentNode;
+    if (wrap && wrap.classList) wrap.classList.toggle('has-bad', bad.size > 0);
+    backdrop.scrollTop = ta.scrollTop;
+    backdrop.scrollLeft = ta.scrollLeft;
+}
+
+function bpawValidateOnBlur() {
+    bpawQueueValidate({ immediate: true, includeTrailing: true });
+}
+
+
+// ═══════════════════════════════════════════════════════════
+//  BIN PUTAWAY — quick local draft (survives refresh / nav)
+//  "Save" stashes the destination bin + scanned serials in the browser
+//  so an operator can step away and resume. Nothing posts to NetSuite
+//  until they hit Put Away; the draft is cleared on a successful putaway.
+// ═══════════════════════════════════════════════════════════
+const BPAW_DRAFT_KEY = 'tq_bpaw_draft_v1';
+
+function bpawSaveDraft() {
+    try {
+        const toBin = (document.getElementById('bpaw-to-bin').value || '').trim();
+        const serials = (document.getElementById('bpaw-serials').value || '');
+        if (!toBin && !serials.trim()) { toast('Nothing to save yet.', 'warning'); return; }
+        localStorage.setItem(BPAW_DRAFT_KEY, JSON.stringify({ toBin: toBin, serials: serials, savedAt: Date.now() }));
+        bpawShowDraftNote('\u2713 Draft saved \u00B7 <a href="#" onclick="bpawDiscardDraft();return false;" style="color:var(--danger,#dc2626);">discard</a>');
+        toast('Draft saved \u2014 safe to refresh or step away.', 'success');
+    } catch (e) { toast('Could not save draft: ' + e.message, 'error'); }
+}
+
+function bpawRestoreDraft() {
+    let d = null;
+    try { d = JSON.parse(localStorage.getItem(BPAW_DRAFT_KEY) || 'null'); } catch (e) { d = null; }
+    if (!d || (!d.toBin && !(d.serials || '').trim())) return;
+    const binEl = document.getElementById('bpaw-to-bin');
+    const taEl = document.getElementById('bpaw-serials');
+    // Don't clobber active work if the operator already started typing.
+    if ((binEl && binEl.value.trim()) || (taEl && taEl.value.trim())) return;
+    if (binEl && d.toBin) binEl.value = d.toBin;
+    if (taEl && d.serials) taEl.value = d.serials;
+    bpawSerialCount();
+    let when = '';
+    try { when = d.savedAt ? new Date(d.savedAt).toLocaleString() : ''; } catch (e) {}
+    bpawShowDraftNote('\u21BA Draft restored' + (when ? ' (saved ' + escHtml(when) + ')' : '') + ' \u00B7 <a href="#" onclick="bpawDiscardDraft();return false;" style="color:var(--danger,#dc2626);">discard</a>');
+}
+
+function bpawDiscardDraft() {
+    bpawClearDraft();
+    const tb = document.getElementById('bpaw-to-bin'); if (tb) tb.value = '';
+    const ta = document.getElementById('bpaw-serials'); if (ta) ta.value = '';
+    bpawResetValidation();
+    bpawSerialCount();
+    bpawShowDraftNote('');
+    toast('Draft discarded.', 'info');
+}
+
+function bpawClearDraft() {
+    try { localStorage.removeItem(BPAW_DRAFT_KEY); } catch (e) {}
+}
+
+function bpawShowDraftNote(html) {
+    const el = document.getElementById('bpaw-draft-note');
+    if (!el) return;
+    if (!html) { el.style.display = 'none'; el.innerHTML = ''; return; }
+    el.innerHTML = html;
+    el.style.display = 'block';
+}
+
+
+// ═══════════════════════════════════════════════════════════
+//  PICK AMAZON SHIPMENTS  (native SPA view)
+//  Mirrors Bin Putaway, but destination bin is hardcoded server-side
+//  and an optional New Status select applies to the whole submission.
+// ═══════════════════════════════════════════════════════════
+let pamzMode = 'serialized';
+let pamzRowSeq = 0;
+let lastPamzLabelData = [];
+let lastPamzTranId = '';
+let _pamzBinsLoaded = false;
+let _pamzStatusLoaded = false;
+
+async function pamzInit() {
+    if (!_pamzBinsLoaded) {
+        try {
+            const bins = await loadBins('1');
+            const dl = document.getElementById('pamz-bin-datalist');
+            if (dl) { dl.innerHTML = ''; bins.forEach(b => { const o = document.createElement('option'); o.value = b.name; dl.appendChild(o); }); }
+            _pamzBinsLoaded = true;
+        } catch (e) { /* non-fatal */ }
+    }
+    if (!_pamzStatusLoaded) {
+        try {
+            const statuses = await loadStatusCodes();
+            const sel = document.getElementById('pamz-to-status');
+            if (sel) {
+                const cur = sel.value;
+                sel.innerHTML = '<option value="">— Keep current status —</option>';
+                statuses.forEach(s => { const o = document.createElement('option'); o.value = s.id; o.textContent = s.name; sel.appendChild(o); });
+                if (cur) sel.value = cur;
+            }
+            _pamzStatusLoaded = true;
+        } catch (e) { /* non-fatal */ }
+    }
+    const wrap = document.getElementById('pamz-ns-rows');
+    if (wrap && !wrap.children.length) pamzAddRow();
+}
+
+function pamzSwitchMode(mode) {
+    pamzMode = mode;
+    document.getElementById('pamz-serialized-section').style.display = (mode === 'serialized') ? 'block' : 'none';
+    document.getElementById('pamz-nonserialized-section').style.display = (mode === 'nonserialized') ? 'block' : 'none';
+    const sBtn = document.getElementById('pamz-mode-serialized-btn');
+    const nBtn = document.getElementById('pamz-mode-nonserialized-btn');
+    if (sBtn) sBtn.className = 'btn' + (mode === 'serialized' ? ' btn-primary' : '');
+    if (nBtn) nBtn.className = 'btn' + (mode === 'nonserialized' ? ' btn-primary' : '');
+    if (mode === 'serialized') { const t = document.getElementById('pamz-serials'); if (t) t.focus(); }
+    else { pamzInit(); }
+}
+
+function pamzSerialCount() {
+    const ta = document.getElementById('pamz-serials');
+    const countEl = document.getElementById('pamz-serial-count');
+    const dupeEl = document.getElementById('pamz-serial-dupe');
+    if (!ta || !countEl) return;
+    const raw = ta.value.split(/\\r?\\n/);
+    const seen = new Set(); const dupes = []; const kept = [];
+    raw.forEach(s => { const t = s.trim(); if (!t) return; const u = t.toUpperCase(); if (seen.has(u)) { dupes.push(t); return; } seen.add(u); kept.push(t); });
+    if (dupes.length) {
+        ta.value = kept.join('\\n');
+        if (dupeEl) { dupeEl.textContent = '⚠ Duplicate rejected: ' + [...new Set(dupes)].join(', '); dupeEl.style.display = 'block'; }
+        ta.classList.add('has-dupe');
+        if (typeof porcvDing === 'function') porcvDing();
+        setTimeout(() => ta.classList.remove('has-dupe'), 600);
+    } else if (dupeEl) { dupeEl.style.display = 'none'; }
+    countEl.textContent = kept.length + ' scanned';
+    const badge = document.getElementById('pamz-ser-count-badge'); if (badge) badge.textContent = kept.length;
+    pamzSyncSubmit();
+    pamzQueueValidate();
+}
+
+function pamzSyncSubmit() {
+    const taEl = document.getElementById('pamz-serials');
+    const n = taEl ? (taEl.value || '').split(/\\r?\\n/).map(s => s.trim()).filter(Boolean).length : 0;
+    const btn = document.getElementById('pamz-ser-submit-btn');
+    const hasErr = (typeof _pamzErrorSerials !== 'undefined') && _pamzErrorSerials.size > 0;
+    if (btn) btn.disabled = !(n > 0) || hasErr;
+}
+
+function pamzAddRow() {
+    const wrap = document.getElementById('pamz-ns-rows');
+    if (!wrap) return;
+    pamzRowSeq++;
+    const id = pamzRowSeq;
+    const div = document.createElement('div');
+    div.className = 'card';
+    div.setAttribute('data-pamz-row', id);
+    div.style.cssText = 'padding:12px;margin-bottom:10px;background:var(--surface);';
+    div.innerHTML =
+        '<div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;">' +
+            '<input type="text" id="pamz-sku-' + id + '" autocomplete="off" placeholder="Part number / SKU" style="flex:1;min-width:0;">' +
+            '<button type="button" class="btn" title="Remove row" onclick="pamzRemoveRow(' + id + ')" style="flex-shrink:0;width:44px;justify-content:center;padding:0;color:#ef4444;font-size:20px;">&times;</button>' +
+        '</div>' +
+        '<div class="pamz-bins-row" style="display:flex;gap:8px;">' +
+            '<div style="flex:1;min-width:0;"><label class="form-label" style="font-size:11px;margin-bottom:2px;">From Bin</label><div style="display:flex;gap:4px;align-items:center;"><input type="text" id="pamz-frombin-' + id + '" list="pamz-bin-datalist" autocomplete="off" placeholder="From" style="flex:1;min-width:0;width:100%;">' +
+                '<button type="button" class="btn" title="Where is this item? Tap a bin to set the From Bin" onclick="pamzLookupItemBins(' + id + ')" style="flex-shrink:0;width:38px;justify-content:center;padding:0;">' +
+                '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.3-4.3"></path></svg>' +
+                '</button></div></div>' +
+            '<div style="width:90px;flex-shrink:0;"><label class="form-label" style="font-size:11px;margin-bottom:2px;">Qty</label><input type="number" id="pamz-qty-' + id + '" min="1" placeholder="Qty" style="width:100%;"></div>' +
+        '</div>';
+    wrap.appendChild(div);
+    pamzRowCount();
+    const sku = document.getElementById('pamz-sku-' + id); if (sku) sku.focus();
+}
+
+function pamzRemoveRow(id) {
+    const row = document.querySelector('[data-pamz-row="' + id + '"]');
+    if (row) row.remove();
+    const wrap = document.getElementById('pamz-ns-rows');
+    if (wrap && !wrap.children.length) pamzAddRow();
+    pamzRowCount();
+}
+
+function pamzRowCount() {
+    const wrap = document.getElementById('pamz-ns-rows');
+    const el = document.getElementById('pamz-ns-row-count');
+    if (wrap && el) el.textContent = wrap.children.length;
+}
+
+async function pamzLookupItemBins(rowId) {
+    const skuEl = document.getElementById('pamz-sku-' + rowId);
+    const sku = skuEl ? skuEl.value.trim() : '';
+    if (!sku) { toast('Enter a part number first.', 'warning'); return; }
+    showProcessing('Looking up…', 'Finding bins for ' + sku);
+    try {
+        const idata = await apiGet('getItems', { q: sku });
+        const list = (idata && idata.results) ? idata.results : [];
+        let match = list.find(i => (i.name || '').toLowerCase() === sku.toLowerCase());
+        if (!match && list.length === 1) match = list[0];
+        hideProcessing();
+        if (!match) { toast('No item matches "' + sku + '".', 'error'); return; }
+        openStockLookup(match.id, match.name || sku, '1', { binTarget: 'pamz-frombin-' + rowId, qtyTarget: 'pamz-qty-' + rowId, pickable: true });
+    } catch (e) { hideProcessing(); toast('Error: ' + e.message, 'error'); }
+}
+
+async function pamzSubmit() {
+    const statusSel = document.getElementById('pamz-to-status');
+    const toStatusId = statusSel ? (statusSel.value || '') : '';
+
+    if (pamzMode === 'serialized') {
+        const serials = (document.getElementById('pamz-serials').value || '').split(/\\r?\\n/).map(s => s.trim()).filter(Boolean);
+        if (!serials.length) { toast('Scan at least one serial number.', 'error'); return; }
+
+        try {
+            const v = await apiGet('validateSerialsExist', { serials: serials.join('\\n') });
+            if (v && v.success && v.invalidCount > 0) {
+                const proceed = confirm(v.invalidCount + ' serial(s) not found in NetSuite and will be skipped:\\n\\n' + (v.invalid || []).join('\\n') + '\\n\\nContinue with ' + v.validCount + ' valid serial(s)?');
+                if (!proceed) return;
+            }
+        } catch (e) { /* non-fatal */ }
+
+        const btn = document.getElementById('pamz-ser-submit-btn');
+        _btnWait(btn);
+        showProcessing('Creating Bin Transfer…', 'Picking ' + serials.length + ' serial(s)');
+        try {
+            const r = await apiPost('pickAmazonSerialized', { serials: serials, toStatusId: toStatusId });
+            if (r.success) pamzShowSuccess(r);
+            else {
+                if (r.sameBin && r.sameBin.length) pamzFlagSameBinSerials(r.sameBin, r.toBinName);
+                toast(r.message || 'Pick failed.', 'error');
+            }
+        } catch (e) { toast('Error: ' + e.message, 'error'); }
+        finally { hideProcessing(); _btnReset(btn); }
+    } else {
+        const rows = [];
+        const rowDomIds = [];
+        let bad = false;
+        const setErr = (elId, on) => { const el = document.getElementById(elId); if (el) el.style.borderColor = on ? '#ef4444' : ''; };
+        document.querySelectorAll('#pamz-ns-rows [data-pamz-row]').forEach(div => {
+            const id = div.getAttribute('data-pamz-row');
+            const sku = (document.getElementById('pamz-sku-' + id).value || '').trim();
+            const fb = (document.getElementById('pamz-frombin-' + id).value || '').trim();
+            const q = parseInt(document.getElementById('pamz-qty-' + id).value, 10) || 0;
+            if (!sku && !fb && q === 0) return;
+            let rowBad = false;
+            setErr('pamz-sku-' + id, !sku); if (!sku) rowBad = true;
+            setErr('pamz-frombin-' + id, !fb); if (!fb) rowBad = true;
+            setErr('pamz-qty-' + id, q <= 0); if (q <= 0) rowBad = true;
+            if (rowBad) { bad = true; return; }
+            rows.push({ itemName: sku, fromBinNumber: fb, quantity: q });
+            rowDomIds.push(id);
+        });
+        if (!rows.length) { toast('Fill in at least one row.', 'error'); return; }
+        if (bad) { toast('Fix the highlighted fields.', 'error'); return; }
+
+        const btn = document.getElementById('pamz-ns-submit-btn');
+        _btnWait(btn);
+        showProcessing('Creating Bin Transfer…', 'Moving ' + rows.length + ' item(s)');
+        try {
+            const r = await apiPost('pickAmazonNonSerialized', { rows: rows, toStatusId: toStatusId });
+            if (r.success) pamzShowSuccess(r);
+            else {
+                if (r.sameBinRows && r.sameBinRows.length) {
+                    r.sameBinRows.forEach(idx => {
+                        const dom = rowDomIds[idx]; if (!dom) return;
+                        setErr('pamz-frombin-' + dom, true);
+                    });
+                    if (typeof porcvDing === 'function') porcvDing();
+                }
+                toast(r.message || 'Pick failed.', 'error');
+            }
+        } catch (e) { toast('Error: ' + e.message, 'error'); }
+        finally { hideProcessing(); _btnReset(btn); }
+    }
+}
+
+// Highlight serials the server flagged as already in the Amazon pick bin.
+// Adds each to the rejected-serial panel in red and shakes the textarea.
+function pamzFlagSameBinSerials(serials, toBinName) {
+    if (!serials || !serials.length) return;
+    const ta = document.getElementById('pamz-serials');
+    if (ta) {
+        ta.classList.add('sopick-has-error');
+        ta.classList.remove('dupe-shake'); void ta.offsetWidth; ta.classList.add('dupe-shake');
+    }
+    if (typeof porcvDing === 'function') porcvDing();
+    const label = 'ALREADY IN ' + ((toBinName || 'AMAZON PICK BIN') + '').toUpperCase();
+    serials.forEach(s => {
+        const t = (s || '').trim(); if (!t) return;
+        _pamzErrorSerials.add(t);
+        _pamzValIssues = _pamzValIssues.filter(it => it.serial !== t);
+        _pamzValIssues.push({ serial: t, label: label, detail: 'already in Amazon pick bin — remove or rescan' });
+    });
+    pamzRenderIssuesPanel();
+    if (_pamzIssuesTimer) { clearTimeout(_pamzIssuesTimer); _pamzIssuesTimer = null; }
+    pamzSyncSubmit();
+}
+
+function pamzShowSuccess(r) {
+    pamzClearDraft();
+    pamzShowDraftNote('');
+    pamzResetValidation();
+    lastPamzLabelData = r.labelGroups || [];
+    lastPamzTranId = r.tranId || '';
+    document.getElementById('pamz-serialized-section').style.display = 'none';
+    document.getElementById('pamz-nonserialized-section').style.display = 'none';
+    document.getElementById('pamz-mode-card').style.display = 'none';
+    document.getElementById('pamz-success-num').textContent = r.tranId || '';
+    document.getElementById('pamz-success-msg').textContent = r.message || '';
+    const failedEl = document.getElementById('pamz-success-failed');
+    if (r.failed && r.failed.length) {
+        failedEl.style.display = 'block';
+        failedEl.innerHTML = '<div style="background:#fef2f2;border:1px solid #fca5a5;border-radius:8px;padding:10px;text-align:left;">' +
+            '<div style="font-weight:700;color:#991b1b;font-size:13px;margin-bottom:4px;">' + r.failed.length + ' serial(s) skipped (not found)</div>' +
+            '<div style="font-size:12px;color:#991b1b;font-family:var(--mono);word-break:break-all;">' + r.failed.map(s => escHtml(s)).join(', ') + '</div></div>';
+    } else { failedEl.style.display = 'none'; }
+    const printBtn = document.getElementById('pamz-print-btn');
+    if (printBtn) printBtn.style.display = (lastPamzLabelData && lastPamzLabelData.length) ? 'inline-flex' : 'none';
+    document.getElementById('pamz-success').style.display = 'block';
+    toast('Bin transfer ' + (r.tranId || '') + ' created.', 'success');
+    window.scrollTo(0, 0);
+}
+
+function pamzPrintLabels() {
+    if (!lastPamzLabelData.length) { toast('No label data available.', 'error'); return; }
+    const labelData = lastPamzLabelData.map(g => ({ itemText: g.itemText || '', description: g.description || '', serialNumbers: g.serialNumbers || [], quantity: (g.serialNumbers || []).length }));
+    const qs = new URLSearchParams({ action: 'printReceiptLabels', labelData: JSON.stringify(labelData), recordId: lastPamzTranId }).toString();
+    window.open(API + '&' + qs, '_blank');
+}
+
+function pamzReset() {
+    document.getElementById('pamz-success').style.display = 'none';
+    document.getElementById('pamz-mode-card').style.display = '';
+    const ta = document.getElementById('pamz-serials'); if (ta) ta.value = '';
+    const cnt = document.getElementById('pamz-serial-count'); if (cnt) cnt.textContent = '0 scanned';
+    const badge = document.getElementById('pamz-ser-count-badge'); if (badge) badge.textContent = '0';
+    const dupe = document.getElementById('pamz-serial-dupe'); if (dupe) dupe.style.display = 'none';
+    const wrap = document.getElementById('pamz-ns-rows'); if (wrap) wrap.innerHTML = '';
+    pamzRowSeq = 0;
+    pamzAddRow();
+    lastPamzLabelData = []; lastPamzTranId = '';
+    pamzSwitchMode(pamzMode);
+    pamzClearDraft();
+    pamzShowDraftNote('');
+    pamzResetValidation();
+    pamzSyncSubmit();
+}
+
+// ── inline serial validation (mirrors Bin Putaway) ──
+let _pamzValCache = {};
+let _pamzErrorSerials = new Set();
+let _pamzValIssues = [];
+let _pamzValTimer = null;
+let _pamzIssuesTimer = null;
+
+function pamzResetValidation() {
+    _pamzValCache = {};
+    _pamzErrorSerials = new Set();
+    _pamzValIssues = [];
+    if (_pamzValTimer) { clearTimeout(_pamzValTimer); _pamzValTimer = null; }
+    if (_pamzIssuesTimer) { clearTimeout(_pamzIssuesTimer); _pamzIssuesTimer = null; }
+    const ta = document.getElementById('pamz-serials'); if (ta) ta.classList.remove('sopick-has-error');
+    pamzRenderIssuesPanel();
+}
+
+function pamzRecount() {
+    const ta = document.getElementById('pamz-serials');
+    const n = ta ? ta.value.split(/\\r?\\n/).map(s => s.trim()).filter(Boolean).length : 0;
+    const c = document.getElementById('pamz-serial-count'); if (c) c.textContent = n + ' scanned';
+    const b = document.getElementById('pamz-ser-count-badge'); if (b) b.textContent = n;
+}
+
+function pamzQueueValidate(opts) {
+    if (_pamzValTimer) clearTimeout(_pamzValTimer);
+    const delay = (opts && opts.immediate) ? 0 : 250;
+    _pamzValTimer = setTimeout(() => pamzRunValidate(!!(opts && opts.includeTrailing)), delay);
+}
+
+async function pamzRunValidate(includeTrailing) {
+    const ta = document.getElementById('pamz-serials');
+    if (!ta) return;
+    const cache = _pamzValCache;
+    const countEl = document.getElementById('pamz-serial-count');
+
+    const text = ta.value;
+    const rawLines = text.split('\\n').map(s => s.trim());
+    const completeLines = (includeTrailing || text.endsWith('\\n'))
+        ? rawLines.filter(Boolean)
+        : rawLines.slice(0, -1).filter(Boolean);
+
+    completeLines.forEach(s => {
+        const e = cache[s];
+        if (e && e.state === 'invalid') {
+            if (_pamzErrorSerials.has(s)) ta.classList.add('sopick-has-error');
+            else pamzRejectBadSerial(s);
+        }
+    });
+
+    if (_pamzErrorSerials.size > 0) {
+        for (const s of [..._pamzErrorSerials]) {
+            if (!completeLines.includes(s)) _pamzErrorSerials.delete(s);
+        }
+        if (_pamzErrorSerials.size > 0) {
+            const newScans = completeLines.filter(s => !_pamzErrorSerials.has(s) && !(cache[s] && cache[s].state === 'valid'));
+            if (newScans.length) {
+                const set = new Set(newScans);
+                const hadTrailing = ta.value.endsWith('\\n');
+                const filtered = ta.value.split('\\n').filter(l => !set.has(l.trim()));
+                ta.value = filtered.join('\\n') + (hadTrailing && filtered.length ? '\\n' : '');
+                toast('⚠ Fix invalid serial first: <code>' + escHtml([..._pamzErrorSerials].join(', ')) + '</code>', 'error');
+                ta.classList.remove('dupe-shake'); void ta.offsetWidth; ta.classList.add('dupe-shake');
+                porcvDing();
+                pamzRecount();
+            }
+            if (countEl) countEl.classList.remove('validating');
+            pamzSyncSubmit();
+            return;
+        } else {
+            ta.classList.remove('sopick-has-error');
+        }
+    }
+
+    const toCheck = completeLines.filter(s => !cache[s]);
+    if (!toCheck.length) { pamzSyncSubmit(); return; }
+    toCheck.forEach(s => { cache[s] = { state: 'pending' }; });
+    if (countEl) countEl.classList.add('validating');
+
+    let result;
+    try {
+        result = await apiGet('validateSerialsExist', { serials: toCheck.join('\\n') });
+    } catch (e) {
+        toCheck.forEach(s => delete cache[s]);
+        if (countEl) countEl.classList.remove('validating');
+        return;
+    }
+    if (countEl) countEl.classList.remove('validating');
+    if (!result || !result.success) { toCheck.forEach(s => delete cache[s]); return; }
+
+    const invalidSet = new Set((result.invalid || []).map(s => String(s).trim()));
+    toCheck.forEach(s => {
+        if (invalidSet.has(s)) { cache[s] = { state: 'invalid' }; pamzRejectBadSerial(s); }
+        else cache[s] = { state: 'valid' };
+    });
+    pamzSyncSubmit();
+}
+
+function pamzRejectBadSerial(serial) {
+    const ta = document.getElementById('pamz-serials');
+    if (!ta) return;
+    const t = (serial || '').trim();
+    if (!t) return;
+    _pamzErrorSerials.add(t);
+    ta.classList.add('sopick-has-error');
+    ta.classList.remove('dupe-shake'); void ta.offsetWidth; ta.classList.add('dupe-shake');
+    porcvDing();
+    toast('⚠ <strong>NOT IN STOCK</strong>: <code>' + escHtml(t) + '</code> — not found in NetSuite stock', 'error');
+    _pamzValIssues = _pamzValIssues.filter(it => it.serial !== t);
+    _pamzValIssues.push({ serial: t, label: 'NOT IN STOCK', detail: 'serial is not in NetSuite stock' });
+    pamzRenderIssuesPanel();
+    pamzSyncSubmit();
+}
+
+function pamzRenderIssuesPanel() {
+    const panel = document.getElementById('pamz-serial-issues');
+    if (!panel) return;
+    const issues = _pamzValIssues || [];
+    if (!issues.length) { panel.style.display = 'none'; panel.innerHTML = ''; return; }
+    panel.innerHTML =
+        '<div class="sopick-serial-issues-head">' +
+            '<span>⚠ ' + issues.length + ' rejected serial' + (issues.length === 1 ? '' : 's') + '</span>' +
+            '<button type="button" class="sopick-serial-issues-clear" onclick="pamzClearIssues()">clear</button>' +
+        '</div>' +
+        issues.map(it =>
+            '<div class="sopick-serial-issue"><code>' + escHtml(it.serial) + '</code> — <strong>' + it.label + '</strong>: ' + it.detail + '</div>'
+        ).join('');
+    panel.style.display = 'block';
+    if (_pamzIssuesTimer) clearTimeout(_pamzIssuesTimer);
+    _pamzIssuesTimer = setTimeout(pamzClearIssues, 5000);
+}
+
+function pamzClearIssues() {
+    _pamzValIssues = [];
+    if (_pamzIssuesTimer) { clearTimeout(_pamzIssuesTimer); _pamzIssuesTimer = null; }
+    pamzRenderIssuesPanel();
+}
+
+function pamzValidateOnBlur() {
+    pamzQueueValidate({ immediate: true, includeTrailing: true });
+}
+
+// ── quick local draft (survives refresh / nav) ──
+const PAMZ_DRAFT_KEY = 'tq_pamz_draft_v1';
+
+function pamzSaveDraft() {
+    try {
+        const serials = (document.getElementById('pamz-serials').value || '');
+        const statusSel = document.getElementById('pamz-to-status');
+        const toStatusId = statusSel ? (statusSel.value || '') : '';
+        if (!serials.trim() && !toStatusId) { toast('Nothing to save yet.', 'warning'); return; }
+        localStorage.setItem(PAMZ_DRAFT_KEY, JSON.stringify({ serials: serials, toStatusId: toStatusId, savedAt: Date.now() }));
+        pamzShowDraftNote('✓ Draft saved · <a href="#" onclick="pamzDiscardDraft();return false;" style="color:var(--danger,#dc2626);">discard</a>');
+        toast('Draft saved — safe to refresh or step away.', 'success');
+    } catch (e) { toast('Could not save draft: ' + e.message, 'error'); }
+}
+
+function pamzRestoreDraft() {
+    let d = null;
+    try { d = JSON.parse(localStorage.getItem(PAMZ_DRAFT_KEY) || 'null'); } catch (e) { d = null; }
+    if (!d || (!(d.serials || '').trim() && !d.toStatusId)) return;
+    const taEl = document.getElementById('pamz-serials');
+    const statusEl = document.getElementById('pamz-to-status');
+    if (taEl && taEl.value.trim()) return;
+    if (taEl && d.serials) taEl.value = d.serials;
+    if (statusEl && d.toStatusId) statusEl.value = d.toStatusId;
+    pamzSerialCount();
+    let when = '';
+    try { when = d.savedAt ? new Date(d.savedAt).toLocaleString() : ''; } catch (e) {}
+    pamzShowDraftNote('↺ Draft restored' + (when ? ' (saved ' + escHtml(when) + ')' : '') + ' · <a href="#" onclick="pamzDiscardDraft();return false;" style="color:var(--danger,#dc2626);">discard</a>');
+}
+
+function pamzDiscardDraft() {
+    pamzClearDraft();
+    const ta = document.getElementById('pamz-serials'); if (ta) ta.value = '';
+    pamzResetValidation();
+    pamzSerialCount();
+    pamzShowDraftNote('');
+    toast('Draft discarded.', 'info');
+}
+
+function pamzClearDraft() {
+    try { localStorage.removeItem(PAMZ_DRAFT_KEY); } catch (e) {}
+}
+
+function pamzShowDraftNote(html) {
+    const el = document.getElementById('pamz-draft-note');
+    if (!el) return;
+    if (!html) { el.style.display = 'none'; el.innerHTML = ''; return; }
+    el.innerHTML = html;
+    el.style.display = 'block';
 }
 
 
@@ -16121,39 +19117,21 @@ function sceRenderList() {
         let metaLeft    = '';
 
         if (counted) {
+            // Blind count: never reveal the snapshot or whether the count
+            // matches it. The comparison happens at review, not on the floor.
             if (item.serialized) {
                 const scanned = (counted.counted.serials || []).length;
-                const expSet = new Set((item.serialNumbers || []).map(s => String(s).trim()));
-                const cntSet = new Set((counted.counted.serials || []).map(s => String(s).trim()));
-                let miss = 0, extra = 0;
-                expSet.forEach(s => { if (!cntSet.has(s)) miss++;   });
-                cntSet.forEach(s => { if (!expSet.has(s)) extra++; });
-                if (miss === 0 && extra === 0) {
-                    stateClass = 'counted';
-                    badge = '<span class="badge badge-success">✓ ' + scanned + ' scanned</span>';
-                } else {
-                    stateClass = 'mismatch';
-                    const parts = [];
-                    if (extra) parts.push('+' + extra);
-                    if (miss)  parts.push('-' + miss);
-                    badge = '<span class="badge" style="background:var(--danger);color:#fff;">' +
-                        scanned + ' · ' + parts.join(' / ') + '</span>';
-                }
+                stateClass = 'counted';
+                badge = '<span class="badge badge-success">\u2713 ' + scanned + ' scanned</span>';
             } else {
                 const cnt = parseFloat(counted.counted.quantity) || 0;
-                if (cnt === expected) {
-                    stateClass = 'counted';
-                    badge = '<span class="badge badge-success">✓ Qty ' + cnt + '</span>';
-                } else {
-                    stateClass = 'mismatch';
-                    const diff = cnt - expected;
-                    badge = '<span class="badge" style="background:var(--danger);color:#fff;">Qty ' + cnt + ' · ' + (diff > 0 ? '+' : '') + diff + '</span>';
-                }
+                stateClass = 'counted';
+                badge = '<span class="badge badge-success">\u2713 Qty ' + cnt + '</span>';
             }
         } else {
             badge = '<span class="badge badge-warning">Pending</span>';
         }
-        metaLeft = (item.serialized ? 'Serialized' : 'Non-serial') + ' · expected ' + expected;
+        metaLeft = (item.serialized ? 'Serialized' : 'Non-serial');
 
         // Encode item id for the inline handler. JSON.stringify gives us safe
         // quoting; strip the outer quotes and re-escape any embedded single quotes
@@ -16179,7 +19157,7 @@ function sceOpenItem(itemId) {
 
     document.getElementById('sce-detail-name').textContent  = item.itemName || '—';
     document.getElementById('sce-detail-meta').textContent  =
-        (item.serialized ? 'Serialized · ' : 'Non-serial · ') + 'expected ' + expected;
+        (item.serialized ? 'Serialized' : 'Non-serial');
 
     document.getElementById('sce-detail-state-badge').innerHTML = existing
         ? '<span class="badge badge-success">Counted</span>'
@@ -16193,15 +19171,9 @@ function sceOpenItem(itemId) {
         sceRenderScannedSerials();
         const input = document.getElementById('sce-serial-input');
         input.value = '';
-        // Snapshot-side serials expander, useful for informed counting.
-        const expList = item.serialNumbers || [];
-        const wrap = document.getElementById('sce-expected-wrap');
-        wrap.style.display = expList.length ? 'block' : 'none';
-        if (expList.length) {
-            document.getElementById('sce-expected-count').textContent = expList.length;
-            document.getElementById('sce-expected-list').innerHTML =
-                expList.map(s => '<span>' + escHtml(s) + '</span>').join('');
-        }
+        // Blind count: the snapshot serial list is intentionally NOT shown
+        // to the counter. The comparison happens at review.
+        document.getElementById('sce-expected-wrap').style.display = 'none';
         // Only auto-focus where there's a physical keyboard — avoids the on-screen
         // keyboard popping up the moment a phone user opens an item.
         if (window.matchMedia && window.matchMedia('(pointer:fine)').matches) {
@@ -16212,7 +19184,7 @@ function sceOpenItem(itemId) {
         document.getElementById('sce-qty-section').style.display    = 'block';
         const qtyIn = document.getElementById('sce-qty-input');
         qtyIn.value = existing ? (existing.counted.quantity || 0) : '';
-        document.getElementById('sce-qty-expected').textContent = expected;
+        // Blind count: expected quantity intentionally not shown.
         if (window.matchMedia && window.matchMedia('(pointer:fine)').matches) {
             setTimeout(() => qtyIn.focus(), 60);
         }
@@ -16235,22 +19207,18 @@ function sceBackToList() {
 function sceRenderScannedSerials() {
     const container = document.getElementById('sce-scanned-serials');
     document.getElementById('sce-scanned-count').textContent = _sceScannedSerials.length;
-    const item = _sceFindItem(_sceActiveItemId);
-    const expected = _sceExpectedCount(item);
+    // Blind count: no "of N" target hint.
     const tgt = document.getElementById('sce-scanned-target');
-    if (tgt) tgt.textContent = expected ? (' of ' + expected) : '';
+    if (tgt) tgt.textContent = '';
 
     if (_sceScannedSerials.length === 0) {
         container.innerHTML = '<span style="color:var(--text-dim);font-size:12px;">No serials scanned yet</span>';
         return;
     }
-    // Mark each pill as "extra" (not in snapshot) so the user can see at-a-glance
-    // which scans are unexpected — that's what gets routed to Bin Transfer / Adj
-    // at finalize.
-    const expSet = new Set(((item && item.serialNumbers) || []).map(s => String(s).trim()));
+    // Blind count: pills are deliberately NOT marked against the snapshot —
+    // the counter records what is physically there, review does the comparing.
     container.innerHTML = _sceScannedSerials.map((sn, idx) => {
-        const isExtra = !expSet.has(String(sn).trim());
-        return '<span class="sce-serial-pill' + (isExtra ? ' extra' : '') + '">' +
+        return '<span class="sce-serial-pill">' +
             escHtml(sn) +
             '<span class="sce-serial-x" onclick="event.stopPropagation();sceRemoveSerial(' + idx + ')" title="Remove">&times;</span>' +
         '</span>';
@@ -16523,6 +19491,8 @@ async function scrStartReview(id) {
         // Populate UI
         scrRenderReviewUI();
         navigateTo('sc-review');
+        // Approval impact preview (async — fills its card when ready)
+        scrLoadImpactPreview();
     } catch (err) {
         toast('Error: ' + err.message, 'error');
     } finally {
@@ -16592,12 +19562,31 @@ function scrCalculateDiscrepancies(items, counted) {
 // Track per-item approval state: 'pending' | 'approved' | 'rejected'
 let _scrItemStates = [];
 
+// A count that's already approved is read-only: no re-approve/reject/finalize.
+function scrIsReadOnly() {
+    return !!(_scrData && String(_scrData.status || '').toLowerCase() === 'approved');
+}
+
 function scrRenderReviewUI() {
     // Header info
     document.getElementById('scr-count-id').textContent = '#' + _scrData.id;
     document.getElementById('scr-location').textContent = _scrData.location || '—';
     document.getElementById('scr-bin').textContent = _scrData.binName || '—';
     document.getElementById('scr-status').textContent = _scrData.status || '—';
+
+    // Correction transaction link (shown once a count has been finalized)
+    const corrEl = document.getElementById('scr-correction');
+    if (corrEl) {
+        const c = _scrData.correction;
+        if (c && c.id) {
+            const label = escHtml((c.typeLabel ? c.typeLabel + ' ' : '') + (c.tranId || c.id));
+            corrEl.innerHTML = c.url
+                ? '<a href="' + escHtml(c.url) + '" target="_blank" rel="noopener" style="color:var(--primary,#1866c2);text-decoration:underline;">' + label + '</a>'
+                : label;
+        } else {
+            corrEl.textContent = '—';
+        }
+    }
 
     // Initialize item states - items with no discrepancy are auto-approved
     _scrItemStates = _scrDiscrepancies.map(d => d.hasDiscrepancy ? 'pending' : 'approved');
@@ -16668,7 +19657,13 @@ function scrRenderReviewTable() {
 
         // Action column based on state
         let actionCell;
-        if (!d.hasDiscrepancy) {
+        const readOnly = scrIsReadOnly();
+        if (readOnly) {
+            // Already finalized — informational only, no buttons.
+            actionCell = d.hasDiscrepancy
+                ? '<span class="badge" style="background:var(--surface-hover);color:var(--text-dim);">Finalized</span>'
+                : '<span style="color:var(--success); font-size:12px;">No action needed</span>';
+        } else if (!d.hasDiscrepancy) {
             actionCell = '<span style="color:var(--success); font-size:12px;">No action needed</span>';
         } else if (state === 'approved') {
             actionCell = '<span class="badge" style="background:var(--success);color:white;">Approved</span>' +
@@ -16704,29 +19699,154 @@ function scrRenderReviewTable() {
     }).join('');
 }
 
+// ── Approval impact preview (dry-run of the finalize classifier) ──
+let _scrPreview = null; // { byItem: {itemId: row}, ok: bool }
+
+function _scrMoney(n) {
+    const v = Math.abs(parseFloat(n) || 0);
+    return '$' + v.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+async function scrLoadImpactPreview() {
+    _scrPreview = null;
+    const card = document.getElementById('scr-impact-card');
+    // Already approved → the "what finalizing will do" dry-run is irrelevant
+    // (and would re-classify against current inventory). Keep the card hidden.
+    if (scrIsReadOnly()) { if (card) card.style.display = 'none'; return; }
+    const changed = _scrDiscrepancies.filter(d => d.hasDiscrepancy);
+    if (!changed.length) { card.style.display = 'none'; return; }
+    card.style.display = 'block';
+    document.getElementById('scr-impact-totals').innerHTML = '';
+    document.getElementById('scr-impact-body').innerHTML = '<div style="color:var(--text-dim);font-size:13px;padding:8px 0;">Calculating impact\u2026</div>';
+    try {
+        const adjustments = changed.map(d => ({
+            itemId: d.itemId,
+            itemName: d.itemName,
+            serialized: d.serialized,
+            addSerials: d.extraSerials || [],
+            removeSerials: d.missingSerials || [],
+            adjustQty: d.serialized ? 0 : d.qtyDifference
+        }));
+        const data = await apiPost('previewStockCountAdjustment', {
+            stockCountId: _scrData.id,
+            locationId: _scrData.locationId,
+            binId: _scrData.binId,
+            adjustments: adjustments
+        });
+        if (!data.success) {
+            document.getElementById('scr-impact-body').innerHTML = '<div style="color:var(--danger);font-size:13px;">Preview unavailable: ' + escHtml(data.message || 'unknown error') + '</div>';
+            return;
+        }
+        const byItem = {};
+        (data.items || []).forEach(r => { byItem[String(r.itemId)] = r; });
+        _scrPreview = { byItem: byItem };
+        scrRenderImpact();
+    } catch (err) {
+        document.getElementById('scr-impact-body').innerHTML = '<div style="color:var(--danger);font-size:13px;">Preview unavailable: ' + escHtml(err.message) + '</div>';
+    }
+}
+
+function scrRenderImpact() {
+    if (!_scrPreview) return;
+    const body = document.getElementById('scr-impact-body');
+    const totalsEl = document.getElementById('scr-impact-totals');
+    const totals = { transferUnits: 0, addUnits: 0, addValue: 0, removeUnits: 0, removeValue: 0, cancelledUnits: 0, blockedUnits: 0 };
+    const lines = [];
+
+    _scrDiscrepancies.forEach((d, idx) => {
+        if (!d.hasDiscrepancy) return;
+        const r = _scrPreview.byItem[String(d.itemId)];
+        if (!r) return;
+        const rejected = (_scrItemStates[idx] === 'rejected');
+
+        const parts = [];
+        if (r.serialized) {
+            if (r.transferIn.length) {
+                const bins = [];
+                r.transferIn.forEach(t => { if (t.fromBinName && bins.indexOf(t.fromBinName) === -1) bins.push(t.fromBinName); });
+                parts.push('<span style="color:var(--primary);font-weight:600;">transfer in ' + r.transferIn.length + '</span> from ' + escHtml(bins.join(', ') || 'other bins'));
+            }
+            if (r.trueAdd.length)    parts.push('<span style="color:var(--success);font-weight:600;">add ' + r.trueAdd.length + ' (+' + _scrMoney(r.addValue) + ')</span>');
+            if (r.realRemove.length) parts.push('<span style="color:var(--danger);font-weight:600;">write off ' + r.realRemove.length + ' (-' + _scrMoney(r.removeValue) + ')</span>');
+            if (r.cancelled.length)  parts.push(r.cancelled.length + ' write-off(s) cancelled (moved elsewhere)');
+            if (r.blocked.length)    parts.push('<span style="color:var(--warning);font-weight:600;">' + r.blocked.length + ' blocked \u2014 manual review</span>');
+        } else {
+            if (r.adjustQty > 0) parts.push('<span style="color:var(--success);font-weight:600;">add ' + r.adjustQty + ' (+' + _scrMoney(r.addValue) + ')</span>');
+            if (r.adjustQty < 0) parts.push('<span style="color:var(--danger);font-weight:600;">write off ' + Math.abs(r.adjustQty) + ' (-' + _scrMoney(r.removeValue) + ')</span>');
+        }
+        if (!parts.length) parts.push('<span style="color:var(--text-dim);">no posting needed</span>');
+
+        if (!rejected) {
+            totals.transferUnits += (r.transferIn || []).length || 0;
+            totals.addUnits      += r.serialized ? r.trueAdd.length    : Math.max(r.adjustQty, 0);
+            totals.removeUnits   += r.serialized ? r.realRemove.length : Math.max(-r.adjustQty, 0);
+            totals.addValue      += r.addValue;
+            totals.removeValue   += r.removeValue;
+            totals.cancelledUnits+= (r.cancelled || []).length || 0;
+            totals.blockedUnits  += (r.blocked || []).length || 0;
+        }
+
+        lines.push('<div style="display:flex;gap:10px;align-items:baseline;padding:7px 0;border-bottom:1px solid var(--border);flex-wrap:wrap;' + (rejected ? 'opacity:.45;text-decoration:line-through;' : '') + '">' +
+            '<span style="font-weight:600;font-size:13px;min-width:180px;">' + escHtml(r.itemName) + (rejected ? ' (rejected)' : '') + '</span>' +
+            '<span style="font-size:12.5px;">' + parts.join(' \u00b7 ') + '</span>' +
+        '</div>');
+    });
+
+    body.innerHTML = lines.join('') || '<div style="color:var(--text-dim);font-size:13px;">Nothing to post.</div>';
+
+    const netValue = totals.addValue - totals.removeValue;
+    const pill = (label, value, color) =>
+        '<div style="padding:8px 14px;background:var(--surface-hover);border-radius:8px;text-align:center;min-width:100px;">' +
+            '<div style="font-size:17px;font-weight:700;' + (color ? 'color:' + color + ';' : '') + '">' + value + '</div>' +
+            '<div style="font-size:11px;color:var(--text-dim);">' + label + '</div>' +
+        '</div>';
+    let t = '';
+    t += pill('Transfers in', totals.transferUnits, 'var(--primary)');
+    t += pill('Write-offs', totals.removeUnits + ' (-' + _scrMoney(totals.removeValue) + ')', 'var(--danger)');
+    t += pill('Additions', totals.addUnits + ' (+' + _scrMoney(totals.addValue) + ')', 'var(--success)');
+    if (totals.cancelledUnits) t += pill('Cancelled', totals.cancelledUnits, '');
+    if (totals.blockedUnits)   t += pill('Blocked', totals.blockedUnits, 'var(--warning)');
+    t += pill('Net value', (netValue < 0 ? '-' : '+') + _scrMoney(netValue), netValue < 0 ? 'var(--danger)' : 'var(--success)');
+    totalsEl.innerHTML = t;
+}
+
 function scrApproveItem(idx) {
+    if (scrIsReadOnly()) return;
     _scrItemStates[idx] = 'approved';
     scrRenderReviewTable();
     scrUpdateFinalizeButton();
+    scrRenderImpact();
 }
 
 function scrRejectItem(idx) {
+    if (scrIsReadOnly()) return;
     _scrItemStates[idx] = 'rejected';
     scrRenderReviewTable();
     scrUpdateFinalizeButton();
+    scrRenderImpact();
 }
 
 function scrUndoItem(idx) {
+    if (scrIsReadOnly()) return;
     _scrItemStates[idx] = 'pending';
     scrRenderReviewTable();
     scrUpdateFinalizeButton();
+    scrRenderImpact();
 }
 
 function scrUpdateFinalizeButton() {
-    const pendingCount = _scrItemStates.filter(s => s === 'pending').length;
     const btn = document.getElementById('scr-finalize-btn');
     const msg = document.getElementById('scr-pending-msg');
 
+    // Approved counts are read-only — no finalizing again.
+    if (scrIsReadOnly()) {
+        if (btn) btn.style.display = 'none';
+        if (msg) msg.style.display = 'none';
+        return;
+    }
+    if (btn) btn.style.display = '';
+
+    const pendingCount = _scrItemStates.filter(s => s === 'pending').length;
     if (pendingCount === 0) {
         btn.disabled = false;
         msg.style.display = 'none';
@@ -16801,6 +19921,7 @@ function scrCloseSerialModal() {
 }
 
 async function scrFinalizeCount() {
+    if (scrIsReadOnly()) { toast('This count is already approved.', 'info'); return; }
     // Get approved items that have discrepancies
     const approvedDiscrepancies = [];
     _scrDiscrepancies.forEach((d, idx) => {

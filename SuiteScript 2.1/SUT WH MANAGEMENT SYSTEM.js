@@ -2442,6 +2442,10 @@ define([
         const lines = [];
         for (let i = 0; i < lineCount; i++) {
             const itemId = String(poRec.getSublistValue({ sublistId: 'item', fieldId: 'item', line: i }));
+            // PO line UNIQUE ID (`line` field). The Item Receipt's `orderline`
+            // references this, NOT the 0-based sublist position, so it's the
+            // only reliable key when the same item is on more than one line.
+            const poLineId = String(poRec.getSublistValue({ sublistId: 'item', fieldId: 'line', line: i }) || '');
             const itemText = poRec.getSublistText({ sublistId: 'item', fieldId: 'item', line: i });
             const description = poRec.getSublistValue({ sublistId: 'item', fieldId: 'description', line: i }) || '';
             const quantity = parseFloat(poRec.getSublistValue({ sublistId: 'item', fieldId: 'quantity', line: i })) || 0;
@@ -2452,7 +2456,7 @@ define([
             const isPendingReceipt = isFullyReceived && (quantityBilled < quantity);
 
             lines.push({
-                lineNum: i, itemId, itemText, description,
+                lineNum: i, poLineId, itemId, itemText, description,
                 quantity, quantityReceived, quantityRemaining: Math.max(0, quantityRemaining),
                 isSerialized: !!serializedItems[itemId],
                 isFullyReceived, isPendingReceipt
@@ -2476,21 +2480,37 @@ define([
 
         receipt.setValue({ fieldId: 'location', value: parseInt(data.locationId) });
 
-        // Build lookup: itemId → line data (handle multiple lines for same item)
-        const receiveQueue = {};
+        // Match each selected line to the EXACT PO line the user picked.
+        // The receipt's `orderline` references the PO line's unique `line` id,
+        // so keying on poLineId receives the right line when the same item is
+        // on more than one PO line. Lines without a poLineId (legacy clients)
+        // fall back to item-based queueing.
+        const receiveByLineId = {};
+        const receiveQueue = {}; // itemId → [lines]  (fallback only)
         data.lines.forEach(l => {
-            const key = String(l.itemId);
-            if (!receiveQueue[key]) receiveQueue[key] = [];
-            receiveQueue[key].push(l);
+            if (l.poLineId) {
+                receiveByLineId[String(l.poLineId)] = l;
+            } else {
+                const key = String(l.itemId);
+                if (!receiveQueue[key]) receiveQueue[key] = [];
+                receiveQueue[key].push(l);
+            }
         });
 
         const lineCount = receipt.getLineCount({ sublistId: 'item' });
         for (let i = 0; i < lineCount; i++) {
             receipt.selectLine({ sublistId: 'item', line: i });
             const lineItem = String(receipt.getCurrentSublistValue({ sublistId: 'item', fieldId: 'item' }));
+            const orderLine = String(receipt.getCurrentSublistValue({ sublistId: 'item', fieldId: 'orderline' }) || '');
 
-            const queue = receiveQueue[lineItem];
-            const matchedLine = queue && queue.length ? queue.shift() : null;
+            let matchedLine = null;
+            if (orderLine && receiveByLineId.hasOwnProperty(orderLine)) {
+                matchedLine = receiveByLineId[orderLine];
+                delete receiveByLineId[orderLine]; // consume: each PO line receives once
+            } else {
+                const queue = receiveQueue[lineItem];
+                matchedLine = queue && queue.length ? queue.shift() : null;
+            }
 
             if (!matchedLine) {
                 receipt.setCurrentSublistValue({ sublistId: 'item', fieldId: 'itemreceive', value: false });
@@ -3005,11 +3025,21 @@ define([
 
         if (!Object.keys(toMoveByItem).length && !nonSerialToMove.length) return null; // Already staged.
 
+        // Memo must reference the SO by document number (tranid), never the
+        // internal id. The client passes data.soTranId; look it up if missing.
+        let soTranId = data.soTranId ? String(data.soTranId) : '';
+        if (!soTranId) {
+            try {
+                const soMeta = search.lookupFields({ type: search.Type.SALES_ORDER, id: data.soId, columns: ['tranid'] });
+                if (soMeta && soMeta.tranid) soTranId = String(soMeta.tranid);
+            } catch (e) { log.debug('stageSerialsForPick: SO tranid lookup failed', e.message); }
+        }
+
         // Build the Bin Transfer (one record, multiple item lines).
         const bt = record.create({ type: record.Type.BIN_TRANSFER, isDynamic: true });
         bt.setValue({ fieldId: 'subsidiary', value: '1' });
         if (locationId) bt.setValue({ fieldId: 'location', value: parseInt(locationId) });
-        bt.setValue({ fieldId: 'memo', value: 'Picked for SO ' + data.soId });
+        bt.setValue({ fieldId: 'memo', value: 'Picked for SO ' + (soTranId || data.soId) });
 
         Object.keys(toMoveByItem).forEach(itemId => {
             const serials = toMoveByItem[itemId];
@@ -3053,7 +3083,7 @@ define([
         });
 
         const btId = bt.save({ enableSourcing: true, ignoreMandatoryFields: false });
-        log.audit('SO Pick Staging', 'Staged picked stock into bin ' + SO_PICK_STAGING_BIN_ID + ' via Bin Transfer ' + btId + ' for SO ' + data.soId);
+        log.audit('SO Pick Staging', 'Staged picked stock into bin ' + SO_PICK_STAGING_BIN_ID + ' via Bin Transfer ' + btId + ' for SO ' + (soTranId || data.soId));
         return btId;
     };
 
@@ -6778,7 +6808,7 @@ define([
                 try {
                     const rec = record.create({ type: 'customrecord_print_label', isDynamic: true });
                     rec.setValue({ fieldId: 'custrecord_pl_item_number', value: group.itemId });
-                    rec.setValue({ fieldId: 'custrecord_express_entry', value: group.serialNumbers.join('<br>') });
+                    rec.setValue({ fieldId: 'custrecord_express_entry', value: group.serialNumbers.join('\n') });
                     group.recordId = rec.save({ enableSourcing: true, ignoreMandatoryFields: false });
                 } catch (e) { log.error('Print Label Record Error', e.message); group.recordId = 'ERR'; }
             });
@@ -9789,56 +9819,83 @@ define([
     //  PRINT LABEL DASHBOARD — Server-side code (embedded, pl-prefixed)
     // ═══════════════════════════════════════════════════════════════════
 
-        function plValidateSerialNumbers(serialNumbers, itemId) {
-            if (!serialNumbers) return { valid: [], invalid: [], details: {} };
-
-            const cleanedSerials = serialNumbers
-                .replace(/\r\n/g, '\n')
-                .replace(/\r/g, '\n')
-                .replace(/<br\s*\/?>/gi, '\n')
-                .split('\n')
+        // Shared serial parser — tolerant of any delimiter a scanner or paste
+        // might produce: newlines, CR, tabs, spaces, commas, semicolons, and
+        // stored <br> separators. De-dupes case-insensitively, preserving the
+        // first-seen spelling. Serial numbers never contain internal spaces, so
+        // splitting on whitespace is safe.
+        function plParseSerials(raw) {
+            if (!raw) return [];
+            const parsed = String(raw)
+                .replace(/<br\s*\/?>/gi, '\n')      // stored separator
+                .replace(/[\u200B\uFEFF]/g, '')     // strip zero-width / BOM chars
+                .split(/[\s,;]+/)                    // whitespace, comma, semicolon
                 .map(sn => sn.trim())
                 .filter(sn => sn !== '');
 
+            const seen = {};
+            return parsed.filter(sn => {
+                const k = sn.toUpperCase();
+                if (seen[k]) return false;
+                seen[k] = true;
+                return true;
+            });
+        }
+
+        function plValidateSerialNumbers(serialNumbers, itemId) {
+            if (!serialNumbers) return { valid: [], invalid: [], details: {} };
+
+            const cleanedSerials = plParseSerials(serialNumbers);
+
             if (cleanedSerials.length === 0) return { valid: [], invalid: [], details: {} };
 
-            const serialFilters = [];
-            cleanedSerials.forEach((serial, index) => {
-                if (index > 0) serialFilters.push('OR');
-                serialFilters.push(['inventorynumber', 'is', serial]);
-            });
-
-            // When an item is specified, require the serial to belong to that item
-            const filterExpression = itemId
-                ? [serialFilters, 'AND', ['item', 'anyof', itemId]]
-                : serialFilters;
-
+            // Case-insensitive found set. The OR-chain is batched and the atomic
+            // item filter is placed FIRST: NetSuite's inventorynumber search
+            // mis-parses when a leading OR sub-group is AND'd with the item
+            // filter (fine with 1 serial, drops matches with 2+), and long OR
+            // chains get unreliable past ~100 conditions. Mirrors the proven
+            // validateSerialsInStock pattern used by SO picking.
             const foundSerials = {};
+            const BATCH = 50;
 
-            try {
-                search.create({
-                    type: 'inventorynumber',
-                    filters: filterExpression,
-                    columns: ['inventorynumber']
-                }).run().each(result => {
-                    const sn = result.getValue('inventorynumber');
-                    foundSerials[sn] = true;
-                    return true;
+            for (let offset = 0; offset < cleanedSerials.length; offset += BATCH) {
+                const batch = cleanedSerials.slice(offset, offset + BATCH);
+                const orExpr = [];
+                batch.forEach((serial, i) => {
+                    if (i > 0) orExpr.push('OR');
+                    orExpr.push(['inventorynumber', 'is', serial]);
                 });
-            } catch (e) {
-                log.error('Search Error', e.message);
+
+                const filterExpression = itemId
+                    ? [['item', 'anyof', [itemId]], 'AND', orExpr]
+                    : orExpr;
+
+                try {
+                    search.create({
+                        type: 'inventorynumber',
+                        filters: filterExpression,
+                        columns: ['inventorynumber']
+                    }).run().each(result => {
+                        foundSerials[String(result.getValue('inventorynumber')).toUpperCase()] = true;
+                        return true;
+                    });
+                } catch (e) {
+                    log.error('plValidate Search Error', e.message);
+                }
             }
 
             const valid = [];
             const invalid = [];
 
             cleanedSerials.forEach(serial => {
-                if (foundSerials[serial]) {
+                if (foundSerials[serial.toUpperCase()]) {
                     valid.push(serial);
                 } else {
                     invalid.push(serial);
                 }
             });
+
+            log.debug('plValidate result', 'item=' + itemId + ' in=' + cleanedSerials.length + ' valid=' + valid.length + ' invalid=[' + invalid.join(', ') + ']');
 
             return { valid, invalid };
         }
@@ -10810,7 +10867,7 @@ define([
             }
 
             try {
-                const serialNumbers = serialsRaw.split('\n').map(s => s.trim()).filter(s => s !== '');
+                const serialNumbers = plParseSerials(serialsRaw);
                 const pdfFile = plGenerateLabelsPdf({ itemText, description, serialNumbers, recordId });
 
                 context.response.setHeader({ name: 'Content-Type', value: 'application/pdf' });
@@ -10940,7 +10997,7 @@ setTimeout(doPrint, 2000);
             try {
                 const rec = record.create({ type: 'customrecord_print_label', isDynamic: true });
                 rec.setValue({ fieldId: 'custrecord_pl_item_number', value: firstItem.itemId });
-                rec.setValue({ fieldId: 'custrecord_express_entry', value: allSerials.join('<br>') });
+                rec.setValue({ fieldId: 'custrecord_express_entry', value: allSerials.join('\n') });
 
                 const recordId = rec.save({ enableSourcing: true, ignoreMandatoryFields: false });
 
@@ -10995,7 +11052,7 @@ setTimeout(doPrint, 2000);
 
             const rec = record.create({ type: 'customrecord_print_label', isDynamic: true });
             rec.setValue({ fieldId: 'custrecord_pl_item_number', value: item });
-            rec.setValue({ fieldId: 'custrecord_express_entry', value: validSerials.join('<br>') });
+            rec.setValue({ fieldId: 'custrecord_express_entry', value: validSerials.join('\n') });
 
             const recordId = rec.save({ enableSourcing: true, ignoreMandatoryFields: false });
 
@@ -11017,11 +11074,7 @@ setTimeout(doPrint, 2000);
                 const itemId = rec.getValue({ fieldId: 'custrecord_pl_item_number' });
                 const serialsRaw = rec.getValue({ fieldId: 'custrecord_express_entry' }) || '';
 
-                const serialNumbers = serialsRaw
-                    .replace(/<br\s*\/?>/gi, '\n')
-                    .split('\n')
-                    .map(s => s.trim())
-                    .filter(s => s !== '');
+                const serialNumbers = plParseSerials(serialsRaw);
 
                 let itemText = '';
                 let description = '';
@@ -11582,6 +11635,19 @@ button.stock-sheet-row-pick:active { background:var(--primary-soft, #e3edff); }
 }
 .sce-chip:hover { background:var(--surface-hover); }
 .sce-chip.selected { background:var(--accent); border-color:var(--accent); color:#fff; }
+.sce-search { position:relative; margin-bottom:10px; }
+.sce-search-input {
+    width:100%; box-sizing:border-box; padding:10px 34px 10px 12px;
+    border:1px solid var(--border); border-radius:8px;
+    background:var(--surface); color:var(--text); font-size:14px;
+}
+.sce-search-input:focus { outline:none; border-color:var(--accent); }
+.sce-search-clear {
+    position:absolute; right:6px; top:50%; transform:translateY(-50%);
+    border:none; background:transparent; color:var(--text-dim);
+    font-size:20px; line-height:1; cursor:pointer; padding:2px 8px;
+}
+.sce-search-clear:hover { color:var(--text); }
 
 .sce-list-card { padding:8px; }
 .sce-list-item {
@@ -13429,6 +13495,10 @@ button.stock-sheet-row-pick:active { background:var(--primary-soft, #e3edff); }
 
     <!-- ── LIST screen ── -->
     <div id="sce-list-screen">
+        <div class="sce-search">
+            <input type="text" id="sce-search" class="sce-search-input" placeholder="Search item\u2026" autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false" oninput="sceSetSearch(this.value)">
+            <button type="button" id="sce-search-clear" class="sce-search-clear" onclick="sceClearSearch()" style="display:none;" aria-label="Clear search">\u00D7</button>
+        </div>
         <div class="sce-filter" id="sce-filter">
             <button class="sce-chip selected" data-filter="all" onclick="sceSetFilter('all')">All</button>
             <button class="sce-chip" data-filter="pending" onclick="sceSetFilter('pending')">Pending</button>
@@ -15879,7 +15949,9 @@ function porcvOpenItem(idx) {
     // Status select - cached options, default to staged status or last-used.
     const statusSel = document.getElementById('porcv-item-status');
     populateSelect(statusSel, porcvStatusCodes);
-    const wantStatus = (line.staged && line.staged.inventoryStatusId) || porcvLastStatusId || '';
+    // Default to Good (internal id = 1) on every fresh item screen; if the line
+    // was already staged, show the status that was previously picked instead.
+    const wantStatus = (line.staged && line.staged.inventoryStatusId) || '1';
     if (wantStatus) statusSel.value = String(wantStatus);
 
     const serialGroup = document.getElementById('porcv-item-serial-group');
@@ -16342,7 +16414,7 @@ async function porcvSubmit() {
     currentPORcvData.lines.forEach(line => {
         if (!line.staged) return;
         selectedLines.push({
-            lineNum: line.lineNum, itemId: line.itemId, itemText: line.itemText, description: line.description,
+            lineNum: line.lineNum, poLineId: line.poLineId, itemId: line.itemId, itemText: line.itemText, description: line.description,
             isSerialized: line.isSerialized,
             serialNumbers: line.staged.serialNumbers,
             quantity: line.staged.quantity,
@@ -18536,7 +18608,7 @@ async function sopickSubmit() {
     showProcessing('Creating Fulfillment...', 'Picking items from inventory');
 
     try {
-        const result = await apiPost('pickSOItems', { soId: currentSOPickData.soId, locationId: sopickLocId, lines: selectedLines });
+        const result = await apiPost('pickSOItems', { soId: currentSOPickData.soId, soTranId: currentSOPickData.soTranId, locationId: sopickLocId, lines: selectedLines });
 
         if (result.success && result.fulfillmentId && !result.partial) {
             // Genuine, verified fulfillment — only now do we show the
@@ -19028,6 +19100,7 @@ let _sceCounted = [];
 let _sceScannedSerials = [];   // scratch buffer for the currently open detail
 let _sceActiveItemId = null;   // which item is open in the detail screen
 let _sceFilter = 'all';        // 'all' | 'pending' | 'counted'
+let _sceSearch = '';           // live item-name search on the counting screen
 
 async function sceStartCount(id) {
     showProcessing('Loading Stock Count...', 'Fetching details');
@@ -19040,6 +19113,11 @@ async function sceStartCount(id) {
         _sceScannedSerials = [];
         _sceActiveItemId = null;
         _sceFilter = 'all';
+        _sceSearch = '';
+        const _si = document.getElementById('sce-search');
+        if (_si) _si.value = '';
+        const _sc = document.getElementById('sce-search-clear');
+        if (_sc) _sc.style.display = 'none';
 
         if (_sceData.status === 'pending') {
             await apiPost('updateStockCount', { id: _sceData.id, status: 'in_progress' });
@@ -19089,22 +19167,44 @@ function sceSetFilter(f) {
     sceRenderList();
 }
 
+function sceSetSearch(v) {
+    _sceSearch = (v || '').trim().toLowerCase();
+    const clr = document.getElementById('sce-search-clear');
+    if (clr) clr.style.display = _sceSearch ? 'block' : 'none';
+    sceRenderList();
+}
+
+function sceClearSearch() {
+    const inp = document.getElementById('sce-search');
+    if (inp) inp.value = '';
+    sceSetSearch('');
+    if (inp) inp.focus();
+}
+
 function sceRenderList() {
     const wrap  = document.getElementById('sce-list');
     const empty = document.getElementById('sce-no-items');
     if (!wrap) return;
 
     const items = _sceItems.filter(item => {
-        if (_sceFilter === 'all')     return true;
         const c = _sceFindCounted(item.itemId);
-        if (_sceFilter === 'pending') return !c;
-        if (_sceFilter === 'counted') return !!c;
+        if (_sceFilter === 'pending' && c)  return false;
+        if (_sceFilter === 'counted' && !c) return false;
+        if (_sceSearch) {
+            const hay = String(item.itemName || '').toLowerCase();
+            if (hay.indexOf(_sceSearch) === -1) return false;
+        }
         return true;
     });
 
     if (!items.length) {
         wrap.innerHTML = '';
-        if (empty) empty.style.display = 'block';
+        if (empty) {
+            empty.textContent = _sceSearch
+                ? ('No items match \u201C' + _sceSearch + '\u201D.')
+                : 'No items to show.';
+            empty.style.display = 'block';
+        }
         return;
     }
     if (empty) empty.style.display = 'none';

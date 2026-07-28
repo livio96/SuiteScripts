@@ -5582,7 +5582,7 @@ define([
                     if (!document.querySelector('meta[name="viewport"]')) {
                         var m = document.createElement('meta');
                         m.name = 'viewport';
-                        m.content = 'width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no';
+                        m.content = 'width=device-width, initial-scale=1, viewport-fit=cover';
                         document.head.appendChild(m);
                     }
                 })();
@@ -5734,7 +5734,7 @@ define([
 
                 .action-select {
                     padding:10px 12px; border:2px solid #d1d5db; border-radius:8px;
-                    font-size:14px; background:#f9fafb; color:#111827;
+                    font-size:16px; background:#f9fafb; color:#111827;
                     cursor:pointer; min-width:200px; min-height:44px; max-width:100%;
                 }
                 .action-select:focus {
@@ -5814,7 +5814,7 @@ define([
                 }
                 .wh-modal-sub { font-size:12px; color:#6b7280; }
                 .wh-modal-close {
-                    width:36px; height:36px; flex-shrink:0;
+                    width:44px; height:44px; flex-shrink:0;
                     background:#f3f4f6; border:none; border-radius:50%;
                     cursor:pointer; font-size:22px; line-height:1;
                     color:#374151;
@@ -5858,7 +5858,7 @@ define([
                     .uir-header-buttons,.uir-button-bar,
                     #tbl_submitter,#submitter_row,.uir_form_tab_bg { display:none !important; }
 
-                    .app-container { padding:0 !important; margin:0 !important; height:100vh; max-width:100% !important; overflow-x:hidden !important; }
+                    .app-container { padding:0 !important; margin:0 !important; height:100dvh; max-width:100% !important; overflow-x:hidden !important; }
                     .main-card { border-radius:0; box-shadow:none; border:none; }
                     .card-header { padding:10px 14px; }
                     .card-header h1 { font-size:16px; }
@@ -6958,11 +6958,12 @@ define([
             serialData.valid.forEach((s, idx) => {
                 const isLoc26 = String(s.locationId) === TRANSFER_SOURCE_LOCATION_ID;
                 const transferOption = isLoc26 ? '<option value="transfer_upcharge">Transfer to A &amp; Upcharge</option>' : '';
-                rows += '<tr data-serial="' + escapeXml(s.serialNumber || '') + '" data-item="' + escapeXml(s.itemText || '') + '" data-bin="' + escapeXml(s.binText || '') + '" data-location="' + escapeXml(s.locationText || '') + '">'
+                rows += '<tr data-serial="' + escapeXml(s.serialNumber || '') + '" data-item="' + escapeXml(s.itemText || '') + '" data-bin="' + escapeXml(s.binText || '') + '" data-location="' + escapeXml(s.locationText || '') + '" data-status="' + escapeXml(s.statusText || '') + '">'
                     + '<td data-label="Serial" style="font-family:\'SF Mono\',Monaco,monospace;font-size:14px;">' + escapeXml(s.serialNumber) + '</td>'
                     + '<td data-label="Item"><strong>' + escapeXml(s.itemText) + '</strong></td>'
                     + '<td data-label="Bin">' + (escapeXml(s.binText) || '<span style="color:#9ca3af;">N/A</span>') + '</td>'
                     + '<td data-label="Location">' + (escapeXml(s.locationText) || '<span style="color:#9ca3af;">N/A</span>') + '</td>'
+                    + '<td data-label="Current Status">' + (escapeXml(s.statusText) || '<span style="color:#9ca3af;">N/A</span>') + '</td>'
                     + '<td data-label="Status"><select class="status-override" data-index="' + idx + '" title="Required for Back to Stock actions; other actions use their default status if left blank." style="width:100%;padding:10px;border:1.5px solid #d1d5db;border-radius:6px;font-size:15px;min-height:44px;color:#6b7280;">' + statusOverrideOptions + '</select></td>'
                     + '<td data-label="Action"><select class="action-select" data-index="' + idx + '" data-location="' + escapeXml(String(s.locationId)) + '" onchange="handleActionChange(this)">'
                     + '<option value="">-- No Action --</option>'
@@ -7052,12 +7053,13 @@ define([
                             </div>
                             <table class="results-table">
                                 <thead><tr>
-                                    <th data-sort="serial" onclick="sortTable('serial')" style="cursor:pointer;user-select:none;width:15%;">Serial<span class="sort-indicator"> ⇅</span></th>
-                                    <th data-sort="item" onclick="sortTable('item')" style="cursor:pointer;user-select:none;width:19%;">Item<span class="sort-indicator"> ⇅</span></th>
+                                    <th data-sort="serial" onclick="sortTable('serial')" style="cursor:pointer;user-select:none;width:13%;">Serial<span class="sort-indicator"> ⇅</span></th>
+                                    <th data-sort="item" onclick="sortTable('item')" style="cursor:pointer;user-select:none;width:16%;">Item<span class="sort-indicator"> ⇅</span></th>
                                     <th data-sort="bin" onclick="sortTable('bin')" style="cursor:pointer;user-select:none;width:11%;">Bin<span class="sort-indicator"> ⇅</span></th>
                                     <th data-sort="location" onclick="sortTable('location')" style="cursor:pointer;user-select:none;width:11%;">Location<span class="sort-indicator"> ⇅</span></th>
-                                    <th style="width:22%;" title="Required for Back to Stock actions; other actions use their default status">Status<br><span style="font-weight:400;color:#9ca3af;font-size:11px;">req. for Back to Stock</span></th>
-                                    <th style="width:22%;">Action</th>
+                                    <th data-sort="status" onclick="sortTable('status')" style="cursor:pointer;user-select:none;width:12%;">Current Status<span class="sort-indicator"> ⇅</span></th>
+                                    <th style="width:19%;" title="Required for Back to Stock actions; other actions use their default status">Status<br><span style="font-weight:400;color:#9ca3af;font-size:11px;">req. for Back to Stock</span></th>
+                                    <th style="width:18%;">Action</th>
                                 </tr></thead>
                                 <tbody>${rows}</tbody>
                             </table>
@@ -8007,7 +8009,7 @@ define([
                     }
                     .bp-modal-sub { font-size:12px; color:#6b7280; }
                     .bp-modal-close {
-                        width:36px; height:36px; flex-shrink:0;
+                        width:44px; height:44px; flex-shrink:0;
                         background:#f3f4f6; border:none; border-radius:50%;
                         cursor:pointer; font-size:22px; line-height:1;
                         color:#374151;
@@ -9808,8 +9810,16 @@ define([
                             return;
                         }
                         var bins = binData.results || [];
+                        // Also pull bins in the Refurbishing warehouse (location 26) so
+                        // pickers can see refurb stock in its own labeled section.
+                        var refurbHtml = '';
+                        try {
+                            var refResp = await fetch(ilApiUrl + '&action=getBinInventory&itemId=' + encodeURIComponent(match.id) + '&locationId=26');
+                            var refData = await refResp.json();
+                            if (refData && refData.success) refurbHtml = _ilRenderRefurbSection(refData.results || []);
+                        } catch (re) { /* refurb section is best-effort; ignore failures */ }
                         // Paint the bin table immediately (serials = undefined -> "loading").
-                        results.innerHTML = _ilRenderItemCard(match, bins, undefined);
+                        results.innerHTML = _ilRenderItemCard(match, bins, undefined) + refurbHtml;
                         // Then pull the on-hand serials per bin and re-render with copy buttons.
                         try {
                             var sResp = await fetch(ilApiUrl + '&action=getItemBinSerials&itemId=' + encodeURIComponent(match.id) + '&locationId=1');
@@ -9819,10 +9829,10 @@ define([
                                 serialMap = {};
                                 (sData.bins || []).forEach(function(b) { serialMap[b.bin] = b; });
                             }
-                            results.innerHTML = _ilRenderItemCard(match, bins, serialMap);
+                            results.innerHTML = _ilRenderItemCard(match, bins, serialMap) + refurbHtml;
                         } catch (se) {
                             // Serial lookup failed — keep the bin table without serials.
-                            results.innerHTML = _ilRenderItemCard(match, bins, null);
+                            results.innerHTML = _ilRenderItemCard(match, bins, null) + refurbHtml;
                         }
                     } catch (e) {
                         results.innerHTML = '<div class="il-error">Error: ' + _ilEsc(e.message) + '</div>';
@@ -9920,6 +9930,35 @@ define([
                     return head
                          + '<table class="il-bin-table">'
                          + '<thead><tr><th>Bin</th><th style="text-align:right;">On Hand</th><th style="text-align:right;">Available</th>' + serialTh + '</tr></thead>'
+                         + '<tbody>' + rows + '</tbody>'
+                         + '</table></div>';
+                }
+
+                // Refurbishing warehouse (location 26) bins, shown as a clearly
+                // separated, prominently-labeled section so pickers never confuse
+                // refurb stock with the main-warehouse bins above it.
+                function _ilRenderRefurbSection(bins) {
+                    if (!bins || !bins.length) return '';
+                    bins = bins.slice().sort(function(a, b) { return (b.qtyOH || 0) - (a.qtyOH || 0); });
+                    var totalOH = bins.reduce(function(a, b) { return a + (b.qtyOH || 0); }, 0);
+                    var totalAv = bins.reduce(function(a, b) { return a + (b.qtyAvail || 0); }, 0);
+                    var rows = bins.map(function(b) {
+                        return '<tr>'
+                             + '<td class="il-bin-name" data-label="Bin">' + _ilEsc(b.bin) + '</td>'
+                             + '<td data-label="On Hand" style="text-align:right;font-weight:700;">' + b.qtyOH + '</td>'
+                             + '<td data-label="Avail" style="text-align:right;color:#6b7280;">' + b.qtyAvail + '</td>'
+                             + '</tr>';
+                    }).join('');
+                    return '<div class="il-card" style="border:2px solid #d97706;background:#fffbeb;margin-top:16px;">'
+                         + '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px;">'
+                         + '<span style="font-size:20px;">🔧</span>'
+                         + '<span style="font-weight:800;text-transform:uppercase;letter-spacing:.5px;color:#b45309;font-size:15px;">Refurbishing Warehouse</span>'
+                         + '<span class="il-badge" style="background:#d97706;color:#fff;">LOCATION 26</span>'
+                         + '<span style="margin-left:auto;font-weight:700;color:#b45309;">' + totalOH + ' OH · ' + totalAv + ' Avail</span>'
+                         + '</div>'
+                         + '<div style="font-size:12px;color:#92400e;margin-bottom:10px;">Not in the main warehouse — this stock is in Refurbishing (Loc 26).</div>'
+                         + '<table class="il-bin-table">'
+                         + '<thead><tr><th>Bin</th><th style="text-align:right;">On Hand</th><th style="text-align:right;">Available</th></tr></thead>'
                          + '<tbody>' + rows + '</tbody>'
                          + '</table></div>';
                 }
@@ -10372,7 +10411,7 @@ define([
                     if (!document.querySelector('meta[name="viewport"]')) {
                         var m = document.createElement('meta');
                         m.name = 'viewport';
-                        m.content = 'width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no';
+                        m.content = 'width=device-width, initial-scale=1, viewport-fit=cover';
                         document.head.appendChild(m);
                     }
                 })();
@@ -11429,7 +11468,7 @@ setTimeout(doPrint, 2000);
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Warehouse Assistant</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/html5-qrcode/2.3.8/html5-qrcode.min.js"><\/script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"><\/script>
@@ -11648,7 +11687,7 @@ body {
 input[type="text"], input[type="number"], select, textarea {
     padding: 9px 12px; border-radius:var(--radius-sm);
     border:1px solid var(--border); background:var(--bg);
-    color:var(--text); font-size:14px; font-family:var(--font);
+    color:var(--text); font-size:16px; font-family:var(--font);
     transition: border-color .15s;
     width:100%;
 }
@@ -11656,7 +11695,7 @@ input:focus, select:focus, textarea:focus {
     outline:none; border-color:var(--accent);
     box-shadow: 0 0 0 3px var(--accent-glow);
 }
-textarea { resize:vertical; min-height:80px; font-family:var(--mono); font-size:13px; }
+textarea { resize:vertical; min-height:80px; font-family:var(--mono); font-size:16px; }
 
 /* ─── TABLE ─── */
 .table-wrap { overflow-x:auto; border-radius:var(--radius); border:1px solid var(--border); }
@@ -11715,7 +11754,7 @@ tr:hover td { background:var(--surface-hover); }
 .porcv-line.selected { border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-glow); }
 .porcv-line.pending-receipt { background:#fef2f2; border-color:#fca5a5; }
 .porcv-line-header { display:flex; align-items:center; gap:12px; margin-bottom:8px; }
-.porcv-line-header input[type="checkbox"] { width:18px; height:18px; flex-shrink:0; accent-color:var(--accent); }
+.porcv-line-header input[type="checkbox"] { width:22px; height:22px; flex-shrink:0; accent-color:var(--accent); }
 .porcv-line-item { font-weight:600; font-size:14px; flex:1; }
 .porcv-line-desc { padding-left:30px; font-size:12px; color:var(--text-dim); margin-bottom:8px; }
 .porcv-line-meta {
@@ -11724,7 +11763,7 @@ tr:hover td { background:var(--surface-hover); }
 }
 .porcv-line-meta .value { font-weight:600; color:var(--text); font-size:14px; }
 .porcv-line-input { padding-left:30px; }
-.porcv-line-input textarea { font-family:var(--mono); font-size:13px; width:100%; }
+.porcv-line-input textarea { font-family:var(--mono); font-size:16px; width:100%; }
 .porcv-line-input input[type="number"] { max-width:140px; }
 .porcv-serial-count { font-size:15px; font-weight:600; color:var(--text); margin-top:8px; }
 .porcv-serial-count.has-dupe { color:#dc2626; font-weight:600; }
@@ -11760,7 +11799,7 @@ textarea.dupe-shake { animation:porcvShake .45s ease; }
 .sopick-line.fulfilled { background:rgba(22,163,74,.06); border-color:rgba(22,163,74,.3); }
 .sopick-line.needs-pick { background:rgba(217,119,6,.06); border-color:rgba(217,119,6,.3); }
 .sopick-line-header { display:flex; align-items:center; gap:12px; margin-bottom:8px; }
-.sopick-line-header input[type="checkbox"] { width:18px; height:18px; flex-shrink:0; accent-color:var(--accent); }
+.sopick-line-header input[type="checkbox"] { width:22px; height:22px; flex-shrink:0; accent-color:var(--accent); }
 .sopick-line-item { font-weight:600; font-size:14px; flex:1; }
 .sopick-line-desc { padding-left:30px; font-size:12px; color:var(--text-dim); margin-bottom:8px; }
 .sopick-line-meta {
@@ -11769,7 +11808,7 @@ textarea.dupe-shake { animation:porcvShake .45s ease; }
 }
 .sopick-line-meta .value { font-weight:600; color:var(--text); font-size:14px; }
 .sopick-line-input { padding-left:30px; }
-.sopick-line-input textarea { font-family:var(--mono); font-size:13px; width:100%; }
+.sopick-line-input textarea { font-family:var(--mono); font-size:16px; width:100%; }
 .sopick-line-input input[type="number"] { max-width:140px; }
 .sopick-line-input select { max-width:280px; }
 .sopick-serial-count { font-size:15px; font-weight:600; color:var(--text); margin-top:8px; }
@@ -12256,7 +12295,7 @@ button.stock-sheet-row-chosen, button.stock-sheet-row-chosen:hover { background:
     input[type="text"], input[type="number"], select {
         min-height:44px; font-size:16px; padding:10px 12px;
     }
-    textarea { font-size:15px; min-height:72px; }
+    textarea { font-size:16px; min-height:72px; }
 
     /* ── Buttons ── */
     .btn { min-height:44px; font-size:14px; padding:0 16px; border-radius:8px; }
@@ -13855,6 +13894,12 @@ button.stock-sheet-row-chosen, button.stock-sheet-row-chosen:hover { background:
                     <summary>Snapshot hidden</summary>
                     <div id="sce-expected-list" class="sce-expected-list"></div>
                 </details>
+                <!-- Explicit "found nothing" so the approver can tell an empty bin
+                     apart from an item that was simply never counted. -->
+                <button class="btn" onclick="sceConfirmNothingFound()" type="button"
+                        style="width:100%;margin-top:12px;border:1.5px solid var(--warning);color:var(--warning);background:transparent;">
+                    Nothing found here (record 0)
+                </button>
             </div>
 
             <!-- Non-serialized: quantity input -->
@@ -19913,6 +19958,35 @@ function sceConfirmItem() {
     sceBackToList();
 }
 
+// Serialized items only: record an explicit "counted, found nothing" (0 serials).
+// This is different from leaving the item uncounted — it tells the approver the
+// counter physically checked the bin and it was empty.
+function sceConfirmNothingFound() {
+    if (!_sceActiveItemId) { toast('No item selected.', 'error'); return; }
+    const item = _sceFindItem(_sceActiveItemId);
+    if (!item) return;
+    if (!item.serialized) { toast('Enter 0 in the quantity field instead.', 'error'); return; }
+    if (_sceScannedSerials.length > 0) {
+        toast('You have scanned serials. Clear them first to report nothing found.', 'error');
+        return;
+    }
+    if (!confirm('Record NOTHING FOUND for "' + (item.itemName || 'this item') + '"?\\n\\nThis tells the approver the bin was checked and no serials were found.')) return;
+
+    const entry = {
+        itemId:       item.itemId,
+        itemName:     item.itemName,
+        serialized:   true,
+        expected:     item.serialNumbers || [],
+        counted:      { serials: [], nothingFound: true }
+    };
+    const i = _sceCounted.findIndex(c => String(c.itemId) === String(item.itemId));
+    if (i >= 0) _sceCounted[i] = entry;
+    else        _sceCounted.push(entry);
+
+    toast('Recorded nothing found: ' + (item.itemName || ''), 'success');
+    sceBackToList();
+}
+
 function sceUncountActive() {
     if (!_sceActiveItemId) return;
     if (!confirm('Remove the count for this item? You can re-open it later to recount.')) return;
@@ -20055,12 +20129,15 @@ function scrCalculateDiscrepancies(items, counted) {
             missingSerials: [],
             extraSerials: [],
             qtyDifference: 0,
-            hasDiscrepancy: false
+            hasDiscrepancy: false,
+            countReported: !!countedItem,   // was this item actually counted (vs skipped)?
+            nothingFound: false             // counter explicitly reported an empty bin
         };
 
         if (countedItem) {
             if (item.serialized) {
                 disc.countedSerials = countedItem.counted?.serials || [];
+                disc.nothingFound = !!(countedItem.counted && countedItem.counted.nothingFound);
                 // Find missing serials (expected but not counted - need to remove from NetSuite)
                 disc.missingSerials = disc.expectedSerials.filter(sn => !disc.countedSerials.includes(sn));
                 // Find extra serials (counted but not expected - need to add to NetSuite)
@@ -20193,7 +20270,11 @@ function scrRenderReviewTable() {
                 : '<span style="color:var(--text-dim);">None</span>';
             countedCell = d.countedSerials.length > 0
                 ? '<a href="#" onclick="scrShowScannedModal(' + idx + '); return false;" style="font-size:11px;text-decoration:underline;cursor:pointer;" title="View scanned serials">' + d.countedSerials.length + ' serial(s)</a>'
-                : '<span style="color:var(--text-dim);">None</span>';
+                : (d.nothingFound
+                    ? '<span style="color:var(--warning);font-size:11px;font-weight:600;" title="Counter checked this bin and found no serials">Nothing found (0)</span>'
+                    : (d.countReported
+                        ? '<span style="color:var(--text-dim);">None</span>'
+                        : '<span style="color:var(--danger);font-size:11px;font-weight:600;" title="This item was never opened during the count">Not counted</span>'));
 
             if (d.hasDiscrepancy) {
                 const parts = [];

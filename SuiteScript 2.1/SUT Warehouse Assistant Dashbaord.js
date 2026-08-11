@@ -191,6 +191,10 @@ define([
                     return respondJson(context, loadSOForPicking(context.request.parameters.soNumber));
                 case 'pickSOItems':
                     return respondJson(context, pickSOItems(JSON.parse(context.request.body)));
+                case 'loadMultipleSOForPicking':
+                    return respondJson(context, loadMultipleSOForPicking(JSON.parse(context.request.body)));
+                case 'pickMultipleSOItems':
+                    return respondJson(context, pickMultipleSOItems(JSON.parse(context.request.body)));
                 case 'validateSerialBatch':
                     return respondJson(context, validateSerialBatch(JSON.parse(context.request.body)));
                 case 'validateReceiptSerials':
@@ -1524,7 +1528,7 @@ define([
         const trimmed = (serials || []).map(s => (s || '').trim()).filter(Boolean);
         if (!trimmed.length) return verdict;
 
-        const found = {}; // serial -> first inventorybalance row we saw with onhand > 0
+        const found = {}; // serial -> ALL on-hand rows (a serial text can exist under >1 item)
         const BATCH = 50;
         for (let off = 0; off < trimmed.length; off += BATCH) {
             const batch = trimmed.slice(off, off + BATCH);
@@ -1567,8 +1571,8 @@ define([
                     ]
                 }).run().each(r => {
                     const sn = (r.getText({ name: 'inventorynumber' }) || '').trim();
-                    if (!sn || found[sn]) return true;
-                    found[sn] = {
+                    if (!sn) return true;
+                    (found[sn] = found[sn] || []).push({
                         itemId:       String(r.getValue({ name: 'item' }) || ''),
                         itemName:     r.getText({ name: 'item' }) || '',
                         locationId:   String(r.getValue({ name: 'location' }) || ''),
@@ -1578,19 +1582,31 @@ define([
                         statusId:     String(r.getValue({ name: 'status' }) || ''),
                         statusText:   r.getText({ name: 'status' }) || '',
                         qty:          parseFloat(r.getValue({ name: 'onhand' })) || 0
-                    };
+                    });
                     return true;
                 });
             } catch (e) { log.debug('classifySerialLocations batch failed', e.message); }
         }
 
         trimmed.forEach(sn => {
-            const row = found[sn];
-            if (!row)                                          { verdict[sn] = { serial: sn, where: 'not_found' }; return; }
-            if (String(row.itemId)     !== String(itemId))     { verdict[sn] = { serial: sn, where: 'wrong_item',     current: row }; return; }
-            if (String(row.locationId) !== String(currentLocationId)) { verdict[sn] = { serial: sn, where: 'cross_location', current: row }; return; }
-            if (String(row.binId)      === String(currentBinId)) { verdict[sn] = { serial: sn, where: 'same_bin', current: row }; return; }
-            verdict[sn] = { serial: sn, where: 'cross_bin', current: row };
+            const rows = found[sn];
+            if (!rows || !rows.length) { verdict[sn] = { serial: sn, where: 'not_found' }; return; }
+            // Prefer the on-hand record for the EXPECTED item. The same serial
+            // text can exist under more than one item (e.g. New vs Recertified
+            // twins), so keying purely by text and taking the first row would
+            // misread a legitimate cross-bin extra as wrong_item whenever the
+            // other item's identical serial happens to also be on hand.
+            const sameItem = rows.filter(r => String(r.itemId) === String(itemId));
+            if (sameItem.length) {
+                // Among expected-item rows, a match already in the count bin wins.
+                const row = sameItem.find(r => String(r.binId) === String(currentBinId)) || sameItem[0];
+                if (String(row.locationId) !== String(currentLocationId)) { verdict[sn] = { serial: sn, where: 'cross_location', current: row }; return; }
+                if (String(row.binId)      === String(currentBinId))      { verdict[sn] = { serial: sn, where: 'same_bin',       current: row }; return; }
+                verdict[sn] = { serial: sn, where: 'cross_bin', current: row };
+                return;
+            }
+            // No on-hand under the expected item — genuinely another item's serial.
+            verdict[sn] = { serial: sn, where: 'wrong_item', current: rows[0] };
         });
         return verdict;
     };
@@ -2592,6 +2608,18 @@ define([
         const poRec = record.load({ type: record.Type.PURCHASE_ORDER, id: poId });
         const lineCount = poRec.getLineCount({ sublistId: 'item' });
 
+        // Special-order flag (custbody26 = T) + the Sales Order this PO was
+        // created from (createdfrom). Surfaced so the receiver can see, up
+        // front, that this is a special order tied to a specific SO.
+        const cb26 = poRec.getValue('custbody26');
+        const isSpecialOrder = (cb26 === true || cb26 === 'T');
+        const salesOrderId = poRec.getValue('createdfrom') || null;
+        const salesOrderNum = poRec.getText('createdfrom') || '';
+
+        // Warehouse comments entered on the PO (custbodycomments_for_warehouse).
+        // Shown on every PO so the receiver sees any notes meant for them.
+        const warehouseComments = poRec.getValue('custbodycomments_for_warehouse') || '';
+
         // Collect unique item IDs for batch serialization check
         const itemIds = [];
         for (let i = 0; i < lineCount; i++) {
@@ -2637,7 +2665,7 @@ define([
             });
         }
 
-        return { success: true, poId, poTranId, poStatus: poStatusText, lines };
+        return { success: true, poId, poTranId, poStatus: poStatusText, lines, isSpecialOrder, salesOrderId, salesOrderNum, warehouseComments };
     };
 
     const receivePOItems = (data) => {
@@ -3103,7 +3131,7 @@ define([
                 addNonSerial(l.itemId, l.quantity, l.binId);
             }
         });
-        if (!Object.keys(serialsByItem).length && !nonSerialMoves.length) return null; // Nothing to stage.
+        if (!Object.keys(serialsByItem).length && !nonSerialMoves.length) return { btId: null, statusBySerial: {}, statusByItemBin: {} }; // Nothing to stage.
 
         // We need the SO's location to scope the lookup + set on the BT. The
         // client passes data.locationId; if missing, derive from the SO header.
@@ -3122,6 +3150,7 @@ define([
         // numeric value was removed".
         const toMoveByItem = {}; // itemId -> [serials needing transfer]
         const unstageable  = []; // serials with no resolvable on-hand bin at this location
+        const statusBySerial = {}; // serial -> real on-hand inventory status id (may be non-Good)
         Object.keys(serialsByItem).forEach(itemId => {
             const serials = Array.from(serialsByItem[itemId]);
             if (!serials.length) return;
@@ -3145,13 +3174,18 @@ define([
                         filters,
                         columns: [
                             search.createColumn({ name: 'inventorynumber' }),
-                            search.createColumn({ name: 'binnumber' })
+                            search.createColumn({ name: 'binnumber' }),
+                            search.createColumn({ name: 'status' })
                         ]
                     }).run().each(r => {
-                        const numId = String(r.getValue({ name: 'inventorynumber' }));
-                        const sn    = reverseMap[numId];
-                        const binId = r.getValue({ name: 'binnumber' });
+                        const numId  = String(r.getValue({ name: 'inventorynumber' }));
+                        const sn     = reverseMap[numId];
+                        const binId  = r.getValue({ name: 'binnumber' });
+                        const status = r.getValue({ name: 'status' });
                         if (sn && binId && !currentBin[sn]) currentBin[sn] = String(binId);
+                        // Remember the unit's ACTUAL status so the transfer (and the
+                        // fulfillment) resolve it where it really is, not in Good.
+                        if (sn && status && !statusBySerial[sn]) statusBySerial[sn] = String(status);
                         return true;
                     });
                 } catch (e) {
@@ -3197,7 +3231,7 @@ define([
             throw err;
         }
 
-        if (!Object.keys(toMoveByItem).length && !nonSerialToMove.length) return null; // Already staged.
+        if (!Object.keys(toMoveByItem).length && !nonSerialToMove.length) return { btId: null, statusBySerial: statusBySerial, statusByItemBin: {} }; // Already staged — statuses still needed for the IF.
 
         // Memo must reference the SO by document number (tranid), never the
         // internal id. The client passes data.soTranId; look it up if missing.
@@ -3207,6 +3241,50 @@ define([
                 const soMeta = search.lookupFields({ type: search.Type.SALES_ORDER, id: data.soId, columns: ['tranid'] });
                 if (soMeta && soMeta.tranid) soTranId = String(soMeta.tranid);
             } catch (e) { log.debug('stageSerialsForPick: SO tranid lookup failed', e.message); }
+        }
+
+        // Resolve the real inventory status of each non-serialized source (item+bin)
+        // so the move preserves it instead of defaulting to Good. If a bin holds the
+        // item in more than one status the pick is ambiguous by quantity alone, so we
+        // leave it unset and let NetSuite fall back (only the Good portion resolves).
+        const statusByItemBin = {}; // itemId|binId -> statusId (single-status bins only)
+        if (nonSerialToMove.length) {
+            const nsItemIds = Array.from(new Set(nonSerialToMove.map(m => m.itemId)));
+            const nsBinIds  = Array.from(new Set(nonSerialToMove.map(m => m.fromBinId)));
+            try {
+                const nsFilters = [];
+                if (locationId) { nsFilters.push(['location', 'anyof', locationId]); nsFilters.push('AND'); }
+                nsFilters.push(['item', 'anyof', nsItemIds]);
+                nsFilters.push('AND');
+                nsFilters.push(['binnumber', 'anyof', nsBinIds]);
+                nsFilters.push('AND');
+                nsFilters.push(['onhand', 'greaterthan', 0]);
+                const seen = {}; // itemId|binId -> Set(statusId)
+                search.create({
+                    type: 'inventorybalance',
+                    filters: nsFilters,
+                    columns: [
+                        search.createColumn({ name: 'item' }),
+                        search.createColumn({ name: 'binnumber' }),
+                        search.createColumn({ name: 'status' })
+                    ]
+                }).run().each(r => {
+                    const it = String(r.getValue({ name: 'item' })      || '');
+                    const bn = String(r.getValue({ name: 'binnumber' }) || '');
+                    const st = String(r.getValue({ name: 'status' })    || '');
+                    if (!it || !bn || !st) return true;
+                    const key = it + '|' + bn;
+                    if (!seen[key]) seen[key] = {};
+                    seen[key][st] = true;
+                    return true;
+                });
+                Object.keys(seen).forEach(key => {
+                    const statuses = Object.keys(seen[key]);
+                    if (statuses.length === 1) statusByItemBin[key] = statuses[0];
+                });
+            } catch (e) {
+                log.debug('stageSerialsForPick: non-serial status lookup failed', e.message);
+            }
         }
 
         // Build the Bin Transfer (one record, multiple item lines).
@@ -3223,9 +3301,14 @@ define([
             const invDetail = bt.getCurrentSublistSubrecord({ sublistId: 'inventory', fieldId: 'inventorydetail' });
             serials.forEach(s => {
                 invDetail.selectNewLine({ sublistId: 'inventoryassignment' });
+                // Carry the unit's real (possibly non-Good) status through the move so
+                // NetSuite resolves the serial where it actually lives, not in Good.
+                const sStatus = statusBySerial[s];
                 invDetail.setCurrentSublistText({  sublistId: 'inventoryassignment', fieldId: 'issueinventorynumber', text: s });
                 invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity',             value: 1 });
+                if (sStatus) invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'inventorystatus', value: parseInt(sStatus) });
                 invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'tobinnumber',          value: SO_PICK_STAGING_BIN_ID });
+                if (sStatus) invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'toinventorystatus', value: parseInt(sStatus) });
                 invDetail.commitLine({ sublistId: 'inventoryassignment' });
             });
             bt.commitLine({ sublistId: 'inventory' });
@@ -3233,7 +3316,8 @@ define([
 
         // Non-serialized lines — one inventory line per item, one assignment
         // per source bin (binnumber -> tobinnumber = staging bin). Status is
-        // left as-is on the move (mirrors executeBulkBinTransfer).
+        // preserved from the source bin when it's unambiguous (single status),
+        // so non-Good stock can be picked; ambiguous bins fall back to default.
         const nsByItem = {};
         nonSerialToMove.forEach(m => {
             if (!nsByItem[m.itemId]) nsByItem[m.itemId] = [];
@@ -3248,9 +3332,12 @@ define([
             const invDetail = bt.getCurrentSublistSubrecord({ sublistId: 'inventory', fieldId: 'inventorydetail' });
             moves.forEach(m => {
                 invDetail.selectNewLine({ sublistId: 'inventoryassignment' });
+                const nsStatus = statusByItemBin[m.itemId + '|' + m.fromBinId];
                 invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity',    value: m.qty });
                 invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber',   value: parseInt(m.fromBinId) });
+                if (nsStatus) invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'inventorystatus', value: parseInt(nsStatus) });
                 invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'tobinnumber', value: SO_PICK_STAGING_BIN_ID });
+                if (nsStatus) invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'toinventorystatus', value: parseInt(nsStatus) });
                 invDetail.commitLine({ sublistId: 'inventoryassignment' });
             });
             bt.commitLine({ sublistId: 'inventory' });
@@ -3258,7 +3345,7 @@ define([
 
         const btId = bt.save({ enableSourcing: true, ignoreMandatoryFields: false });
         log.audit('SO Pick Staging', 'Staged picked stock into bin ' + SO_PICK_STAGING_BIN_ID + ' via Bin Transfer ' + btId + ' for SO ' + (soTranId || data.soId));
-        return btId;
+        return { btId: btId, statusBySerial: statusBySerial, statusByItemBin: statusByItemBin };
     };
 
     // ═══════════════════════════════════════════════════════════
@@ -3364,8 +3451,15 @@ define([
         // Once they're in bin 1738, NetSuite auto-resolves the from-bin on
         // every serial-bearing inventoryassignment below.
         let stagingBtId = null;
+        let pickStatusBySerial = {};  // serial -> real status id, for the IF assignments below
+        let pickStatusByItemBin = {}; // itemId|binId -> status id (non-serialized)
         try {
-            stagingBtId = stageSerialsForPick(data);
+            const staged = stageSerialsForPick(data);
+            if (staged) {
+                stagingBtId         = staged.btId || null;
+                pickStatusBySerial  = staged.statusBySerial  || {};
+                pickStatusByItemBin = staged.statusByItemBin || {};
+            }
         } catch (stageErr) {
             log.error('SO Pick: staging failed', stageErr);
             return {
@@ -3457,6 +3551,9 @@ define([
                                 invDetail.selectNewLine({ sublistId: 'inventoryassignment' });
                                 invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity', value: 1 });
                                 invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'issueinventorynumber', value: numId });
+                                // Fulfill the serial in its real status (it was staged there), not Good.
+                                const kcStatus = pickStatusBySerial[serial.trim()];
+                                if (kcStatus) invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'inventorystatus', value: parseInt(kcStatus) });
                                 invDetail.commitLine({ sublistId: 'inventoryassignment' });
                                 kcAdded++;
                             } catch (se) { log.debug('SO Picking (kit comp): serial assignment failed for ' + serial, se.message); }
@@ -3470,7 +3567,8 @@ define([
                         invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity', value: compQty });
                         // Stock was staged into the picking bin — fulfill from there, not the original bin.
                         invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', value: SO_PICK_STAGING_BIN_ID });
-                        if (matchedLine.inventoryStatusId) invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'inventorystatus', value: parseInt(matchedLine.inventoryStatusId) });
+                        const compStatus = matchedLine.inventoryStatusId || pickStatusByItemBin[matchedLine.itemId + '|' + matchedLine.binId];
+                        if (compStatus) invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'inventorystatus', value: parseInt(compStatus) });
                         invDetail.commitLine({ sublistId: 'inventoryassignment' });
                     }
                 } catch (invErr) {
@@ -3512,6 +3610,9 @@ define([
                                 invDetail.selectNewLine({ sublistId: 'inventoryassignment' });
                                 invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity', value: 1 });
                                 invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'issueinventorynumber', value: numId });
+                                // Fulfill the serial in its real status (it was staged there), not Good.
+                                const sStatus = pickStatusBySerial[serial.trim()];
+                                if (sStatus) invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'inventorystatus', value: parseInt(sStatus) });
                                 invDetail.commitLine({ sublistId: 'inventoryassignment' });
                                 added++;
                             } catch (se) { log.debug('SO Picking: serial assignment failed for ' + serial, se.message); }
@@ -3522,7 +3623,8 @@ define([
                         invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity', value: requestedQty });
                         // Stock was staged into the picking bin — fulfill from there, not the original bin.
                         invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', value: SO_PICK_STAGING_BIN_ID });
-                        if (matchedLine.inventoryStatusId) invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'inventorystatus', value: parseInt(matchedLine.inventoryStatusId) });
+                        const nsStatus = matchedLine.inventoryStatusId || pickStatusByItemBin[matchedLine.itemId + '|' + matchedLine.binId];
+                        if (nsStatus) invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'inventorystatus', value: parseInt(nsStatus) });
                         invDetail.commitLine({ sublistId: 'inventoryassignment' });
                     }
                 } catch (invErr) {
@@ -3605,6 +3707,190 @@ define([
             fulfillmentId: ffId,
             fulfillmentTranId: ffTranId,
             stagingTransferId: stagingBtId
+        };
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  SO PICKING (MULTIPLE)
+    //  Scan several SO numbers, then scan every serial needed for all of
+    //  them at once. Every order is for the SAME serialized item, and the
+    //  total serial count always equals the total remaining quantity.
+    //  Load aggregates the orders + demand; fulfill auto-assigns serials to
+    //  orders (in scan order) and creates one Item Fulfillment per SO by
+    //  reusing the proven single-SO pickSOItems path.
+    // ═══════════════════════════════════════════════════════════
+
+    // Load a CHUNK of scanned SOs, enforce the "one serialized item across all
+    // orders" invariant, and return per-order demand. Loading a full SO record
+    // is heavy (record.load + several searches), so 30+ SOs in one synchronous
+    // request can blow past the Suitelet time/governance limit and die with a
+    // cryptic native error. Instead we process only as many SOs as fit safely
+    // in this request, then hand a `nextIndex` back to the client to resume.
+    // The reference item is carried across chunks via `itemId`/`itemText`.
+    const loadMultipleSOForPicking = (data) => {
+        let list = (data && data.soNumbers) || [];
+        if (typeof list === 'string') list = list.split(/[\n,\r]+/);
+        list = (list || []).map(s => (s || '').trim()).filter(Boolean);
+
+        // Stable de-dupe (identical every chunk so indices line up across calls).
+        const seen = new Set();
+        const ordered = [];
+        list.forEach(s => { const k = s.toUpperCase(); if (!seen.has(k)) { seen.add(k); ordered.push(s); } });
+        if (!ordered.length) return { success: false, message: 'Scan at least one SO number.' };
+
+        const startIndex = (data && data.startIndex) || 0;
+        let itemId   = (data && data.itemId)   || null;   // reference item across chunks
+        let itemText = (data && data.itemText) || null;
+
+        const scriptObj = runtime.getCurrentScript();
+        const startTime = Date.now();
+        const TIME_BUDGET_MS = 30000;  // stop well before the Suitelet time limit
+        const MIN_USAGE      = 400;    // keep headroom so a load never dies mid-flight
+        const HARD_CAP       = 25;     // backstop on SOs per chunk
+
+        const orders   = [];
+        const problems = [];
+        let i = startIndex;
+        let done = 0;
+        for (; i < ordered.length; i++) {
+            // Always process at least one SO per call; then stop if budget is low.
+            if (done > 0) {
+                if (done >= HARD_CAP) break;
+                if (scriptObj.getRemainingUsage() < MIN_USAGE) break;
+                if (Date.now() - startTime > TIME_BUDGET_MS) break;
+            }
+            done++;
+
+            const soNum = ordered[i];
+            let res;
+            try {
+                res = loadSOForPicking(soNum);
+            } catch (e) {
+                problems.push({ soNumber: soNum, message: 'Load failed: ' + (e.message || e) });
+                continue;
+            }
+            if (!res || !res.success) {
+                problems.push({ soNumber: soNum, message: (res && res.message) || 'Sales order not found.' });
+                continue;
+            }
+
+            // Only serialized lines with remaining quantity are pickable here.
+            const pickLines = (res.lines || []).filter(l => l.isSerialized && l.quantityRemaining > 0);
+            const remaining = pickLines.reduce((a, l) => a + l.quantityRemaining, 0);
+            if (!pickLines.length || remaining <= 0) {
+                problems.push({ soNumber: res.soTranId || soNum, message: 'Nothing left to pick (no serialized items or already fulfilled).' });
+                continue;
+            }
+
+            // Enforce single-item invariant across every line and every SO.
+            let mixed = false;
+            for (const l of pickLines) {
+                if (itemId === null) { itemId = String(l.itemId); itemText = l.itemText; }
+                else if (String(l.itemId) !== itemId) { mixed = true; break; }
+            }
+            if (mixed) {
+                problems.push({ soNumber: res.soTranId || soNum, message: 'Contains a different item than the other orders. Multiple picking handles one item at a time.' });
+                continue;
+            }
+
+            orders.push({
+                soId: res.soId,
+                soTranId: res.soTranId,
+                soCustomer: res.soCustomer || '',
+                soDate: res.soDate || '',
+                itemId: String(pickLines[0].itemId),
+                itemText: pickLines[0].itemText,
+                qty: remaining,
+                // Keep each serialized line's remaining qty so fulfill can rebuild
+                // exact per-line serial slices (usually a single line).
+                lines: pickLines.map(l => ({ lineNum: l.lineNum, itemId: String(l.itemId), quantityRemaining: l.quantityRemaining })),
+                openFulfillments: (res.openFulfillments || []).map(f => ({ tranId: f.tranId, statusText: f.statusText }))
+            });
+        }
+
+        const nextIndex = i < ordered.length ? i : null;
+        return {
+            success: true,
+            chunk: true,
+            orders,
+            problems,
+            itemId,
+            itemText,
+            nextIndex,
+            processedTo: i,
+            totalScanned: ordered.length
+        };
+    };
+
+    // Fulfill a CHUNK of already-assigned orders. The client slices the scanned
+    // serials to each order (scan order) and sends the full order list plus a
+    // `startIndex`; each order carries its own `lines` (with serials). We create
+    // one Item Fulfillment per SO by reusing the proven single-SO pickSOItems.
+    // Each SO does a staging bin-transfer + transform + save, so — exactly like
+    // load — we process only as many as fit safely in this request and hand a
+    // `nextIndex` back to resume. Continues on failure; one bad SO can't block
+    // the rest.
+    const pickMultipleSOItems = (data) => {
+        const orders = (data && data.orders) || [];
+        const locationId = data && data.locationId;
+        const startIndex = (data && data.startIndex) || 0;
+        if (!orders.length) return { success: false, message: 'No sales orders to fulfill.' };
+
+        const scriptObj = runtime.getCurrentScript();
+        const startTime = Date.now();
+        const TIME_BUDGET_MS = 30000;  // stop well before the Suitelet time limit
+        const MIN_USAGE      = 500;    // one order's ops (staging + transform + save) + margin
+        const HARD_CAP       = 15;     // backstop on SOs per chunk
+
+        const results = [];
+        let i = startIndex;
+        let done = 0;
+        for (; i < orders.length; i++) {
+            // Always process at least one SO per call; then stop if budget is low.
+            if (done > 0) {
+                if (done >= HARD_CAP) break;
+                if (scriptObj.getRemainingUsage() < MIN_USAGE) break;
+                if (Date.now() - startTime > TIME_BUDGET_MS) break;
+            }
+            done++;
+
+            const o = orders[i];
+            // Normalize the per-line payload (defensive: ensure serialized shape).
+            const lines = (o.lines || []).map(l => ({
+                lineNum: l.lineNum,
+                itemId: String(l.itemId),
+                isSerialized: true,
+                serialNumbers: l.serialNumbers || [],
+                quantity: (l.serialNumbers || []).length
+            }));
+
+            try {
+                const r = pickSOItems({ soId: o.soId, soTranId: o.soTranId, locationId: locationId, lines: lines });
+                results.push({
+                    soId: o.soId,
+                    soTranId: o.soTranId,
+                    success: !!(r && r.success && r.fulfillmentId),
+                    partial: !!(r && r.partial),
+                    fulfillmentId: (r && r.fulfillmentId) || null,
+                    fulfillmentTranId: (r && r.fulfillmentTranId) || null,
+                    message: (r && r.message) || ''
+                });
+            } catch (e) {
+                log.error({ title: 'pickMultipleSOItems: SO ' + o.soTranId + ' failed', details: (e.message || e) + '\n' + (e.stack || '') });
+                results.push({ soId: o.soId, soTranId: o.soTranId, success: false, partial: false, fulfillmentId: null, fulfillmentTranId: null, message: e.message || String(e) });
+            }
+        }
+
+        const nextIndex = i < orders.length ? i : null;
+        const okCount = results.filter(r => r.success && !r.partial).length;
+        return {
+            success: true,
+            chunk: true,
+            results,
+            nextIndex,
+            processedTo: i,
+            createdCount: okCount,
+            totalCount: orders.length
         };
     };
 
@@ -5148,6 +5434,33 @@ define([
             return { transferId: transferId, tranId: tranId };
         }
 
+        // Resolve the inventory status of non-serialized stock sitting in a given
+        // (item, bin, location). Returns the status id only when the bin holds the
+        // item in exactly ONE status — a qty-only pick can't disambiguate multiple
+        // statuses, so in that case we return '' and let NetSuite fall back to Good.
+        function resolveSingleBinStatus(itemId, binId, locationId) {
+            if (!itemId || !binId) return '';
+            try {
+                const filters = [['item', 'anyof', [itemId]], 'AND', ['binnumber', 'anyof', [binId]], 'AND', ['onhand', 'greaterthan', 0]];
+                if (locationId) { filters.push('AND'); filters.push(['location', 'anyof', [locationId]]); }
+                const seen = {};
+                search.create({
+                    type: 'inventorybalance',
+                    filters: filters,
+                    columns: [search.createColumn({ name: 'status' })]
+                }).run().each(function(r) {
+                    const st = String(r.getValue({ name: 'status' }) || '');
+                    if (st) seen[st] = true;
+                    return true;
+                });
+                const statuses = Object.keys(seen);
+                return statuses.length === 1 ? statuses[0] : '';
+            } catch (e) {
+                log.debug('resolveSingleBinStatus', e.message);
+                return '';
+            }
+        }
+
         function createNonSerializedBinTransferMulti(rows, memo) {
             const tr = record.create({ type: record.Type.BIN_TRANSFER, isDynamic: true });
             tr.setValue({ fieldId: 'subsidiary', value: '1' });
@@ -5161,6 +5474,10 @@ define([
                 invDetail.selectNewLine({ sublistId: 'inventoryassignment' });
                 invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity', value: data.quantity });
                 if (data.fromBinId) invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', value: data.fromBinId });
+                // Resolve the source stock in its real status when the caller knows it
+                // (may be non-Good); without this NetSuite defaults to Good and can't
+                // find non-Good stock to move. Callers that don't pass it are unchanged.
+                if (data.fromStatusId) invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'inventorystatus', value: data.fromStatusId });
                 invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'tobinnumber', value: data.toBinId });
                 if (data.toStatusId) invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'toinventorystatus', value: data.toStatusId });
                 invDetail.commitLine({ sublistId: 'inventoryassignment' });
@@ -8700,7 +9017,7 @@ define([
                 serialData.valid.forEach(function(s) {
                     const key = s.itemId + '_' + s.locationId;
                     if (!groupMap[key]) groupMap[key] = { itemId: s.itemId, itemText: s.itemText, locationId: s.locationId, action: 'bin_putaway', serials: [] };
-                    groupMap[key].serials.push({ serialNumber: s.serialNumber, serialId: s.serialId, binId: s.binId });
+                    groupMap[key].serials.push({ serialNumber: s.serialNumber, serialId: s.serialId, binId: s.binId, statusId: s.statusId });
                 });
 
                 const groups = Object.values(groupMap);
@@ -8724,6 +9041,9 @@ define([
                             invDetail.setCurrentSublistText({ sublistId: 'inventoryassignment', fieldId: 'issueinventorynumber', text: serial.serialNumber });
                             invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity', value: 1 });
                             if (serial.binId) invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', value: serial.binId });
+                            // Resolve the serial in the status it's ACTUALLY in (may be non-Good),
+                            // not the Good default — otherwise NetSuite can't find it to move it.
+                            if (serial.statusId) invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'inventorystatus', value: parseInt(serial.statusId) });
                             invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'tobinnumber', value: toBin.id });
                             invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'toinventorystatus', value: BACK_TO_STOCK_STATUS_ID });
                             invDetail.commitLine({ sublistId: 'inventoryassignment' });
@@ -8779,6 +9099,7 @@ define([
                         itemId: itemCache[itemName].id, itemText: itemCache[itemName].displayname || itemCache[itemName].itemid,
                         description: itemCache[itemName].description, locationId: locationId, quantity: quantity,
                         fromBinId: binCache[fromBinNumber].id, toBinId: binCache[toBinNumber].id,
+                        fromStatusId: resolveSingleBinStatus(itemCache[itemName].id, binCache[fromBinNumber].id, locationId),
                         toStatusId: BACK_TO_STOCK_STATUS_ID, action: 'bin_putaway'
                     });
                 });
@@ -8848,7 +9169,7 @@ define([
                 serialData.valid.forEach(function(s) {
                     var key = s.itemId + '_' + s.locationId;
                     if (!groupMap[key]) groupMap[key] = { itemId: s.itemId, itemText: s.itemText, locationId: s.locationId, serials: [] };
-                    groupMap[key].serials.push({ serialNumber: s.serialNumber, serialId: s.serialId, binId: s.binId });
+                    groupMap[key].serials.push({ serialNumber: s.serialNumber, serialId: s.serialId, binId: s.binId, statusId: s.statusId });
                 });
                 var groups = Object.keys(groupMap).map(function(k) { return groupMap[k]; });
 
@@ -8867,6 +9188,9 @@ define([
                         invDetail.setCurrentSublistText({ sublistId: 'inventoryassignment', fieldId: 'issueinventorynumber', text: serial.serialNumber });
                         invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity', value: 1 });
                         if (serial.binId) invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', value: serial.binId });
+                        // Resolve the serial in the status it's ACTUALLY in (may be non-Good),
+                        // not the Good default — otherwise NetSuite can't find it to move it.
+                        if (serial.statusId) invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'inventorystatus', value: parseInt(serial.statusId) });
                         invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'tobinnumber', value: toBin.id });
                         invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'toinventorystatus', value: putawayStatusId });
                         invDetail.commitLine({ sublistId: 'inventoryassignment' });
@@ -8932,6 +9256,7 @@ define([
                         itemId: itemCache[itemName].id, itemText: itemCache[itemName].displayname || itemCache[itemName].itemid,
                         description: itemCache[itemName].description, locationId: locationId, quantity: quantity,
                         fromBinId: binCache[fromBinNumber].id, toBinId: binCache[toBinNumber].id,
+                        fromStatusId: resolveSingleBinStatus(itemCache[itemName].id, binCache[fromBinNumber].id, locationId),
                         toStatusId: putawayStatusId, action: 'bin_putaway'
                     });
                 });
@@ -12572,6 +12897,10 @@ button.stock-sheet-row-chosen, button.stock-sheet-row-chosen:hover { background:
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 5H7a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-2"/><rect x="9" y="3" width="6" height="4" rx="1"/><path d="M9 14l2 2 4-4"/></svg>
         Sales Order Picking
     </div>
+    <div class="nav-item" data-view="sopickmulti">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 5H7a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-2"/><rect x="9" y="3" width="6" height="4" rx="1"/><path d="M8 13l2 2 3-3"/><path d="M8 17l2 2 3-3"/></svg>
+        SO Picking (Multiple)
+    </div>
     <div class="nav-item" data-view="binputaway">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12"/><path d="M8 11l4 4 4-4"/><rect x="3" y="17" width="18" height="4" rx="1"/></svg>
         Bin Putaway
@@ -12687,6 +13016,10 @@ button.stock-sheet-row-chosen, button.stock-sheet-row-chosen:hover { background:
             <button class="home-tile tile-pick" onclick="navigateTo('sopick')">
                 <div class="home-tile-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 5H7a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-2"/><rect x="9" y="3" width="6" height="4" rx="1"/><path d="M9 14l2 2 4-4"/></svg></div>
                 <div class="home-tile-title">Sales Order Picking</div>
+            </button>
+            <button class="home-tile tile-pick" onclick="navigateTo('sopickmulti')">
+                <div class="home-tile-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 5H7a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-2"/><rect x="9" y="3" width="6" height="4" rx="1"/><path d="M8 13l2 2 3-3"/><path d="M8 17l2 2 3-3"/></svg></div>
+                <div class="home-tile-title">SO Picking (Multiple)</div>
             </button>
             <button class="home-tile tile-putaway" onclick="navigateTo('binputaway')">
                 <div class="home-tile-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12"/><path d="M8 11l4 4 4-4"/><rect x="3" y="17" width="18" height="4" rx="1"/></svg></div>
@@ -13521,6 +13854,16 @@ button.stock-sheet-row-chosen, button.stock-sheet-row-chosen:hover { background:
                 <span id="porcv-po-status" class="badge badge-info" style="font-size:11px;"></span></span>
                 <button class="btn" style="padding:6px 12px;" onclick="porcvReset()">New PO</button>
             </div>
+            <!-- Special-order callout: shown only when the PO is a special order (custbody26 = T) -->
+            <div id="porcv-special-order" style="display:none;margin:10px 0 4px;padding:12px 14px;background:#fffbeb;border:2px solid #f59e0b;border-left:6px solid #f59e0b;border-radius:8px;">
+                <div style="font-weight:800;color:#92400e;font-size:15px;letter-spacing:.3px;">⚠ SPECIAL ORDER</div>
+                <div style="margin-top:4px;color:#92400e;font-size:14px;">Sales Order: <span id="porcv-special-order-so" style="font-weight:800;"></span></div>
+            </div>
+            <!-- Warehouse comments entered on the PO (custbodycomments_for_warehouse); shown on any PO that has them -->
+            <div id="porcv-wh-comments" style="display:none;margin:10px 0 4px;padding:12px 14px;background:#eff6ff;border:2px solid #2563eb;border-left:6px solid #2563eb;border-radius:8px;">
+                <div style="font-weight:800;color:#1e40af;font-size:14px;letter-spacing:.3px;">📝 WAREHOUSE COMMENTS</div>
+                <div id="porcv-wh-comments-text" style="margin-top:4px;color:#1e3a8a;font-size:14px;white-space:pre-wrap;"></div>
+            </div>
             <div class="form-grid" style="grid-template-columns:1fr 1fr;gap:10px;">
                 <div class="form-group">
                     <label class="form-label">Warehouse *</label>
@@ -13668,6 +14011,72 @@ button.stock-sheet-row-chosen, button.stock-sheet-row-chosen:hover { background:
                 <button class="btn btn-primary" onclick="sopickReloadSO()" style="min-width:160px;">Reload This SO</button>
                 <button class="btn" onclick="sopickReset()" style="min-width:160px;">New SO</button>
             </div>
+        </div>
+    </div>
+</div>
+
+<!-- ═══════ SO PICKING (MULTIPLE) VIEW ═══════ -->
+<div class="view" id="view-sopickmulti">
+
+    <!-- STEP 1: scan SO numbers -->
+    <div class="card" id="somulti-load-card" style="margin-top:8px;">
+        <div class="card-title" style="font-size:18px;">1 &middot; Scan Sales Orders</div>
+        <div style="font-size:12px;color:var(--text-muted);margin-bottom:10px;">Scan one SO per line, then Load. Every order must be for the same serialized item.</div>
+        <div class="form-grid" style="grid-template-columns:1fr;gap:10px;">
+            <div class="form-group" style="margin:0;max-width:240px;">
+                <label class="form-label">Warehouse</label>
+                <select id="somulti-location" style="padding:7px 9px;font-size:13px;"></select>
+            </div>
+            <div class="form-group" style="margin:0;">
+                <label class="form-label">SO Numbers <span class="badge badge-info" style="font-size:11px;"><span id="somulti-so-count">0</span> scanned</span></label>
+                <textarea id="somulti-so-input" placeholder="Scan SO numbers, one per line..." autocomplete="off" spellcheck="false" style="font-family:var(--mono);font-size:16px;width:100%;min-height:120px;"></textarea>
+            </div>
+        </div>
+        <button class="btn btn-primary" onclick="somultiLoadSOs()" id="somulti-load-btn" style="margin-top:12px;">Load Orders</button>
+    </div>
+
+    <!-- STEP 2: scan serials + fulfill -->
+    <div id="somulti-summary-section" style="display:none;">
+        <div class="card" id="somulti-summary-card">
+            <div class="card-title" style="display:flex;align-items:center;gap:8px;justify-content:space-between;flex-wrap:wrap;">
+                <span>Item: <span id="somulti-item-name" style="font-weight:700;"></span></span>
+                <button class="btn" style="padding:6px 12px;" onclick="somultiReset()">New Batch</button>
+            </div>
+            <div id="somulti-orders-list" style="margin-top:8px;"></div>
+            <div id="somulti-problems" style="display:none;margin-top:10px;"></div>
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-top:12px;padding-top:10px;border-top:1px solid var(--border);font-weight:700;">
+                <span>Total to fulfill</span>
+                <span><span id="somulti-total-needed">0</span> units across <span id="somulti-order-count">0</span> order(s)</span>
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="card-title" style="font-size:18px;">2 &middot; Scan Serial Numbers</div>
+            <div style="font-size:12px;color:var(--text-muted);margin-bottom:10px;">Scan every serial for all orders. They're auto-assigned to orders in scan order.</div>
+            <div class="form-group" style="margin:0;">
+                <label class="form-label">Serial Numbers
+                    <span class="sopick-serial-count" id="somulti-serial-count">0 / 0 scanned</span>
+                </label>
+                <textarea id="somulti-serials" placeholder="Scan serial numbers, one per line..." autocomplete="off" spellcheck="false" style="font-family:var(--mono);font-size:16px;width:100%;min-height:180px;"></textarea>
+            </div>
+            <div class="sopick-serial-issues" id="somulti-serial-issues" style="display:none;"></div>
+            <button class="btn btn-success" onclick="somultiFulfillAll()" id="somulti-fulfill-btn" disabled style="width:100%;justify-content:center;padding:14px;margin-top:12px;opacity:.55;">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+                Fulfill All
+            </button>
+        </div>
+    </div>
+
+    <!-- STEP 3: results -->
+    <div class="card" id="somulti-success" style="display:none;">
+        <div style="text-align:center;padding:20px 16px 8px;">
+            <svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="var(--success)" stroke-width="2" style="margin-bottom:8px;"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+            <div style="font-size:18px;font-weight:700;" id="somulti-success-title">Done</div>
+            <div style="color:var(--text-muted);font-size:14px;margin-top:4px;" id="somulti-success-msg"></div>
+        </div>
+        <div id="somulti-results-list" style="margin:8px 0;"></div>
+        <div style="display:flex;gap:10px;justify-content:center;margin-top:8px;flex-wrap:wrap;">
+            <button class="btn btn-primary" onclick="somultiReset()" style="min-width:180px;">New Batch</button>
         </div>
     </div>
 </div>
@@ -14675,6 +15084,7 @@ document.querySelectorAll('.nav-item[data-view]').forEach(el => {
         if (el.dataset.view === 'transfer') document.getElementById('transfer-plate-input').focus();
         if (el.dataset.view === 'poreceive') document.getElementById('porcv-po-input').focus();
         if (el.dataset.view === 'sopick') document.getElementById('sopick-so-input').focus();
+        if (el.dataset.view === 'sopickmulti') document.getElementById('somulti-so-input').focus();
         if (el.dataset.view === 'binputaway') { bpawInit(); bpawRestoreDraft(); if (bpawMode === 'serialized') { const b = document.getElementById('bpaw-to-bin'); if (b) b.focus(); } }
         if (el.dataset.view === 'pickamazon') { pamzInit(); pamzRestoreDraft(); if (pamzMode === 'serialized') { const t = document.getElementById('pamz-serials'); if (t) t.focus(); } }
         if (el.dataset.view === 'inventorystatuschange') { iscInit(); }
@@ -16226,6 +16636,28 @@ async function porcvLoadPO() {
 
         document.getElementById('porcv-po-tranid').textContent = data.poTranId;
         document.getElementById('porcv-po-status').textContent = data.poStatus || '';
+
+        // Special-order callout: make it obvious this PO is a special order
+        // (custbody26 = T) and show the Sales Order it's tied to (createdfrom).
+        const soBanner = document.getElementById('porcv-special-order');
+        if (data.isSpecialOrder) {
+            document.getElementById('porcv-special-order-so').textContent = data.salesOrderNum || '(not linked)';
+            soBanner.style.display = 'block';
+            toast('Special order — Sales Order ' + (data.salesOrderNum || 'N/A'), 'warning');
+        } else {
+            soBanner.style.display = 'none';
+        }
+
+        // Warehouse comments: shown on any PO that has them (textContent keeps
+        // user-entered text safe from HTML injection; pre-wrap keeps line breaks).
+        const whBanner = document.getElementById('porcv-wh-comments');
+        const whText = (data.warehouseComments || '').trim();
+        if (whText) {
+            document.getElementById('porcv-wh-comments-text').textContent = whText;
+            whBanner.style.display = 'block';
+        } else {
+            whBanner.style.display = 'none';
+        }
 
         await porcvLoadBinsForCurrentLocation();
         porcvRenderList();
@@ -19109,6 +19541,293 @@ async function initSOPickForm() {
 }
 
 // ═══════════════════════════════════════════════════════════
+//  SO PICKING (MULTIPLE)
+//  Scan many SOs, then scan every serial for all of them at once and
+//  fulfill everything in one click. Serials are auto-assigned to orders
+//  in scan order; one Item Fulfillment is created per SO.
+// ═══════════════════════════════════════════════════════════
+let currentSOMultiData = null;
+let _somultiTotalNeeded = 0;
+let _somultiValTimer = null;
+let _somultiValToken = 0;
+
+function _somultiParseLines(text) {
+    return (text || '').split('\\n').map(function(s){ return s.trim(); }).filter(function(s){ return s !== ''; });
+}
+
+function _somultiUpdateSoCount() {
+    // Auto-reject duplicate SO numbers in-place (ding + red shake), same dupe
+    // UX as SO picking's serial scan. Deduped list drives the count badge.
+    let sos = _somultiParseLines(document.getElementById('somulti-so-input').value);
+    if (typeof window._dedupeSerialTextarea === 'function') {
+        const r = window._dedupeSerialTextarea({
+            textarea: 'somulti-so-input',
+            onDupesFound: function(res){
+                toast('Duplicate SO removed: ' + [...new Set(res.dupes)].slice(0, 8).join(', '), 'warning');
+            }
+        });
+        sos = r.deduped;
+    }
+    document.getElementById('somulti-so-count').textContent = sos.length;
+}
+
+async function somultiLoadSOs() {
+    const soNumbers = _somultiParseLines(document.getElementById('somulti-so-input').value);
+    if (!soNumbers.length) { toast('Scan at least one SO number.', 'error'); return; }
+
+    const btn = document.getElementById('somulti-load-btn');
+    btn.disabled = true;
+
+    // Loading a full SO record is heavy, so the server processes the list in
+    // chunks and hands back a nextIndex; we loop here until the whole list is
+    // loaded, carrying the reference item across chunks.
+    let orders = [], problems = [], itemId = null, itemText = null;
+    let startIndex = 0, guard = 0;
+    const total = soNumbers.length;
+    try {
+        while (startIndex !== null && guard < 1000) {
+            guard++;
+            showProcessing('Loading Orders...', 'Loaded ' + orders.length + ' of ' + total + ' order(s)');
+            const data = await apiPost('loadMultipleSOForPicking', { soNumbers: soNumbers, startIndex: startIndex, itemId: itemId, itemText: itemText });
+            if (!data || !data.success) {
+                toast((data && data.message) || 'Could not load orders.', 'error');
+                hideProcessing(); btn.disabled = false; return;
+            }
+            orders = orders.concat(data.orders || []);
+            problems = problems.concat(data.problems || []);
+            if (data.itemId) { itemId = data.itemId; itemText = data.itemText; }
+            startIndex = (data.nextIndex === null || data.nextIndex === undefined) ? null : data.nextIndex;
+        }
+    } catch (err) {
+        toast('Error: ' + err.message, 'error');
+        hideProcessing(); btn.disabled = false; return;
+    }
+    hideProcessing();
+    btn.disabled = false;
+
+    if (!orders.length) {
+        let msg = 'None of the scanned SOs have serialized items to pick.';
+        if (problems.length) msg += '  ' + problems.slice(0, 5).map(function(p){ return p.soNumber + ': ' + p.message; }).join(' | ');
+        toast(msg, 'error');
+        return;
+    }
+
+    const totalQty = orders.reduce(function(a, o){ return a + (o.qty || 0); }, 0);
+    currentSOMultiData = { itemId: itemId, itemText: itemText, orders: orders, problems: problems, totalQty: totalQty, orderCount: orders.length };
+    _somultiTotalNeeded = totalQty;
+    somultiRenderSummary(currentSOMultiData);
+    document.getElementById('somulti-load-card').style.display = 'none';
+    document.getElementById('somulti-summary-section').style.display = 'block';
+    document.getElementById('somulti-success').style.display = 'none';
+    document.getElementById('somulti-serials').value = '';
+    somultiOnSerialInput();
+    setTimeout(function(){ document.getElementById('somulti-serials').focus(); }, 60);
+}
+
+function somultiRenderSummary(data) {
+    document.getElementById('somulti-item-name').textContent = data.itemText || ('Item ' + data.itemId);
+    document.getElementById('somulti-total-needed').textContent = data.totalQty || 0;
+    document.getElementById('somulti-order-count').textContent = data.orderCount || (data.orders ? data.orders.length : 0);
+
+    let html = '';
+    (data.orders || []).forEach(function(o, i) {
+        const openBadge = (o.openFulfillments && o.openFulfillments.length)
+            ? '<span class="badge" style="background:var(--warning-soft,#fff7ed);color:var(--warning,#b45309);font-size:10px;margin-left:6px;">open IF</span>'
+            : '';
+        html += '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;padding:8px 10px;border:1px solid var(--border);border-radius:8px;margin-bottom:6px;">' +
+            '<div style="min-width:0;"><div style="font-weight:700;">' + (i + 1) + '. ' + escHtml(o.soTranId) + openBadge + '</div>' +
+            '<div style="font-size:12px;color:var(--text-muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + escHtml(o.soCustomer || '') + '</div></div>' +
+            '<div style="font-weight:800;font-size:16px;white-space:nowrap;">' + o.qty + ' <span style="font-size:11px;font-weight:500;color:var(--text-muted);">units</span></div>' +
+        '</div>';
+    });
+    document.getElementById('somulti-orders-list').innerHTML = html;
+
+    const prob = document.getElementById('somulti-problems');
+    if (data.problems && data.problems.length) {
+        prob.innerHTML = '<div class="card" style="border-left:4px solid var(--warning,#f59e0b);background:var(--warning-soft,#fff7ed);padding:8px 10px;box-shadow:none;">' +
+            '<div style="font-weight:700;font-size:12px;margin-bottom:4px;">Skipped ' + data.problems.length + ' order(s):</div>' +
+            data.problems.map(function(p){ return '<div style="font-size:11.5px;">' + escHtml(p.soNumber) + ' — ' + escHtml(p.message) + '</div>'; }).join('') +
+        '</div>';
+        prob.style.display = 'block';
+    } else {
+        prob.style.display = 'none';
+        prob.innerHTML = '';
+    }
+}
+
+function somultiOnSerialInput() {
+    const countEl = document.getElementById('somulti-serial-count');
+    const btn = document.getElementById('somulti-fulfill-btn');
+
+    // Auto-reject duplicate serials in-place (ding + red shake), identical dupe
+    // UX to SO picking. The deduped list drives the counter, button, and scan
+    // validation, so a repeated serial can never make it into the fulfillment.
+    let serials = _somultiParseLines(document.getElementById('somulti-serials').value);
+    if (typeof window._dedupeSerialTextarea === 'function') {
+        const r = window._dedupeSerialTextarea({
+            textarea: 'somulti-serials',
+            onDupesFound: function(res){
+                countEl.textContent = '⚠ Duplicate rejected: ' + [...new Set(res.dupes)].slice(0, 10).join(', ');
+                countEl.classList.add('has-dupe');
+            },
+            onClean: function(res){
+                countEl.textContent = res.deduped.length + ' / ' + _somultiTotalNeeded + ' scanned';
+                countEl.classList.remove('has-dupe');
+            }
+        });
+        serials = r.deduped;
+    }
+    if (!countEl.classList.contains('has-dupe')) {
+        countEl.textContent = serials.length + ' / ' + _somultiTotalNeeded + ' scanned';
+    }
+
+    const ready = _somultiTotalNeeded > 0 && serials.length === _somultiTotalNeeded;
+    btn.disabled = !ready;
+    btn.style.opacity = ready ? '1' : '.55';
+
+    // Debounced advisory validation (wrong-item / not-found / depleted)
+    if (_somultiValTimer) clearTimeout(_somultiValTimer);
+    if (!serials.length || !currentSOMultiData) { document.getElementById('somulti-serial-issues').style.display = 'none'; return; }
+    const token = ++_somultiValToken;
+    _somultiValTimer = setTimeout(function(){ somultiValidateSerials(serials, token); }, 400);
+}
+
+async function somultiValidateSerials(serials, token) {
+    if (!currentSOMultiData) return;
+    try {
+        const res = await apiPost('validateSerialBatch', { itemId: currentSOMultiData.itemId, serials: serials });
+        if (token !== _somultiValToken) return; // a newer scan superseded this
+        const issues = (res.validations || []).filter(function(v){ return !v.inStock; });
+        const box = document.getElementById('somulti-serial-issues');
+        if (!issues.length) { box.style.display = 'none'; box.innerHTML = ''; return; }
+        const rows = issues.slice(0, 20).map(function(v){
+            const why = v.reason === 'wrong_item' ? ('belongs to ' + escHtml(v.belongsToItemName || 'another item'))
+                : v.reason === 'depleted' ? 'not in stock'
+                : 'not found';
+            return '<div class="sopick-serial-issue"><code>' + escHtml(v.serial) + '</code> — ' + why + '</div>';
+        }).join('');
+        box.innerHTML = '<div class="sopick-serial-issues-head">' + issues.length + ' serial(s) need attention</div>' + rows +
+            (issues.length > 20 ? '<div class="sopick-serial-issue">(+' + (issues.length - 20) + ' more)</div>' : '');
+        box.style.display = 'block';
+    } catch (e) { /* advisory only */ }
+}
+
+async function somultiFulfillAll() {
+    if (!currentSOMultiData) { toast('Load orders first.', 'error'); return; }
+    const serials = _somultiParseLines(document.getElementById('somulti-serials').value);
+    if (serials.length !== _somultiTotalNeeded) {
+        toast('Scanned ' + serials.length + ' serial(s), but need ' + _somultiTotalNeeded + '.', 'error'); return;
+    }
+    const uniq = {};
+    let dup = false;
+    serials.forEach(function(s){ const k = s.toUpperCase(); if (uniq[k]) dup = true; else uniq[k] = true; });
+    if (dup) { toast('Remove duplicate serials before fulfilling.', 'error'); return; }
+
+    // Assign serials to orders in scan order, distributing across each order's
+    // serialized lines. Each order becomes self-contained so the server can
+    // fulfill any slice of them without extra state.
+    const assigned = [];
+    let cursor = 0;
+    currentSOMultiData.orders.forEach(function(o){
+        const slice = serials.slice(cursor, cursor + o.qty);
+        cursor += o.qty;
+        let sub = 0;
+        const lines = (o.lines || []).map(function(l){
+            const ls = slice.slice(sub, sub + l.quantityRemaining);
+            sub += l.quantityRemaining;
+            return { lineNum: l.lineNum, itemId: String(l.itemId), isSerialized: true, serialNumbers: ls, quantity: ls.length };
+        });
+        assigned.push({ soId: o.soId, soTranId: o.soTranId, qty: o.qty, lines: lines });
+    });
+
+    const locationId = document.getElementById('somulti-location').value;
+    const btn = document.getElementById('somulti-fulfill-btn');
+    btn.disabled = true;
+
+    // Fulfillment is heavy (staging + transform + save per SO), so the server
+    // processes the batch in chunks and hands back a nextIndex; loop until done.
+    let allResults = [];
+    let startIndex = 0, guard = 0;
+    try {
+        while (startIndex !== null && guard < 1000) {
+            guard++;
+            showProcessing('Creating Fulfillments...', 'Fulfilled ' + allResults.length + ' of ' + assigned.length + ' order(s)');
+            const result = await apiPost('pickMultipleSOItems', {
+                locationId: locationId,
+                orders: assigned,
+                startIndex: startIndex
+            });
+            if (!result || !result.results) {
+                toast((result && result.message) || 'Fulfillment failed.', 'error');
+                // Show whatever completed so far before bailing.
+                break;
+            }
+            allResults = allResults.concat(result.results);
+            startIndex = (result.nextIndex === null || result.nextIndex === undefined) ? null : result.nextIndex;
+        }
+    } catch (err) {
+        toast('Error after ' + allResults.length + ' order(s): ' + err.message, 'error');
+    } finally { hideProcessing(); }
+
+    const createdCount = allResults.filter(function(r){ return r.success && !r.partial; }).length;
+    const allSucceeded = allResults.length === assigned.length && allResults.every(function(r){ return r.success && !r.partial; });
+    const merged = {
+        results: allResults,
+        allSucceeded: allSucceeded,
+        createdCount: createdCount,
+        totalCount: assigned.length,
+        message: createdCount + ' of ' + assigned.length + ' fulfillment(s) created' + (allSucceeded ? ' successfully.' : ' — some orders need attention.')
+    };
+    somultiRenderResults(merged);
+    document.getElementById('somulti-summary-section').style.display = 'none';
+    document.getElementById('somulti-success').style.display = 'block';
+    toast(merged.message, allSucceeded ? 'success' : 'warning');
+}
+
+function somultiRenderResults(result) {
+    document.getElementById('somulti-success-title').textContent = result.allSucceeded ? 'All Fulfillments Created!' : 'Completed with Issues';
+    document.getElementById('somulti-success-msg').textContent = result.message || '';
+    let html = '';
+    (result.results || []).forEach(function(r){
+        const ok = r.success && !r.partial;
+        const color = ok ? 'var(--success,#16a34a)' : (r.partial ? 'var(--warning,#f59e0b)' : 'var(--danger,#dc2626)');
+        const label = ok ? (r.fulfillmentTranId || 'Created') : (r.partial ? ('Partial ' + (r.fulfillmentTranId || '')) : 'Failed');
+        html += '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;padding:8px 10px;border:1px solid var(--border);border-left:3px solid ' + color + ';border-radius:8px;margin-bottom:6px;">' +
+            '<div style="font-weight:700;">' + escHtml(r.soTranId || ('SO ' + r.soId)) + '</div>' +
+            '<div style="text-align:right;min-width:0;"><div style="font-weight:700;color:' + color + ';">' + escHtml(label) + '</div>' +
+            (ok ? '' : '<div style="font-size:11px;color:var(--text-muted);max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + escHtml(r.message || '') + '</div>') +
+        '</div></div>';
+    });
+    document.getElementById('somulti-results-list').innerHTML = html;
+}
+
+function somultiReset() {
+    currentSOMultiData = null;
+    _somultiTotalNeeded = 0;
+    if (_somultiValTimer) clearTimeout(_somultiValTimer);
+    document.getElementById('somulti-so-input').value = '';
+    document.getElementById('somulti-serials').value = '';
+    document.getElementById('somulti-so-count').textContent = '0';
+    document.getElementById('somulti-serial-issues').style.display = 'none';
+    document.getElementById('somulti-orders-list').innerHTML = '';
+    document.getElementById('somulti-problems').style.display = 'none';
+    document.getElementById('somulti-summary-section').style.display = 'none';
+    document.getElementById('somulti-success').style.display = 'none';
+    document.getElementById('somulti-load-card').style.display = '';
+    const btn = document.getElementById('somulti-fulfill-btn');
+    btn.disabled = true; btn.style.opacity = '.55';
+    setTimeout(function(){ document.getElementById('somulti-so-input').focus(); }, 60);
+}
+
+async function initSOMultiForm() {
+    const locs = await loadLocations();
+    populateSelect(document.getElementById('somulti-location'), locs);
+    document.getElementById('somulti-location').value = '1';
+    document.getElementById('somulti-so-input').addEventListener('input', _somultiUpdateSoCount);
+    document.getElementById('somulti-serials').addEventListener('input', somultiOnSerialInput);
+}
+
+// ═══════════════════════════════════════════════════════════
 //  CREATE FROM PO
 // ═══════════════════════════════════════════════════════════
 let poItemSearchTimeout;
@@ -20828,7 +21547,7 @@ function scrViewApproved(id) {
     // Set initial padding for warehouse view (default)
     document.querySelector('.main').style.padding = '0';
 
-    await Promise.all([initCreateForm(), initSearchForm(), initPOForm(), initIRForm(), initPORcvForm(), initSOPickForm(), initStockCountForm(), initBinTransferAllForm()]);
+    await Promise.all([initCreateForm(), initSearchForm(), initPOForm(), initIRForm(), initPORcvForm(), initSOPickForm(), initSOMultiForm(), initStockCountForm(), initBinTransferAllForm()]);
     // Dashboard loads lazily on first nav click (warehouse is default view)
 
     // Attach the SKU/bin typeahead to the static bin fields (item fields here

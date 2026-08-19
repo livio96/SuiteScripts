@@ -31,7 +31,21 @@ define(['N/record', 'N/search', 'N/log', 'N/url', 'N/runtime', 'N/ui/serverWidge
         // WAREHOUSE ASSISTANT CONSTANTS
         // ══════════════════════════════════════════════
         const ADJUSTMENT_ACCOUNT_ID = '154';
-        const BACK_TO_STOCK_BIN_ID = 3555;
+        // Back to Stock bin is 3555 for everyone, EXCEPT user 1723067 who uses bin 10023.
+        // Resolved per request from the executing user (this module body runs fresh each request).
+        const DEFAULT_BACK_TO_STOCK_BIN_ID = 3555;
+        const BACK_TO_STOCK_BIN_OVERRIDE_USER_ID = 1723067;
+        const BACK_TO_STOCK_BIN_OVERRIDE_BIN_ID = 10023;
+        const BACK_TO_STOCK_BIN_ID = (function () {
+            try {
+                const currentUserId = runtime.getCurrentUser().id;
+                return String(currentUserId) === String(BACK_TO_STOCK_BIN_OVERRIDE_USER_ID)
+                    ? BACK_TO_STOCK_BIN_OVERRIDE_BIN_ID
+                    : DEFAULT_BACK_TO_STOCK_BIN_ID;
+            } catch (e) {
+                return DEFAULT_BACK_TO_STOCK_BIN_ID;
+            }
+        })();
         const BACK_TO_STOCK_STATUS_ID = 1;
         const TESTING_BIN_ID = 3549;
         const TESTING_STATUS_ID = 6;
@@ -233,6 +247,7 @@ define(['N/record', 'N/search', 'N/log', 'N/url', 'N/runtime', 'N/ui/serverWidge
                 const uniqueItemIds = [...new Set(items.map(i => i.itemId))];
                 let serializedSet = new Set();
                 let usedSerials = {};
+                let fulfilledItemIds = new Set();
                 try {
                     serializedSet = batchCheckSerialized(uniqueItemIds);
                     const serialMap = batchGetSerialNumbers(uniqueItemIds, fromLocation, serializedSet);
@@ -242,6 +257,7 @@ define(['N/record', 'N/search', 'N/log', 'N/url', 'N/runtime', 'N/ui/serverWidge
                     );
                     results.fulfillmentId = fulfillResult.fulfillmentId;
                     usedSerials = fulfillResult.usedSerials;
+                    fulfilledItemIds = fulfillResult.fulfilledItemIds || new Set();
                     results.fulfillmentTranId = getTranId(record.Type.ITEM_FULFILLMENT, results.fulfillmentId);
                     log.audit('IF Created', results.fulfillmentTranId);
                 } catch (e) {
@@ -337,6 +353,7 @@ define(['N/record', 'N/search', 'N/log', 'N/url', 'N/runtime', 'N/ui/serverWidge
 
                         results.nonSerializedItems = items
                             .filter(i => !serializedSet.has(String(i.itemId)))
+                            .filter(i => fulfilledItemIds.has(String(i.itemId)))
                             .map(i => {
                                 const info = itemNameMap[String(i.itemId)] || {};
                                 const lotInfo = nsLotMap[String(i.itemId)] || {};
@@ -523,6 +540,7 @@ define(['N/record', 'N/search', 'N/log', 'N/url', 'N/runtime', 'N/ui/serverWidge
             const numLines = fulfillment.getLineCount({ sublistId: 'item' });
             let hasFulfillmentLines = false;
             const usedSerials = {}; // { itemId: [{id, text}] }
+            const fulfilledItemIds = new Set(); // itemIds actually being fulfilled (qty > 0)
 
             for (let i = 0; i < numLines; i++) {
                 fulfillment.selectLine({ sublistId: 'item', line: i });
@@ -533,10 +551,11 @@ define(['N/record', 'N/search', 'N/log', 'N/url', 'N/runtime', 'N/ui/serverWidge
                     const quantity = fulfillment.getCurrentSublistValue({ sublistId: 'item', fieldId: 'quantity' });
                     const available = serialMap[itemId] || [];
 
-                    if (available.length >= quantity) {
+                    if (quantity > 0 && available.length >= quantity) {
                         const selectedSerials = pickRandomSerials(available, quantity);
 
                         fulfillment.setCurrentSublistValue({ sublistId: 'item', fieldId: 'itemreceive', value: true });
+                        fulfilledItemIds.add(itemId);
 
                         const inventoryDetail = fulfillment.getCurrentSublistSubrecord({
                             sublistId: 'item',
@@ -570,8 +589,14 @@ define(['N/record', 'N/search', 'N/log', 'N/url', 'N/runtime', 'N/ui/serverWidge
                         fulfillment.setCurrentSublistValue({ sublistId: 'item', fieldId: 'itemreceive', value: false });
                     }
                 } else {
-                    fulfillment.setCurrentSublistValue({ sublistId: 'item', fieldId: 'itemreceive', value: true });
-                    hasFulfillmentLines = true;
+                    const quantity = fulfillment.getCurrentSublistValue({ sublistId: 'item', fieldId: 'quantity' });
+                    if (quantity > 0) {
+                        fulfillment.setCurrentSublistValue({ sublistId: 'item', fieldId: 'itemreceive', value: true });
+                        fulfilledItemIds.add(itemId);
+                        hasFulfillmentLines = true;
+                    } else {
+                        fulfillment.setCurrentSublistValue({ sublistId: 'item', fieldId: 'itemreceive', value: false });
+                    }
                 }
 
                 fulfillment.commitLine({ sublistId: 'item' });
@@ -582,7 +607,7 @@ define(['N/record', 'N/search', 'N/log', 'N/url', 'N/runtime', 'N/ui/serverWidge
             }
 
             const fulfillmentId = fulfillment.save({ enableSourcing: false, ignoreMandatoryFields: true });
-            return { fulfillmentId, usedSerials };
+            return { fulfillmentId, usedSerials, fulfilledItemIds };
         };
 
         // ──────────────────────────────────────────────
@@ -1601,8 +1626,8 @@ function previewIssueImages(input) {
   var previews = document.getElementById('issue_image_previews');
   var files = input.files;
   var currentCount = _issueImages.filter(function(x) { return x !== null; }).length;
-  if (currentCount + files.length > 5) {
-    alert('Maximum 5 images allowed.');
+  if (currentCount + files.length > 15) {
+    alert('Maximum 15 images allowed.');
     input.value = '';
     return;
   }
@@ -1921,15 +1946,50 @@ document.addEventListener('keydown', function(e) {
         //  WAREHOUSE ASSISTANT — LABEL PDF GENERATION
         // ══════════════════════════════════════════════════════════════
 
+        // Destination strip text shown vertically on the right edge of a label.
+        // Every bin move gets its bin's name EXCEPT Back to Stock (A-BTS-01),
+        // which returns '' so no strip is added. Actions that don't move an
+        // item to a bin (plain condition/serial/part changes, likenew) also
+        // return '' since there is no destination to mark.
+        function whGetLabelMarker(action) {
+            const a = String(action || '');
+            if (a.indexOf('stock') !== -1) return '';                 // Back to Stock (A-BTS-01)
+            if (a.indexOf('testing') !== -1) return 'TESTING';
+            if (a.indexOf('refurbishing') !== -1) return 'REFURBISHING';
+            if (a === 'defective') return 'DEFECTIVE';
+            if (a === 'trash') return 'TRASH';
+            if (a === 'return_to_vendor') return 'RTV';
+            return '';
+        }
+
         function whGenerateLabelsPdf(labelGroups, recordId) {
             let bodyContent = '';
+            // Today's date (MM/DD/YYYY) — shown at the bottom of the tag strip.
+            // Uses server (Pacific) time; if Eastern-accurate dates are needed near
+            // midnight, source it from a current-datetime saved search instead.
+            const now = new Date();
+            const labelDateStr = ('0' + (now.getMonth() + 1)).slice(-2) + '/' + ('0' + now.getDate()).slice(-2) + '/' + now.getFullYear();
             labelGroups.forEach(group => {
                 const itemName = whEscapeXml(group.itemText || '');
                 const description = whEscapeXml(group.description || '');
                 const escapedRecordId = whEscapeXml(recordId || '');
-                const isTesting = String(group.action || '').indexOf('testing') !== -1;
-                var wrapOpen = isTesting ? '<table width="100%" height="100%"><tr><td>' : '';
-                var wrapClose = isTesting ? '</td><td width="12mm" valign="middle" align="center" style="font-size:19px; color:#AAAAAA; font-weight:bold; line-height:21px;">T<br/>E<br/>S<br/>T<br/>I<br/>N<br/>G</td></tr></table>' : '';
+                const markerText = whGetLabelMarker(group.action);
+                const hasMarker = markerText.length > 0;
+                const markerVertical = markerText.split('').join('<br/>');
+                // Size the stacked tag as large as fits: short tags big, long tags
+                // (REFURBISHING) sized down so letters + date still fit the 3in label.
+                // line-height >= font-size and a single plain cell = the layout BFO
+                // renders reliably (nested/inverted line-height dropped the letters).
+                const markerLen = markerText.length;
+                const markerFs = markerLen <= 5 ? 26 : (markerLen <= 7 ? 22 : (markerLen <= 9 ? 18 : 14));
+                const markerLh = markerFs + 2;
+                var wrapOpen = hasMarker ? '<table width="100%" height="100%"><tr><td>' : '';
+                var wrapClose = hasMarker
+                    ? '</td><td width="15mm" valign="middle" align="center" style="font-size:' + markerFs + 'px; line-height:' + markerLh + 'px; color:#000000; font-weight:bold;">'
+                        + markerVertical
+                        + '<br/><span style="font-size:11px; line-height:13px;">' + labelDateStr + '</span>'
+                        + '</td></tr></table>'
+                    : '';
                 if (group.serialNumbers && group.serialNumbers.length > 0) {
                     group.serialNumbers.forEach(serialNumber => {
                         const escapedSerial = whEscapeXml(serialNumber);

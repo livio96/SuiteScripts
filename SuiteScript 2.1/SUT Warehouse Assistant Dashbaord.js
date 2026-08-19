@@ -205,6 +205,8 @@ define([
                     return respondJson(context, getBinInventoryForSerials(context.request.parameters));
                 case 'validateSerialsExist':
                     return respondJson(context, validateSerialsExist(context.request.parameters));
+                case 'validateSerialsExistBatch':
+                    return respondJson(context, validateSerialsExistBatch(JSON.parse(context.request.body)));
                 case 'binPutawaySerialized':
                     return respondJson(context, apiBinPutawaySerialized(JSON.parse(context.request.body)));
                 case 'binPutawayNonSerialized':
@@ -706,6 +708,12 @@ define([
         }
         if (!data.items || !data.items.length) return { success: false, message: 'No items selected for transfer.' };
 
+        // Optional target status. When omitted/blank the transfer is a pure bin
+        // move that preserves each item's current inventory status (unchanged
+        // behavior). When supplied, every moved unit also lands in that status.
+        const toStatusId = (data.toStatusId !== undefined && data.toStatusId !== null && String(data.toStatusId).trim() !== '')
+            ? parseInt(data.toStatusId, 10) : null;
+
         const bt = record.create({ type: record.Type.BIN_TRANSFER, isDynamic: true });
         bt.setValue({ fieldId: 'subsidiary', value: '1' });
         bt.setValue({ fieldId: 'location',   value: parseInt(data.locationId) });
@@ -731,6 +739,8 @@ define([
                     invDetail.setCurrentSublistText({  sublistId: 'inventoryassignment', fieldId: 'issueinventorynumber', text: s });
                     invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity',             value: 1 });
                     invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'tobinnumber',          value: parseInt(data.toBinId) });
+                    // Optional status change; NetSuite auto-resolves the serial's current status.
+                    if (toStatusId) invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'toinventorystatus', value: toStatusId });
                     invDetail.commitLine({ sublistId: 'inventoryassignment' });
                 });
                 bt.commitLine({ sublistId: 'inventory' });
@@ -759,6 +769,8 @@ define([
                     if (bk.statusId) {
                         invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'inventorystatus', value: parseInt(bk.statusId) });
                     }
+                    // Optional status change; leaving toinventorystatus unset preserves the source status.
+                    if (toStatusId) invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'toinventorystatus', value: toStatusId });
                     invDetail.commitLine({ sublistId: 'inventoryassignment' });
                 });
                 bt.commitLine({ sublistId: 'inventory' });
@@ -1636,6 +1648,15 @@ define([
                 filters.push('AND');
                 filters.push(['custrecord_sc_status', 'is', params.status]);
             }
+            // User filter is a real record field, so it filters at the search level.
+            if (params.assignedTo) {
+                filters.push('AND');
+                filters.push(['custrecord_sc_assigned_to', 'anyof', params.assignedTo]);
+            }
+            // Item / serial live inside the items JSON blob, not searchable fields —
+            // they are applied as a post-filter over each row's parsed items below.
+            const itemFilter   = (params.item   || '').trim().toLowerCase();
+            const serialFilter = (params.serial || '').trim().toLowerCase();
             const results = [];
             search.create({
                 type: 'customrecord_wh_stock_count',
@@ -1653,8 +1674,24 @@ define([
                 ]
             }).run().each(r => {
                 const itemsJson = r.getValue({ name: 'custrecordsc_items_json' }) || '[]';
-                let itemCount = 0;
-                try { itemCount = JSON.parse(itemsJson).length; } catch(e) {}
+                let parsedItems = [];
+                try { parsedItems = JSON.parse(itemsJson); } catch(e) {}
+                const itemCount = parsedItems.length;
+
+                // Skip rows that don't contain the requested item / serial.
+                if (itemFilter) {
+                    const hit = parsedItems.some(it =>
+                        (String(it.itemName || '').toLowerCase().indexOf(itemFilter) !== -1) ||
+                        (String(it.itemId   || '').toLowerCase() === itemFilter));
+                    if (!hit) return true;
+                }
+                if (serialFilter) {
+                    const hit = parsedItems.some(it =>
+                        (it.serialNumbers || []).some(sn =>
+                            String(sn || '').toLowerCase().indexOf(serialFilter) !== -1));
+                    if (!hit) return true;
+                }
+
                 results.push({
                     id: r.getValue({ name: 'internalid' }),
                     location: r.getText({ name: 'custrecord_sc_location' }),
@@ -3131,7 +3168,7 @@ define([
                 addNonSerial(l.itemId, l.quantity, l.binId);
             }
         });
-        if (!Object.keys(serialsByItem).length && !nonSerialMoves.length) return { btId: null, statusBySerial: {}, statusByItemBin: {} }; // Nothing to stage.
+        if (!Object.keys(serialsByItem).length && !nonSerialMoves.length) return { btId: null, statusBySerial: {}, allocationByItemBin: {} }; // Nothing to stage.
 
         // We need the SO's location to scope the lookup + set on the BT. The
         // client passes data.locationId; if missing, derive from the SO header.
@@ -3231,7 +3268,7 @@ define([
             throw err;
         }
 
-        if (!Object.keys(toMoveByItem).length && !nonSerialToMove.length) return { btId: null, statusBySerial: statusBySerial, statusByItemBin: {} }; // Already staged — statuses still needed for the IF.
+        if (!Object.keys(toMoveByItem).length && !nonSerialToMove.length) return { btId: null, statusBySerial: statusBySerial, allocationByItemBin: {} }; // Already staged — statuses still needed for the IF.
 
         // Memo must reference the SO by document number (tranid), never the
         // internal id. The client passes data.soTranId; look it up if missing.
@@ -3243,11 +3280,12 @@ define([
             } catch (e) { log.debug('stageSerialsForPick: SO tranid lookup failed', e.message); }
         }
 
-        // Resolve the real inventory status of each non-serialized source (item+bin)
-        // so the move preserves it instead of defaulting to Good. If a bin holds the
-        // item in more than one status the pick is ambiguous by quantity alone, so we
-        // leave it unset and let NetSuite fall back (only the Good portion resolves).
-        const statusByItemBin = {}; // itemId|binId -> statusId (single-status bins only)
+        // Determine how much of each non-serialized item+bin is AVAILABLE per
+        // inventory status, so a single pick quantity can be drawn across more
+        // than one status instead of being restricted to one status at a time.
+        // Only statuses whose stock is actually available (pickable) are counted,
+        // so Hold/Defective/etc. is never pulled even if it's on hand in the bin.
+        const availByItemBin = {}; // itemId|binId -> [{ statusId, avail }] ordered Good-first then ascending id
         if (nonSerialToMove.length) {
             const nsItemIds = Array.from(new Set(nonSerialToMove.map(m => m.itemId)));
             const nsBinIds  = Array.from(new Set(nonSerialToMove.map(m => m.fromBinId)));
@@ -3259,32 +3297,73 @@ define([
                 nsFilters.push(['binnumber', 'anyof', nsBinIds]);
                 nsFilters.push('AND');
                 nsFilters.push(['onhand', 'greaterthan', 0]);
-                const seen = {}; // itemId|binId -> Set(statusId)
+                const raw = {}; // itemId|binId -> { statusId: availableQty }
                 search.create({
                     type: 'inventorybalance',
                     filters: nsFilters,
                     columns: [
                         search.createColumn({ name: 'item' }),
                         search.createColumn({ name: 'binnumber' }),
-                        search.createColumn({ name: 'status' })
+                        search.createColumn({ name: 'status' }),
+                        search.createColumn({ name: 'available' })
                     ]
                 }).run().each(r => {
                     const it = String(r.getValue({ name: 'item' })      || '');
                     const bn = String(r.getValue({ name: 'binnumber' }) || '');
                     const st = String(r.getValue({ name: 'status' })    || '');
-                    if (!it || !bn || !st) return true;
+                    const av = parseFloat(r.getValue({ name: 'available' }) || 0);
+                    if (!it || !bn || !st || av <= 0) return true; // skip statuses with nothing available (Hold/Defective/etc.)
                     const key = it + '|' + bn;
-                    if (!seen[key]) seen[key] = {};
-                    seen[key][st] = true;
+                    if (!raw[key]) raw[key] = {};
+                    raw[key][st] = (raw[key][st] || 0) + av;
                     return true;
                 });
-                Object.keys(seen).forEach(key => {
-                    const statuses = Object.keys(seen[key]);
-                    if (statuses.length === 1) statusByItemBin[key] = statuses[0];
+                const GOOD_STATUS_ID = '1'; // "Good"/back-to-stock; picked first so normal stock rotates out before alt statuses
+                Object.keys(raw).forEach(key => {
+                    const list = Object.keys(raw[key]).map(st => ({ statusId: st, avail: raw[key][st] }));
+                    list.sort((a, b) => {
+                        if (a.statusId === GOOD_STATUS_ID) return -1;
+                        if (b.statusId === GOOD_STATUS_ID) return 1;
+                        return parseInt(a.statusId) - parseInt(b.statusId);
+                    });
+                    availByItemBin[key] = list;
                 });
             } catch (e) {
-                log.debug('stageSerialsForPick: non-serial status lookup failed', e.message);
+                log.debug('stageSerialsForPick: non-serial availability lookup failed', e.message);
             }
+        }
+
+        // Aggregate the requested non-serial qty per item+bin, then allocate it
+        // across that bin's available statuses (Good first, then ascending id).
+        // The resulting buckets drive both the staging Bin Transfer below and,
+        // later, the Item Fulfillment — so both split the same qty the same way.
+        const nsQtyByItemBin = {}; // itemId|binId -> total requested qty
+        nonSerialToMove.forEach(m => {
+            const k = m.itemId + '|' + m.fromBinId;
+            nsQtyByItemBin[k] = (nsQtyByItemBin[k] || 0) + m.qty;
+        });
+        const allocationByItemBin = {}; // itemId|binId -> [{ statusId, qty }]
+        const insufficient = [];
+        Object.keys(nsQtyByItemBin).forEach(k => {
+            const need = nsQtyByItemBin[k];
+            const availList = availByItemBin[k] || [];
+            const buckets = [];
+            let remaining = need;
+            availList.forEach(a => {
+                if (remaining <= 0) return;
+                const take = Math.min(remaining, a.avail);
+                if (take > 0) { buckets.push({ statusId: a.statusId, qty: take }); remaining -= take; }
+            });
+            if (remaining > 0) {
+                const parts = k.split('|');
+                insufficient.push('Item ' + parts[0] + ' in bin ' + parts[1] + ' — requested ' + need + ', only ' + (need - remaining) + ' available across pickable statuses');
+            }
+            allocationByItemBin[k] = buckets;
+        });
+        if (insufficient.length) {
+            const err = new Error('Cannot pick — not enough available stock in the source bin(s): ' + insufficient.join('  |  ') + '. Reload the SO or choose another bin.');
+            err.name = 'InsufficientAvailable';
+            throw err;
         }
 
         // Build the Bin Transfer (one record, multiple item lines).
@@ -3314,38 +3393,41 @@ define([
             bt.commitLine({ sublistId: 'inventory' });
         });
 
-        // Non-serialized lines — one inventory line per item, one assignment
-        // per source bin (binnumber -> tobinnumber = staging bin). Status is
-        // preserved from the source bin when it's unambiguous (single status),
-        // so non-Good stock can be picked; ambiguous bins fall back to default.
-        const nsByItem = {};
-        nonSerialToMove.forEach(m => {
-            if (!nsByItem[m.itemId]) nsByItem[m.itemId] = [];
-            nsByItem[m.itemId].push(m);
+        // Non-serialized lines — one inventory line per item. Within each item,
+        // move every (source bin × available status) bucket into the staging bin,
+        // preserving the status on both sides. Splitting per bucket is what lets a
+        // single pick quantity span multiple available statuses at once.
+        const nsBinsByItem = {}; // itemId -> [binId, ...]
+        Object.keys(nsQtyByItemBin).forEach(k => {
+            const parts = k.split('|');
+            if (!nsBinsByItem[parts[0]]) nsBinsByItem[parts[0]] = [];
+            nsBinsByItem[parts[0]].push(parts[1]);
         });
-        Object.keys(nsByItem).forEach(itemId => {
-            const moves = nsByItem[itemId];
-            const totalQty = moves.reduce((s, m) => s + m.qty, 0);
+        Object.keys(nsBinsByItem).forEach(itemId => {
+            const bins = nsBinsByItem[itemId];
+            const totalQty = bins.reduce((s, b) => s + nsQtyByItemBin[itemId + '|' + b], 0);
             bt.selectNewLine({ sublistId: 'inventory' });
             bt.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'item',     value: parseInt(itemId) });
             bt.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'quantity', value: totalQty });
             const invDetail = bt.getCurrentSublistSubrecord({ sublistId: 'inventory', fieldId: 'inventorydetail' });
-            moves.forEach(m => {
-                invDetail.selectNewLine({ sublistId: 'inventoryassignment' });
-                const nsStatus = statusByItemBin[m.itemId + '|' + m.fromBinId];
-                invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity',    value: m.qty });
-                invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber',   value: parseInt(m.fromBinId) });
-                if (nsStatus) invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'inventorystatus', value: parseInt(nsStatus) });
-                invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'tobinnumber', value: SO_PICK_STAGING_BIN_ID });
-                if (nsStatus) invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'toinventorystatus', value: parseInt(nsStatus) });
-                invDetail.commitLine({ sublistId: 'inventoryassignment' });
+            bins.forEach(binId => {
+                const buckets = allocationByItemBin[itemId + '|' + binId] || [];
+                buckets.forEach(bk => {
+                    invDetail.selectNewLine({ sublistId: 'inventoryassignment' });
+                    invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity',          value: bk.qty });
+                    invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber',         value: parseInt(binId) });
+                    invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'inventorystatus',   value: parseInt(bk.statusId) });
+                    invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'tobinnumber',       value: SO_PICK_STAGING_BIN_ID });
+                    invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'toinventorystatus', value: parseInt(bk.statusId) });
+                    invDetail.commitLine({ sublistId: 'inventoryassignment' });
+                });
             });
             bt.commitLine({ sublistId: 'inventory' });
         });
 
         const btId = bt.save({ enableSourcing: true, ignoreMandatoryFields: false });
         log.audit('SO Pick Staging', 'Staged picked stock into bin ' + SO_PICK_STAGING_BIN_ID + ' via Bin Transfer ' + btId + ' for SO ' + (soTranId || data.soId));
-        return { btId: btId, statusBySerial: statusBySerial, statusByItemBin: statusByItemBin };
+        return { btId: btId, statusBySerial: statusBySerial, allocationByItemBin: allocationByItemBin };
     };
 
     // ═══════════════════════════════════════════════════════════
@@ -3452,13 +3534,13 @@ define([
         // every serial-bearing inventoryassignment below.
         let stagingBtId = null;
         let pickStatusBySerial = {};  // serial -> real status id, for the IF assignments below
-        let pickStatusByItemBin = {}; // itemId|binId -> status id (non-serialized)
+        let pickAllocationByItemBin = {}; // itemId|binId -> [{ statusId, qty }] (non-serialized, staged split)
         try {
             const staged = stageSerialsForPick(data);
             if (staged) {
-                stagingBtId         = staged.btId || null;
-                pickStatusBySerial  = staged.statusBySerial  || {};
-                pickStatusByItemBin = staged.statusByItemBin || {};
+                stagingBtId             = staged.btId || null;
+                pickStatusBySerial      = staged.statusBySerial      || {};
+                pickAllocationByItemBin = staged.allocationByItemBin || {};
             }
         } catch (stageErr) {
             log.error('SO Pick: staging failed', stageErr);
@@ -3467,6 +3549,35 @@ define([
                 message: 'Could not stage serials into staging bin: ' + (stageErr.message || stageErr)
             };
         }
+
+        // Mutable per-(item+bin) pool of the staged status buckets. Each non-serial
+        // fulfillment line draws its quantity from here (Good first, then the other
+        // available statuses), so multiple lines from the same bin split correctly
+        // and every unit is fulfilled in the true status it was staged under.
+        const nsPool = {}; // itemId|binId -> [{ statusId, qty }] remaining
+        Object.keys(pickAllocationByItemBin).forEach(k => {
+            nsPool[k] = (pickAllocationByItemBin[k] || []).map(b => ({ statusId: b.statusId, qty: b.qty }));
+        });
+        const assignNonSerialFromPool = (invDetail, itemId, binId, qtyNeeded, fromBinValue) => {
+            const pool = nsPool[itemId + '|' + binId];
+            let assigned = 0;
+            if (pool && pool.length) {
+                let remaining = qtyNeeded;
+                for (let pi = 0; pi < pool.length && remaining > 0; pi++) {
+                    if (pool[pi].qty <= 0) continue;
+                    const take = Math.min(remaining, pool[pi].qty);
+                    invDetail.selectNewLine({ sublistId: 'inventoryassignment' });
+                    invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity',        value: take });
+                    invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber',       value: fromBinValue });
+                    invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'inventorystatus', value: parseInt(pool[pi].statusId) });
+                    invDetail.commitLine({ sublistId: 'inventoryassignment' });
+                    pool[pi].qty -= take;
+                    remaining -= take;
+                    assigned += take;
+                }
+            }
+            return assigned;
+        };
 
         // Everything from the transform through save() is wrapped so that if
         // the Item Fulfillment fails to build or save AFTER the staging Bin
@@ -3563,13 +3674,27 @@ define([
                         }
                     } else {
                         const compQty = parseFloat(matchedLine.quantity) || 0;
-                        invDetail.selectNewLine({ sublistId: 'inventoryassignment' });
-                        invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity', value: compQty });
                         // Stock was staged into the picking bin — fulfill from there, not the original bin.
-                        invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', value: SO_PICK_STAGING_BIN_ID });
-                        const compStatus = matchedLine.inventoryStatusId || pickStatusByItemBin[matchedLine.itemId + '|' + matchedLine.binId];
-                        if (compStatus) invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'inventorystatus', value: parseInt(compStatus) });
-                        invDetail.commitLine({ sublistId: 'inventoryassignment' });
+                        // Split the qty across the staged status buckets (Good first, then other available statuses).
+                        let compAssigned = 0;
+                        if (matchedLine.inventoryStatusId) {
+                            invDetail.selectNewLine({ sublistId: 'inventoryassignment' });
+                            invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity',        value: compQty });
+                            invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber',       value: SO_PICK_STAGING_BIN_ID });
+                            invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'inventorystatus', value: parseInt(matchedLine.inventoryStatusId) });
+                            invDetail.commitLine({ sublistId: 'inventoryassignment' });
+                            compAssigned = compQty;
+                        } else {
+                            compAssigned = assignNonSerialFromPool(invDetail, String(matchedLine.itemId), String(matchedLine.binId), compQty, SO_PICK_STAGING_BIN_ID);
+                        }
+                        // Fallback (e.g. stock already sat in the staging bin — nothing staged): assign the
+                        // remaining qty without a status and let NetSuite resolve it (prior behavior).
+                        if (compAssigned < compQty) {
+                            invDetail.selectNewLine({ sublistId: 'inventoryassignment' });
+                            invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity',  value: compQty - compAssigned });
+                            invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', value: SO_PICK_STAGING_BIN_ID });
+                            invDetail.commitLine({ sublistId: 'inventoryassignment' });
+                        }
                     }
                 } catch (invErr) {
                     log.debug('SO Picking: Kit component inventory detail not available for line ' + i, invErr.message);
@@ -3619,13 +3744,28 @@ define([
                         });
                         finalQty = added;
                     } else {
-                        invDetail.selectNewLine({ sublistId: 'inventoryassignment' });
-                        invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity', value: requestedQty });
                         // Stock was staged into the picking bin — fulfill from there, not the original bin.
-                        invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', value: SO_PICK_STAGING_BIN_ID });
-                        const nsStatus = matchedLine.inventoryStatusId || pickStatusByItemBin[matchedLine.itemId + '|' + matchedLine.binId];
-                        if (nsStatus) invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'inventorystatus', value: parseInt(nsStatus) });
-                        invDetail.commitLine({ sublistId: 'inventoryassignment' });
+                        // Split the requested qty across the staged status buckets (Good first, then other
+                        // available statuses) so a pick spanning multiple statuses fulfills as one line.
+                        let nsAssigned = 0;
+                        if (matchedLine.inventoryStatusId) {
+                            invDetail.selectNewLine({ sublistId: 'inventoryassignment' });
+                            invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity',        value: requestedQty });
+                            invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber',       value: SO_PICK_STAGING_BIN_ID });
+                            invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'inventorystatus', value: parseInt(matchedLine.inventoryStatusId) });
+                            invDetail.commitLine({ sublistId: 'inventoryassignment' });
+                            nsAssigned = requestedQty;
+                        } else {
+                            nsAssigned = assignNonSerialFromPool(invDetail, String(matchedLine.itemId), String(matchedLine.binId), requestedQty, SO_PICK_STAGING_BIN_ID);
+                        }
+                        // Fallback (e.g. stock already sat in the staging bin — nothing staged): assign the
+                        // remaining qty without a status and let NetSuite resolve it (prior behavior).
+                        if (nsAssigned < requestedQty) {
+                            invDetail.selectNewLine({ sublistId: 'inventoryassignment' });
+                            invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity',  value: requestedQty - nsAssigned });
+                            invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', value: SO_PICK_STAGING_BIN_ID });
+                            invDetail.commitLine({ sublistId: 'inventoryassignment' });
+                        }
                     }
                 } catch (invErr) {
                     log.debug('SO Picking: Inventory detail not available for line ' + i, invErr.message);
@@ -4084,6 +4224,24 @@ define([
         const serialTexts = cleanSerialInput(serialsRaw);
         if (!serialTexts.length) return { success: false, message: 'No serials provided.' };
         const serialData = lookupSerialDetails(serialTexts);
+        return {
+            success: true,
+            validCount: (serialData.valid || []).length,
+            invalidCount: (serialData.invalid || []).length,
+            invalid: serialData.invalid || []
+        };
+    };
+
+    // POST + batched variant of validateSerialsExist. Same response shape, but
+    // reads serials from the request BODY (no URL length cap) and batches the
+    // lookup, so Pick Amazon can validate 50+ serials of ANY length at once —
+    // the way SO picking's validateSerialBatch does.
+    const validateSerialsExistBatch = (data) => {
+        const serialsRaw = (data && data.serials) || '';
+        if (!serialsRaw) return { success: false, message: 'Serials are required.' };
+        const serialTexts = cleanSerialInput(serialsRaw);
+        if (!serialTexts.length) return { success: false, message: 'No serials provided.' };
+        const serialData = lookupSerialDetailsBatched(serialTexts);
         return {
             success: true,
             validCount: (serialData.valid || []).length,
@@ -4786,7 +4944,16 @@ define([
         // ====================================================================
 
         const ADJUSTMENT_ACCOUNT_ID = '154';
-        const BACK_TO_STOCK_BIN_ID = 3555;
+        // Back-to-stock bin is 3555 for everyone, EXCEPT user 1723067 who uses
+        // bin 10023. Per-user override only — all other logic/status is unchanged.
+        // Resolved lazily via getBackToStockBinId() (NOT at module load) because
+        // SuiteScript's runtime module is unavailable during the define() callback;
+        // the current user is only known at request time.
+        const BACK_TO_STOCK_BIN_OVERRIDES = { 1723067: 10023 };
+        function getBackToStockBinId() {
+            const _uid = parseInt(runtime.getCurrentUser().id, 10);
+            return BACK_TO_STOCK_BIN_OVERRIDES[_uid] || 3555;
+        }
         const BACK_TO_STOCK_STATUS_ID = 1;
         const TESTING_BIN_ID = 3549;
         const TESTING_STATUS_ID = 6;
@@ -5093,6 +5260,24 @@ define([
             return { valid, invalid };
         }
 
+        // Batched wrapper around lookupSerialDetails. NetSuite search filter
+        // chains get unreliable past ~100 OR conditions, so large serial scans
+        // are split into groups of 50 and merged — mirroring the batching SO
+        // picking uses in validateSerialBatch. This lets Pick Amazon validate
+        // and move well over 50 serials (of any length) in a single submission.
+        function lookupSerialDetailsBatched(serialTexts) {
+            if (!serialTexts || !serialTexts.length) return { valid: [], invalid: [] };
+            const BATCH = 50;
+            const valid = [];
+            const invalid = [];
+            for (let off = 0; off < serialTexts.length; off += BATCH) {
+                const res = lookupSerialDetails(serialTexts.slice(off, off + BATCH));
+                if (res.valid && res.valid.length)     Array.prototype.push.apply(valid, res.valid);
+                if (res.invalid && res.invalid.length) Array.prototype.push.apply(invalid, res.invalid);
+            }
+            return { valid, invalid };
+        }
+
         // ====================================================================
         // LABEL PDF GENERATION
         // ====================================================================
@@ -5266,7 +5451,7 @@ define([
                     addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'receiptinventorynumber', value: serial.serialNumber });
                     addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity', value: 1 });
                     if (group.action === 'likenew_stock') {
-                        addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', value: BACK_TO_STOCK_BIN_ID });
+                        addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', value: getBackToStockBinId() });
                         addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'inventorystatus', value: _ovStatus(serial.statusOverride, BACK_TO_STOCK_STATUS_ID) });
                     } else {
                         if (serial.binId) addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', value: serial.binId });
@@ -5296,7 +5481,7 @@ define([
                 if (group.action === 'move_testing') { toBinId = TESTING_BIN_ID; toStatusId = TESTING_STATUS_ID; }
                 else if (group.action === 'move_refurbishing') { toBinId = REFURBISHING_BIN_ID; toStatusId = REFURBISHING_STATUS_ID; }
                 else if (group.action === 'move_not_counted') { toBinId = NOT_COUNTED_BIN_ID; toStatusId = NOT_COUNTED_STATUS_ID; }
-                else if (group.action === 'back_to_stock') { toBinId = BACK_TO_STOCK_BIN_ID; toStatusId = BACK_TO_STOCK_STATUS_ID; }
+                else if (group.action === 'back_to_stock') { toBinId = getBackToStockBinId(); toStatusId = BACK_TO_STOCK_STATUS_ID; }
                 else if (group.action === 'defective') { toBinId = DEFECTIVE_BIN_ID; toStatusId = DEFECTIVE_STATUS_ID; }
                 else if (group.action === 'trash') { toBinId = TRASH_BIN_ID; toStatusId = TRASH_STATUS_ID; }
                 else if (group.action === 'return_to_vendor') { toBinId = RETURN_TO_VENDOR_BIN_ID; toStatusId = RETURN_TO_VENDOR_STATUS_ID; }
@@ -5513,7 +5698,7 @@ define([
                     addDetail.selectNewLine({ sublistId: 'inventoryassignment' });
                     addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'receiptinventorynumber', value: serial.serialNumber });
                     addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity', value: 1 });
-                    addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', value: BACK_TO_STOCK_BIN_ID });
+                    addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', value: getBackToStockBinId() });
                     addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'inventorystatus', value: _ovStatus(serial.statusOverride, BACK_TO_STOCK_STATUS_ID) });
                     addDetail.commitLine({ sublistId: 'inventoryassignment' });
                 });
@@ -5540,7 +5725,7 @@ define([
             const addDetail = adjRecord.getCurrentSublistSubrecord({ sublistId: 'inventory', fieldId: 'inventorydetail' });
             addDetail.selectNewLine({ sublistId: 'inventoryassignment' });
             addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity', value: data.quantity });
-            addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', value: BACK_TO_STOCK_BIN_ID });
+            addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', value: getBackToStockBinId() });
             addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'inventorystatus', value: BACK_TO_STOCK_STATUS_ID });
             addDetail.commitLine({ sublistId: 'inventoryassignment' });
             adjRecord.commitLine({ sublistId: 'inventory' });
@@ -5569,7 +5754,7 @@ define([
                 const addDetail = adjRecord.getCurrentSublistSubrecord({ sublistId: 'inventory', fieldId: 'inventorydetail' });
                 addDetail.selectNewLine({ sublistId: 'inventoryassignment' });
                 addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity', value: data.quantity });
-                addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', value: BACK_TO_STOCK_BIN_ID });
+                addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', value: getBackToStockBinId() });
                 addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'inventorystatus', value: _ovStatus(data.statusOverride, BACK_TO_STOCK_STATUS_ID) });
                 addDetail.commitLine({ sublistId: 'inventoryassignment' });
                 adjRecord.commitLine({ sublistId: 'inventory' });
@@ -5732,7 +5917,7 @@ define([
                     addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'receiptinventorynumber', value: change.newSerialNumber });
                     addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity', value: 1 });
                     if (change.action === 'serial_change_stock') {
-                        addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', value: BACK_TO_STOCK_BIN_ID });
+                        addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', value: getBackToStockBinId() });
                         addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'inventorystatus', value: _ovStatus(change.statusOverride, BACK_TO_STOCK_STATUS_ID) });
                     } else {
                         if (change.binId) addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', value: change.binId });
@@ -5800,7 +5985,7 @@ define([
                     addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'receiptinventorynumber', value: change.serialNumber });
                     addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity', value: 1 });
                     if (change.action === 'part_number_change_stock') {
-                        addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', value: BACK_TO_STOCK_BIN_ID });
+                        addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', value: getBackToStockBinId() });
                         addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'inventorystatus', value: _ovStatus(change.statusOverride, BACK_TO_STOCK_STATUS_ID) });
                     } else {
                         if (change.binId) addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', value: change.binId });
@@ -5870,7 +6055,7 @@ define([
                     addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'receiptinventorynumber', value: change.newSerialNumber });
                     addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity', value: 1 });
                     if (change.action === 'part_serial_change_stock') {
-                        addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', value: BACK_TO_STOCK_BIN_ID });
+                        addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', value: getBackToStockBinId() });
                         addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'inventorystatus', value: _ovStatus(change.statusOverride, BACK_TO_STOCK_STATUS_ID) });
                     } else {
                         if (change.binId) addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', value: change.binId });
@@ -7885,7 +8070,7 @@ define([
                 if (!targetItem) { createEntryForm(context, 'Like New item not found: ' + likeNewName, 'error'); return; }
                 labelItemDetails = { itemid: targetItem.itemid, displayname: targetItem.displayname, description: targetItem.description };
                 let toBinId = null, toStatusId = null;
-                if (action === 'likenew_stock') { toBinId = BACK_TO_STOCK_BIN_ID; toStatusId = BACK_TO_STOCK_STATUS_ID; }
+                if (action === 'likenew_stock') { toBinId = getBackToStockBinId(); toStatusId = BACK_TO_STOCK_STATUS_ID; }
                 try {
                     const r = createNonSerializedAdjustment({ sourceItemId: itemId, sourceItemName: itemDetails.itemid, targetItemId: targetItem.id, targetItemName: targetItem.itemid, locationId: locationId, quantity: quantity, fromBinId: fromBinId, toBinId: toBinId || fromBinId, toStatusId: toStatusId }, userMemo || 'Created via WH Assistant');
                     adjustmentTranId = r.tranId;
@@ -7895,7 +8080,7 @@ define([
                 if (action === 'move_testing') { toBinId = TESTING_BIN_ID; toStatusId = TESTING_STATUS_ID; }
                 else if (action === 'move_refurbishing') { toBinId = REFURBISHING_BIN_ID; toStatusId = REFURBISHING_STATUS_ID; }
                 else if (action === 'move_not_counted') { toBinId = NOT_COUNTED_BIN_ID; toStatusId = NOT_COUNTED_STATUS_ID; }
-                else if (action === 'back_to_stock') { toBinId = BACK_TO_STOCK_BIN_ID; toStatusId = BACK_TO_STOCK_STATUS_ID; }
+                else if (action === 'back_to_stock') { toBinId = getBackToStockBinId(); toStatusId = BACK_TO_STOCK_STATUS_ID; }
                 else if (action === 'defective') { toBinId = DEFECTIVE_BIN_ID; toStatusId = DEFECTIVE_STATUS_ID; }
                 else if (action === 'trash') { toBinId = TRASH_BIN_ID; toStatusId = TRASH_STATUS_ID; }
                 else if (action === 'return_to_vendor') { toBinId = RETURN_TO_VENDOR_BIN_ID; toStatusId = RETURN_TO_VENDOR_STATUS_ID; }
@@ -7944,7 +8129,7 @@ define([
                     if (!targetItemCache[itemData.id].found) return;
                     const c = targetItemCache[itemData.id];
                     let toBinId = null, toStatusId = null;
-                    if (action === 'likenew_stock') { toBinId = BACK_TO_STOCK_BIN_ID; toStatusId = BACK_TO_STOCK_STATUS_ID; }
+                    if (action === 'likenew_stock') { toBinId = getBackToStockBinId(); toStatusId = BACK_TO_STOCK_STATUS_ID; }
                     toStatusId = _ovStatus(row.statusOverride, toStatusId);
                     adjustmentRows.push({ sourceItemId: itemData.id, sourceItemName: itemData.itemid, targetItemId: c.targetItem.id, targetItemName: c.targetItem.itemid, targetDisplayName: c.targetItem.displayname, targetDescription: c.targetItem.description, locationId: locationId, quantity: quantity, fromBinId: fromBinId, toBinId: toBinId || fromBinId, toStatusId: toStatusId, action: action });
                 } else if (BIN_TRANSFER_ACTIONS.indexOf(action) !== -1) {
@@ -7952,7 +8137,7 @@ define([
                     if (action === 'move_testing') { toBinId = TESTING_BIN_ID; toStatusId = TESTING_STATUS_ID; }
                     else if (action === 'move_refurbishing') { toBinId = REFURBISHING_BIN_ID; toStatusId = REFURBISHING_STATUS_ID; }
                     else if (action === 'move_not_counted') { toBinId = NOT_COUNTED_BIN_ID; toStatusId = NOT_COUNTED_STATUS_ID; }
-                    else if (action === 'back_to_stock') { toBinId = BACK_TO_STOCK_BIN_ID; toStatusId = BACK_TO_STOCK_STATUS_ID; }
+                    else if (action === 'back_to_stock') { toBinId = getBackToStockBinId(); toStatusId = BACK_TO_STOCK_STATUS_ID; }
                     else if (action === 'defective') { toBinId = DEFECTIVE_BIN_ID; toStatusId = DEFECTIVE_STATUS_ID; }
                     else if (action === 'trash') { toBinId = TRASH_BIN_ID; toStatusId = TRASH_STATUS_ID; }
                     else if (action === 'return_to_vendor') { toBinId = RETURN_TO_VENDOR_BIN_ID; toStatusId = RETURN_TO_VENDOR_STATUS_ID; }
@@ -7967,7 +8152,7 @@ define([
                     if (!targetItemCache['pnc_' + newItemName].found) return;
                     const pnc = targetItemCache['pnc_' + newItemName];
                     let toBinId = fromBinId, toStatusId = null;
-                    if (action === 'part_number_change_stock') { toBinId = BACK_TO_STOCK_BIN_ID; toStatusId = BACK_TO_STOCK_STATUS_ID; }
+                    if (action === 'part_number_change_stock') { toBinId = getBackToStockBinId(); toStatusId = BACK_TO_STOCK_STATUS_ID; }
                     toStatusId = _ovStatus(row.statusOverride, toStatusId);
                     partNumberChangeRows.push({ sourceItemId: itemData.id, sourceItemName: itemData.itemid, targetItemId: pnc.targetItem.id, targetItemName: pnc.targetItem.itemid, targetDisplayName: pnc.targetItem.displayname, targetDescription: pnc.targetItem.description, locationId: locationId, quantity: quantity, fromBinId: fromBinId, toBinId: toBinId, toStatusId: toStatusId, action: action });
                 } else if (TRANSFER_UPCHARGE_ACTIONS.indexOf(action) !== -1) {
@@ -9311,7 +9496,7 @@ define([
                     toBinName = binLk.binnumber || String(AMAZON_PICK_BIN_ID);
                 } catch (e) { toBinName = String(AMAZON_PICK_BIN_ID); }
 
-                var serialData = lookupSerialDetails(serialTexts);
+                var serialData = lookupSerialDetailsBatched(serialTexts);
                 if (serialData.valid.length === 0) {
                     var invalidMsg = serialData.invalid.length > 0 ? 'Not found: ' + serialData.invalid.join(', ') : 'None of the serials were found in stock.';
                     return { success: false, message: invalidMsg, failed: (serialData.invalid || []) };
@@ -13623,6 +13808,12 @@ button.stock-sheet-row-chosen, button.stock-sheet-row-chosen:hover { background:
                     <datalist id="bta-dest-bin-datalist"></datalist>
                 </div>
                 <div class="form-group">
+                    <label class="form-label">Change Status (optional)</label>
+                    <select id="bta-to-status">
+                        <option value="">— Keep current status —</option>
+                    </select>
+                </div>
+                <div class="form-group">
                     <label class="form-label">Memo (optional)</label>
                     <input type="text" id="bta-memo" placeholder="Reason / note">
                 </div>
@@ -14155,6 +14346,20 @@ button.stock-sheet-row-chosen, button.stock-sheet-row-chosen:hover { background:
                     <option value="completed">Completed</option>
                     <option value="approved">Approved</option>
                 </select>
+            </div>
+            <div class="form-group">
+                <label class="form-label">Assigned To</label>
+                <select id="scd-user-filter" onchange="scdLoadStockCounts()">
+                    <option value="">All Users</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label class="form-label">Item</label>
+                <input type="text" id="scd-item-filter" placeholder="Item name or ID" onkeydown="if(event.key==='Enter')scdLoadStockCounts()">
+            </div>
+            <div class="form-group">
+                <label class="form-label">Serial Number</label>
+                <input type="text" id="scd-serial-filter" placeholder="Serial number" onkeydown="if(event.key==='Enter')scdLoadStockCounts()">
             </div>
             <div class="form-group" style="display:flex;align-items:flex-end;">
                 <button class="btn" onclick="scdLoadStockCounts()">
@@ -15815,12 +16020,14 @@ async function btaSubmit() {
     submitBtn.disabled = true;
     showProcessing('Creating Bin Transfer\u2026', 'Moving ' + selectedItems.length + ' item(s)');
     try {
+        const statusSel = document.getElementById('bta-to-status');
         const result = await apiPost('executeBulkBinTransfer', {
             locationId,
             fromBinId: _btaContents.binId,
             toBinId:   destBinId,
             items:     selectedItems,
-            memo:      document.getElementById('bta-memo').value.trim()
+            memo:      document.getElementById('bta-memo').value.trim(),
+            toStatusId: statusSel ? (statusSel.value || '') : ''
         });
         if (result.success) {
             document.getElementById('bta-contents-section').style.display = 'none';
@@ -15839,6 +16046,12 @@ async function initBinTransferAllForm() {
     const locs = await loadLocations();
     populateSelect(document.getElementById('bta-location'), locs);
     document.getElementById('bta-location').value = '1';
+    // Populate the optional "change status" dropdown (blank = keep current status).
+    try {
+        const statuses = await loadStatusCodes();
+        const sel = document.getElementById('bta-to-status');
+        if (sel) statuses.forEach(s => { const o = document.createElement('option'); o.value = s.id; o.textContent = s.name; sel.appendChild(o); });
+    } catch (e) { /* non-fatal */ }
     await btaRefreshBins('1');
     document.getElementById('bta-location').addEventListener('change', async function() { await btaRefreshBins(this.value); });
     document.getElementById('bta-source-bin').addEventListener('keydown', e => {
@@ -18110,7 +18323,8 @@ async function pamzSubmit() {
         if (!serials.length) { toast('Scan at least one serial number.', 'error'); return; }
 
         try {
-            const v = await apiGet('validateSerialsExist', { serials: serials.join('\\n') });
+            // POST + batched so 50+ serials (of any length) validate reliably.
+            const v = await apiPost('validateSerialsExistBatch', { serials: serials.join('\\n') });
             if (v && v.success && v.invalidCount > 0) {
                 const proceed = confirm(v.invalidCount + ' serial(s) not found in NetSuite and will be skipped:\\n\\n' + (v.invalid || []).join('\\n') + '\\n\\nContinue with ' + v.validCount + ' valid serial(s)?');
                 if (!proceed) return;
@@ -18325,7 +18539,9 @@ async function pamzRunValidate(includeTrailing) {
 
     let result;
     try {
-        result = await apiGet('validateSerialsExist', { serials: toCheck.join('\\n') });
+        // POST (not GET) so a large paste of long serials can't blow the URL
+        // length limit — server batches the lookup. Mirrors SO picking.
+        result = await apiPost('validateSerialsExistBatch', { serials: toCheck.join('\\n') });
     } catch (e) {
         toCheck.forEach(s => delete cache[s]);
         if (countEl) countEl.classList.remove('validating');
@@ -20155,13 +20371,41 @@ async function submitStockCount() {
 //  STOCK COUNT DASHBOARD
 // ═══════════════════════════════════════════════════════════
 
+// Populate the Assigned-To filter dropdown once, lazily, from the employee list.
+let _scdUsersLoaded = false;
+async function scdInitUserFilter() {
+    if (_scdUsersLoaded) return;
+    _scdUsersLoaded = true;
+    try {
+        const emps = await apiGet('getEmployees');
+        if (emps && emps.results) {
+            const sel = document.getElementById('scd-user-filter');
+            emps.results.forEach(e => {
+                const opt = document.createElement('option');
+                opt.value = e.id; opt.textContent = e.name;
+                sel.appendChild(opt);
+            });
+        }
+    } catch (err) {
+        _scdUsersLoaded = false; // allow a retry on the next load
+    }
+}
+
 async function scdLoadStockCounts() {
-    const status = document.getElementById('scd-status-filter').value;
+    scdInitUserFilter();
+    const status     = document.getElementById('scd-status-filter').value;
+    const assignedTo = document.getElementById('scd-user-filter').value;
+    const item       = document.getElementById('scd-item-filter').value.trim();
+    const serial     = document.getElementById('scd-serial-filter').value.trim();
     const tbody = document.getElementById('scd-table-body');
     tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--text-dim)">Loading...</td></tr>';
 
     try {
-        const params = status ? { status } : {};
+        const params = {};
+        if (status)     params.status     = status;
+        if (assignedTo) params.assignedTo = assignedTo;
+        if (item)       params.item       = item;
+        if (serial)     params.serial     = serial;
         const data = await apiGet('getStockCounts', params);
         if (!data.success) {
             tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--danger)">' + escHtml(data.message || 'Failed to load') + '</td></tr>';
@@ -20196,6 +20440,7 @@ async function scdLoadStockCounts() {
 // Delete (soft-remove) a stock count from the dashboard. Approved counts carry a
 // posted inventory adjustment that is NOT reversed — the confirm text says so.
 async function scdDeleteStockCount(id, hasAdj) {
+    if (!scrPasswordOk('Enter password to delete this stock count:')) return;
     const msg = hasAdj
         ? 'Delete stock count #' + id + '?\\n\\nIts posted inventory adjustment will NOT be reversed — only the count record is removed from the dashboard.'
         : 'Delete stock count #' + id + '?\\n\\nThis removes it from the dashboard and cannot be undone here.';
@@ -20794,7 +21039,20 @@ async function sceCompleteCount() {
 let _scrData = null;
 let _scrDiscrepancies = [];
 
+// Password gate — anyone opening a stock count's results/approval screen must
+// enter this password first. Prompted on every open (no session unlock) so the
+// results are never viewable without it. Password is intentionally hard-coded.
+const SC_REVIEW_PASSWORD = '010203';
+function scrPasswordOk(message) {
+    const entry = prompt(message || 'Enter password to view stock count results:');
+    if (entry === null) return false;            // user cancelled
+    if (entry === SC_REVIEW_PASSWORD) return true;
+    toast('Incorrect password.', 'error');
+    return false;
+}
+
 async function scrStartReview(id) {
+    if (!scrPasswordOk()) return;
     showProcessing('Loading stock count...');
     try {
         const data = await apiGet('getStockCountById', { id });
@@ -21570,6 +21828,7 @@ function scrViewApproved(id) {
         populateSelect(document.getElementById('search-bin'), bins);
     }
 })();
+
 <\/script>
 </body>
 </html>`;

@@ -17,10 +17,22 @@ define([
     'N/url',
     'N/task',
     'N/encode',
-    'N/render'
-], (serverWidget, record, search, log, runtime, url, task, encode, render) => {
+    'N/render',
+    'N/format'
+], (serverWidget, record, search, log, runtime, url, task, encode, render, format) => {
 
     const RECORD_TYPE = 'customrecord_tq_license_plate';
+
+    // Inventory statuses that are NOT pickable. A serial/unit on hand in any of
+    // these statuses (Not Counted, Not Tested, Hold, Defective, etc.) must never
+    // be staged or fulfilled on an SO pick. These are inventory-status internal
+    // ids per the TelQuest setup — anything not listed here is treated as
+    // pickable (Good, etc.). Maintained as a blocklist so new available statuses
+    // work without a code change; add ids here to block additional statuses.
+    const NON_PICKABLE_STATUS_IDS = ['2','5','6','8','9','10','11','12','13','14','15','16','17','18','21','22','23'];
+    const _nonPickableStatusSet = {};
+    NON_PICKABLE_STATUS_IDS.forEach(id => { _nonPickableStatusSet[String(id)] = true; });
+    const isNonPickableStatus = (statusId) => !!_nonPickableStatusSet[String(statusId)];
 
     const onRequest = (context) => {
         const action = context.request.parameters.action || 'page';
@@ -691,11 +703,46 @@ define([
     };
 
     // ═══════════════════════════════════════════════════════════
+    //  HELPER: Map each serial in (item, bin) to the inventory status
+    //  it is ACTUALLY in. A serialized Bin Transfer must set the source
+    //  status per serial — otherwise NetSuite assumes "Good" and cannot
+    //  find serials sitting in any non-Good status (Refurbishing, Defective,
+    //  Testing, …). Mirrors Bin Putaway's per-serial status resolution.
+    //  Returns { SERIAL_UPPERCASE: statusId }.
+    // ═══════════════════════════════════════════════════════════
+    const getSerialStatusMap = (itemId, binId, locationId) => {
+        const map = {};
+        try {
+            const filters = [
+                ['item', 'anyof', [itemId]], 'AND',
+                ['binnumber', 'anyof', [binId]], 'AND',
+                ['onhand', 'greaterthan', 0]
+            ];
+            if (locationId) { filters.push('AND'); filters.push(['location', 'anyof', [locationId]]); }
+            search.create({
+                type: 'inventorybalance',
+                filters: filters,
+                columns: [
+                    search.createColumn({ name: 'inventorynumber' }),
+                    search.createColumn({ name: 'status' })
+                ]
+            }).run().each(r => {
+                const sn = (r.getText({ name: 'inventorynumber' }) || '').trim();
+                const st = r.getValue({ name: 'status' }) || '';
+                if (sn) map[sn.toUpperCase()] = st;
+                return true;
+            });
+        } catch (e) { log.debug('getSerialStatusMap error', e.message); }
+        return map;
+    };
+
+    // ═══════════════════════════════════════════════════════════
     //  BIN TRANSFER (ALL) — Execute bulk bin transfer
     //  Creates ONE Bin Transfer record with multiple item lines.
     //  Each item handled by type:
-    //    - serialized: one inventoryassignment per serial (NS auto-resolves
-    //      the from-bin from the serial's current location)
+    //    - serialized: one inventoryassignment per serial. The serial's
+    //      real source bin + status are set so NetSuite can move stock in
+    //      ANY status (not just Good); mixed statuses in the scan are fine.
     //    - non-serialized: one inventoryassignment per status bucket so
     //      mixed-status stock in the same bin is preserved correctly
     // ═══════════════════════════════════════════════════════════
@@ -730,17 +777,28 @@ define([
                 const serials = (item.serials || []).map(s => (s || '').trim()).filter(Boolean);
                 if (!serials.length) { skipped.push(item.itemName + ' (no serials)'); return; }
 
+                // Resolve each serial's real source status in the from-bin so mixed
+                // statuses all move (NetSuite otherwise assumes Good and can't find
+                // non-Good serials). All serials in this transfer come from fromBinId.
+                const statusMap = getSerialStatusMap(item.itemId, data.fromBinId, data.locationId);
+
                 bt.selectNewLine({ sublistId: 'inventory' });
                 bt.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'item',     value: parseInt(item.itemId) });
                 bt.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'quantity', value: serials.length });
                 const invDetail = bt.getCurrentSublistSubrecord({ sublistId: 'inventory', fieldId: 'inventorydetail' });
                 serials.forEach(s => {
+                    const srcStatus = statusMap[s.toUpperCase()] || '';
                     invDetail.selectNewLine({ sublistId: 'inventoryassignment' });
                     invDetail.setCurrentSublistText({  sublistId: 'inventoryassignment', fieldId: 'issueinventorynumber', text: s });
                     invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity',             value: 1 });
+                    // Source bin + source status pin down exactly which unit to move.
+                    invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber',            value: parseInt(data.fromBinId) });
+                    if (srcStatus) invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'inventorystatus', value: parseInt(srcStatus) });
                     invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'tobinnumber',          value: parseInt(data.toBinId) });
-                    // Optional status change; NetSuite auto-resolves the serial's current status.
-                    if (toStatusId) invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'toinventorystatus', value: toStatusId });
+                    // Destination status: an explicit change wins; otherwise keep the
+                    // serial's own status so a mixed-status scan lands unchanged.
+                    const destStatus = toStatusId ? toStatusId : (srcStatus ? parseInt(srcStatus) : null);
+                    if (destStatus) invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'toinventorystatus', value: destStatus });
                     invDetail.commitLine({ sublistId: 'inventoryassignment' });
                 });
                 bt.commitLine({ sublistId: 'inventory' });
@@ -956,6 +1014,8 @@ define([
         // a stale qoh=0 row can't poison the verdict for a serial that's
         // actually in stock.
         const found  = {}; // serial -> { [itemId]: { itemName, totalQoh } }
+        const expectedSerialId = {}; // serial -> inventorynumber internal id (for the expected item), used for the availability pass
+        const expectedKey = String(itemId);
         const BATCH  = 50;
         for (let off = 0; off < unique.length; off += BATCH) {
             const batch = unique.slice(off, off + BATCH);
@@ -972,6 +1032,7 @@ define([
                     type: 'inventorynumber',
                     filters: filterExpr,
                     columns: [
+                        search.createColumn({ name: 'internalid' }),
                         search.createColumn({ name: 'inventorynumber' }),
                         search.createColumn({ name: 'item' }),
                         search.createColumn({ name: 'quantityonhand' })
@@ -985,6 +1046,7 @@ define([
                     if (!found[sn]) found[sn] = {};
                     if (!found[sn][itId]) found[sn][itId] = { itemName: itTx, totalQoh: 0 };
                     found[sn][itId].totalQoh += qoh;
+                    if (itId === expectedKey && !expectedSerialId[sn]) expectedSerialId[sn] = String(r.getValue({ name: 'internalid' }) || '');
                     return true;
                 });
             } catch (e) {
@@ -992,7 +1054,41 @@ define([
             }
         }
 
-        const expectedKey = String(itemId);
+        // Availability pass: a serial can be on hand (qoh>0) yet sit in a
+        // non-pickable inventory status (Not Counted, Not Tested, Hold, etc.),
+        // which the pick rejects server-side. Look up each in-stock serial's
+        // current on-hand status here so the picker is warned at scan time
+        // instead of at submit. nonPickableStatusText[s] is set only when the
+        // serial's status is in the block set.
+        const nonPickableStatusText = {}; // serial -> status text (present only when blocked)
+        const idToSerial = {}; // inventorynumber id -> serial text
+        Object.keys(expectedSerialId).forEach(sn => { const id = expectedSerialId[sn]; if (id) idToSerial[id] = sn; });
+        const availIds = Object.keys(idToSerial);
+        for (let off = 0; off < availIds.length; off += BATCH) {
+            const batchIds = availIds.slice(off, off + BATCH);
+            try {
+                search.create({
+                    type: 'inventorybalance',
+                    filters: [['inventorynumber', 'anyof', batchIds], 'AND', ['onhand', 'greaterthan', 0]],
+                    columns: [
+                        search.createColumn({ name: 'inventorynumber' }),
+                        search.createColumn({ name: 'status' })
+                    ]
+                }).run().each(r => {
+                    const id = String(r.getValue({ name: 'inventorynumber' }));
+                    const sn = idToSerial[id];
+                    if (!sn) return true;
+                    const st = r.getValue({ name: 'status' });
+                    if (isNonPickableStatus(st) && !nonPickableStatusText[sn]) {
+                        nonPickableStatusText[sn] = r.getText({ name: 'status' }) || '';
+                    }
+                    return true;
+                });
+            } catch (e) {
+                log.debug('validateSerialBatch availability batch error', e.message);
+            }
+        }
+
         const validations = serials.map(s => {
             const base = { serial: s, expectedItemId: expectedKey, expectedItemName };
             const byItem = found[s];
@@ -1010,6 +1106,11 @@ define([
                 });
             }
             if (matching.totalQoh <= 0) return Object.assign(base, { inStock: false, reason: 'depleted' });
+            // On hand for the right item, but sitting in a non-pickable inventory
+            // status (Not Counted, Not Tested, Hold, etc.) -> block. Warn now, not at submit.
+            if (Object.prototype.hasOwnProperty.call(nonPickableStatusText, s)) {
+                return Object.assign(base, { inStock: false, reason: 'unavailable_status', statusText: nonPickableStatusText[s] || '' });
+            }
             return Object.assign(base, { inStock: true });
         });
 
@@ -1089,9 +1190,83 @@ define([
             results.push({ serial: orig, status: 'ok' });
         });
 
-        const blocked = results.filter(r => r.status === 'in_stock_same');
-        const warned  = results.filter(r => r.status === 'in_stock_other');
-        return { success: true, results, blocked, warned, hasBlocking: blocked.length > 0 };
+        const blocked      = results.filter(r => r.status === 'in_stock_same');
+        const blockedOther = results.filter(r => r.status === 'in_stock_other');
+        // A serial already on hand under a DIFFERENT item is a duplicate serial
+        // number and is not allowed in any condition — hard block, same as an
+        // already-in-stock-same-item serial. `warned` is kept as an alias for
+        // backward-compat with older client code paths.
+        return {
+            success: true, results,
+            blocked, blockedOther, warned: blockedOther,
+            hasBlocking: blocked.length > 0 || blockedOther.length > 0
+        };
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  DUPLICATE-SERIAL GUARD (cross-item)
+    //  A serial number must never be on hand (qty > 0, in ANY inventory
+    //  status) under more than one item. Given a list of serial strings,
+    //  returns a map SERIAL(UPPER) -> [{ itemId, itemName, qoh }] of every
+    //  item that currently holds the serial on hand. No item filter, so a
+    //  serial living under two part numbers is fully visible. Batched to stay
+    //  safe on NetSuite filter-chain length. Shared by Warehouse Assistant
+    //  (every serial action) and PO Receiving.
+    // ═══════════════════════════════════════════════════════════
+    const getSerialOnHandOwners = (serials) => {
+        const owners = {}; // SERIAL(UPPER) -> { itemId: { itemId, itemName, qoh } }
+        const unique = Array.from(new Set((serials || []).map(s => (s || '').trim()).filter(Boolean).map(s => s.toUpperCase())));
+        const BATCH = 50;
+        for (let off = 0; off < unique.length; off += BATCH) {
+            const batch = unique.slice(off, off + BATCH);
+            const expr = [];
+            batch.forEach((s, i) => { if (i > 0) expr.push('OR'); expr.push(['inventorynumber', 'is', s]); });
+            try {
+                search.create({
+                    type: 'inventorynumber',
+                    filters: expr,
+                    columns: [
+                        search.createColumn({ name: 'inventorynumber' }),
+                        search.createColumn({ name: 'item' }),
+                        search.createColumn({ name: 'quantityonhand' })
+                    ]
+                }).run().each(r => {
+                    const sn   = (r.getValue({ name: 'inventorynumber' }) || '').trim().toUpperCase();
+                    const itId = String(r.getValue({ name: 'item' }));
+                    const itTx = r.getText({ name: 'item' }) || itId;
+                    const qoh  = parseFloat(r.getValue({ name: 'quantityonhand' })) || 0;
+                    if (!sn || qoh <= 0) return true; // only on-hand copies count as duplicates
+                    if (!owners[sn]) owners[sn] = {};
+                    if (!owners[sn][itId]) owners[sn][itId] = { itemId: itId, itemName: itTx, qoh: 0 };
+                    owners[sn][itId].qoh += qoh;
+                    return true;
+                });
+            } catch (e) { log.debug('getSerialOnHandOwners batch error', e.message); }
+        }
+        const flat = {}; // SERIAL(UPPER) -> [{ itemId, itemName, qoh }]
+        Object.keys(owners).forEach(sn => { flat[sn] = Object.keys(owners[sn]).map(k => owners[sn][k]); });
+        return flat;
+    };
+
+    // Given scanned serials each tied to an "allowed" owner item, return the
+    // ones that are ALSO on hand under some OTHER item (i.e. duplicated across
+    // part numbers). `allowedByUpper` maps SERIAL(UPPER) -> itemId that is the
+    // legitimate owner for that serial (the item the action concerns). Pass an
+    // empty/undefined owner to require the serial be on hand under NO item.
+    // Returns [{ serial, allowedItemId, otherItems: [{ itemId, itemName, qoh }] }].
+    const findCrossItemDuplicateSerials = (serials, allowedByUpper) => {
+        const owners = getSerialOnHandOwners(serials);
+        const allow = allowedByUpper || {};
+        const dupes = [];
+        Array.from(new Set((serials || []).map(s => (s || '').trim()).filter(Boolean))).forEach(orig => {
+            const up = orig.toUpperCase();
+            const list = owners[up];
+            if (!list || !list.length) return;
+            const allowedId = allow[up] ? String(allow[up]) : '';
+            const other = list.filter(o => String(o.itemId) !== allowedId);
+            if (other.length) dupes.push({ serial: orig, allowedItemId: allowedId, otherItems: other });
+        });
+        return dupes;
     };
 
     // ═══════════════════════════════════════════════════════════
@@ -1641,6 +1816,30 @@ define([
         }
     };
 
+    // Minutes elapsed between two stock-count timestamps, MINUS any time the
+    // count was paused. Inputs are the display-format strings a search returns
+    // for the Date/Time fields; we parse them with NetSuite's own datetime parser
+    // (time-zone correct) rather than a search formula, which was unreliable on
+    // these fields. pausedSecs is the accumulated break time (seconds) that must
+    // not be billed to the counter. Returns null when either endpoint is missing
+    // (never started / not yet submitted) or unparseable; clamps to >= 0 so a
+    // stray pause value can never produce a negative duration.
+    const scDurationMinutes = (startStr, endStr, pausedSecs) => {
+        if (!startStr || !endStr) return null;
+        try {
+            const s = format.parse({ value: startStr, type: format.Type.DATETIME });
+            const e = format.parse({ value: endStr,   type: format.Type.DATETIME });
+            if (s instanceof Date && e instanceof Date) {
+                let ms = (e.getTime() - s.getTime()) - (Number(pausedSecs) || 0) * 1000;
+                if (ms < 0) ms = 0;
+                return Math.round(ms / 60000);
+            }
+        } catch (pe) {
+            log.debug('scDurationMinutes parse failed', pe.message);
+        }
+        return null;
+    };
+
     const getStockCounts = (params) => {
         try {
             const filters = [['isinactive', 'is', 'F']];
@@ -1670,6 +1869,11 @@ define([
                     search.createColumn({ name: 'custrecordsc_items_json' }),
                     search.createColumn({ name: 'custrecord_sc_adj_id' }),
                     search.createColumn({ name: 'custrecord_sc_bt_id' }),
+                    search.createColumn({ name: 'custrecord_sc_start' }),
+                    search.createColumn({ name: 'custrecord_sc_end' }),
+                    search.createColumn({ name: 'custrecord_sc_pause_start' }),
+                    search.createColumn({ name: 'custrecord_sc_paused_secs' }),
+                    search.createColumn({ name: 'custrecord_sc_pause_reason' }),
                     search.createColumn({ name: 'created', sort: search.Sort.DESC })
                 ]
             }).run().each(r => {
@@ -1704,6 +1908,18 @@ define([
                     adjustmentId: r.getValue({ name: 'custrecord_sc_adj_id' }) || null,
                     binTransferId: r.getValue({ name: 'custrecord_sc_bt_id' }) || null,
                     binTransferTranId: r.getText({ name: 'custrecord_sc_bt_id' }) || null,
+                    startDate: r.getValue({ name: 'custrecord_sc_start' }) || null,
+                    endDate: r.getValue({ name: 'custrecord_sc_end' }) || null,
+                    // A non-empty pause-start with no end means the counter is on
+                    // a break right now — drives the "Paused" badge / "Resume" button.
+                    paused: !!(r.getValue({ name: 'custrecord_sc_pause_start' }) && !r.getValue({ name: 'custrecord_sc_end' })),
+                    pausedSecs: Number(r.getValue({ name: 'custrecord_sc_paused_secs' })) || 0,
+                    pauseReason: r.getValue({ name: 'custrecord_sc_pause_reason' }) || '',
+                    durationMinutes: scDurationMinutes(
+                        r.getValue({ name: 'custrecord_sc_start' }),
+                        r.getValue({ name: 'custrecord_sc_end' }),
+                        r.getValue({ name: 'custrecord_sc_paused_secs' })
+                    ),
                     created: r.getValue({ name: 'created' })
                 });
                 return true;
@@ -1800,6 +2016,25 @@ define([
                     assignedToId: rec.getValue({ fieldId: 'custrecord_sc_assigned_to' }),
                     assignedTo: rec.getText({ fieldId: 'custrecord_sc_assigned_to' }),
                     status: rec.getValue({ fieldId: 'custrecord_sc_status' }),
+                    startDate: rec.getText({ fieldId: 'custrecord_sc_start' }) || null,
+                    endDate: rec.getText({ fieldId: 'custrecord_sc_end' }) || null,
+                    // Currently paused = a pause-start is set and the count hasn't
+                    // ended yet. sceStartCount uses this to auto-resume on re-entry.
+                    paused: !!(rec.getValue({ fieldId: 'custrecord_sc_pause_start' }) && !rec.getValue({ fieldId: 'custrecord_sc_end' })),
+                    pausedSecs: Number(rec.getValue({ fieldId: 'custrecord_sc_paused_secs' })) || 0,
+                    pauseReason: rec.getValue({ fieldId: 'custrecord_sc_pause_reason' }) || '',
+                    durationMinutes: (function () {
+                        // getValue on a Date/Time field returns a Date in server context.
+                        const s = rec.getValue({ fieldId: 'custrecord_sc_start' });
+                        const e = rec.getValue({ fieldId: 'custrecord_sc_end' });
+                        const pSecs = Number(rec.getValue({ fieldId: 'custrecord_sc_paused_secs' })) || 0;
+                        if (s instanceof Date && e instanceof Date) {
+                            let ms = (e.getTime() - s.getTime()) - pSecs * 1000;
+                            if (ms < 0) ms = 0;
+                            return Math.round(ms / 60000);
+                        }
+                        return null;
+                    })(),
                     adjustmentId: adjLinkId,
                     binTransferId: btLinkId,
                     adjustmentLink: adjustmentLink,
@@ -1821,6 +2056,55 @@ define([
             const id = data.id;
             if (!id) return { success: false, message: 'Stock count ID required.' };
             const rec = record.load({ type: 'customrecord_wh_stock_count', id: id, isDynamic: true });
+
+            // ── Timing stamps ────────────────────────────────────────────
+            // Track how long a count took: stamp START the first time it goes
+            // In Progress (the "Start Count" click) and END the first time it is
+            // submitted for approval (status -> completed, i.e. Pending Review).
+            // Both are only-if-empty so "Continue" re-entry or a re-submit never
+            // overwrites the original timing. Server-side new Date() keeps the
+            // clock authoritative and in the account time zone.
+            if (data.status === 'in_progress' && !rec.getValue({ fieldId: 'custrecord_sc_start' })) {
+                rec.setValue({ fieldId: 'custrecord_sc_start', value: new Date() });
+            }
+
+            // ── Pause / Resume ───────────────────────────────────────────
+            // Pause stamps pause_start (the moment the break began). Resume adds
+            // the elapsed break to the running total (custrecord_sc_paused_secs)
+            // and clears pause_start. Duration = (end - start) - paused_secs, so
+            // break time is never billed to the counter. Guarded so a double
+            // pause / stray resume can't corrupt the total.
+            if (data.pauseAction === 'pause') {
+                const reason = (data.pauseReason || '').trim();
+                if (!reason) return { success: false, message: 'A pause reason is required.' };
+                if (!rec.getValue({ fieldId: 'custrecord_sc_pause_start' })) {
+                    rec.setValue({ fieldId: 'custrecord_sc_pause_start', value: new Date() });
+                }
+                rec.setValue({ fieldId: 'custrecord_sc_pause_reason', value: reason });
+            } else if (data.pauseAction === 'resume') {
+                const ps = rec.getValue({ fieldId: 'custrecord_sc_pause_start' });
+                if (ps instanceof Date) {
+                    const cur = Number(rec.getValue({ fieldId: 'custrecord_sc_paused_secs' })) || 0;
+                    const add = Math.max(0, Math.floor((Date.now() - ps.getTime()) / 1000));
+                    rec.setValue({ fieldId: 'custrecord_sc_paused_secs', value: cur + add });
+                    rec.setValue({ fieldId: 'custrecord_sc_pause_start', value: '' });
+                }
+            }
+
+            if (data.status === 'completed' && !rec.getValue({ fieldId: 'custrecord_sc_end' })) {
+                const _end = new Date();
+                rec.setValue({ fieldId: 'custrecord_sc_end', value: _end });
+                // Completing while still paused: fold the open break into the
+                // total and clear it, so the final pause gap is excluded too.
+                const ps = rec.getValue({ fieldId: 'custrecord_sc_pause_start' });
+                if (ps instanceof Date) {
+                    const cur = Number(rec.getValue({ fieldId: 'custrecord_sc_paused_secs' })) || 0;
+                    const add = Math.max(0, Math.floor((_end.getTime() - ps.getTime()) / 1000));
+                    rec.setValue({ fieldId: 'custrecord_sc_paused_secs', value: cur + add });
+                    rec.setValue({ fieldId: 'custrecord_sc_pause_start', value: '' });
+                }
+            }
+
             if (data.status) rec.setValue({ fieldId: 'custrecord_sc_status', value: data.status });
             if (data.countedJson !== undefined) rec.setValue({ fieldId: 'custrecordsc_count_json', value: data.countedJson });
             if (data.adjustmentId !== undefined) rec.setValue({ fieldId: 'custrecord_sc_adj_id', value: data.adjustmentId });
@@ -2710,6 +2994,39 @@ define([
         if (!data.locationId) return { success: false, message: 'Location is required.' };
         if (!data.lines || !data.lines.length) return { success: false, message: 'No lines selected for receiving.' };
 
+        // ── Duplicate-serial guard (cross-item), authoritative ──
+        // A serial being received must not already be on hand (qty>0, any status)
+        // under a DIFFERENT item — that would create the same serial number under
+        // two part numbers, which is never allowed. Blocked here so it holds even
+        // if the client check is bypassed. Same-item already-in-stock is handled
+        // separately (NetSuite rejects it and the client strips it).
+        try {
+            const dupSerials = [];
+            const dupAllowed = {}; // SERIAL(UPPER) -> the item being received onto
+            data.lines.forEach(l => {
+                if (l.isSerialized && Array.isArray(l.serialNumbers)) {
+                    l.serialNumbers.forEach(s => {
+                        const t = (s || '').trim();
+                        if (!t) return;
+                        dupSerials.push(t);
+                        dupAllowed[t.toUpperCase()] = String(l.itemId || '');
+                    });
+                }
+            });
+            if (dupSerials.length) {
+                const dupes = findCrossItemDuplicateSerials(dupSerials, dupAllowed);
+                if (dupes.length) {
+                    const shown = dupes.slice(0, 12).map(d => d.serial + ' → already in stock under ' + d.otherItems.map(o => o.itemName).join(', ')).join('  |  ');
+                    const extra = dupes.length > 12 ? '  (+' + (dupes.length - 12) + ' more)' : '';
+                    return {
+                        success: false,
+                        duplicateSerials: dupes,
+                        message: 'Cannot receive — duplicate serial number(s) already in stock under a different part number: ' + shown + extra + '. This is not allowed in any condition; resolve the duplicate first.'
+                    };
+                }
+            }
+        } catch (dupErr) { log.error('receivePOItems duplicate-serial guard failed', dupErr.message); }
+
         const receipt = record.transform({
             fromType: record.Type.PURCHASE_ORDER,
             fromId: data.poId,
@@ -3154,18 +3471,28 @@ define([
             if (!itemId || q <= 0) return;
             nonSerialMoves.push({ itemId: String(itemId), qty: q, fromBinId: fromBinId ? String(fromBinId) : '' });
         };
+        // A non-serialized line may draw from one bin (`binId` + `quantity`) or,
+        // for multi-order picking where one order's demand straddles bins, from
+        // several (`binAllocations: [{ binId, qty }]`). Stage each source bin.
+        const addNonSerialLine = (itemId, line) => {
+            if (line.binAllocations && line.binAllocations.length) {
+                line.binAllocations.forEach(a => addNonSerial(itemId, a.qty, a.binId));
+            } else {
+                addNonSerial(itemId, line.quantity, line.binId);
+            }
+        };
         data.lines.forEach(l => {
             if (l.committed) return; // committed lines fulfill from their own commitment — never staged
             if (l.isNonInventory) return; // services / non-inv parts have no stock to stage
             if (l.isKit && l.components) {
                 l.components.forEach(comp => {
                     if (comp.isSerialized) addSerials(comp.itemId, comp.serialNumbers);
-                    else addNonSerial(comp.itemId, comp.quantity, comp.binId);
+                    else addNonSerialLine(comp.itemId, comp);
                 });
             } else if (l.isSerialized) {
                 addSerials(l.itemId, l.serialNumbers);
             } else {
-                addNonSerial(l.itemId, l.quantity, l.binId);
+                addNonSerialLine(l.itemId, l);
             }
         });
         if (!Object.keys(serialsByItem).length && !nonSerialMoves.length) return { btId: null, statusBySerial: {}, allocationByItemBin: {} }; // Nothing to stage.
@@ -3187,6 +3514,7 @@ define([
         // numeric value was removed".
         const toMoveByItem = {}; // itemId -> [serials needing transfer]
         const unstageable  = []; // serials with no resolvable on-hand bin at this location
+        const unavailable  = []; // serials on hand but sitting in a non-available inventory status (e.g. Not Counted)
         const statusBySerial = {}; // serial -> real on-hand inventory status id (may be non-Good)
         Object.keys(serialsByItem).forEach(itemId => {
             const serials = Array.from(serialsByItem[itemId]);
@@ -3196,7 +3524,9 @@ define([
             const reverseMap = {}; // numericId -> serialText
             Object.keys(idMap).forEach(sn => { reverseMap[String(idMap[sn])] = sn; });
             const idList = Object.keys(reverseMap);
-            const currentBin = {}; // serial -> binId string
+            const currentBin = {}; // serial -> binId string (only for units in an AVAILABLE status)
+            const onHandStatusText = {}; // serial -> status text of any on-hand row (available or not), for messaging
+            const sawOnHand = {}; // serial -> true if any on-hand row exists at all
             if (idList.length) {
                 const filters = [];
                 if (locationId) { filters.push(['location', 'anyof', locationId]); filters.push('AND'); }
@@ -3215,14 +3545,23 @@ define([
                             search.createColumn({ name: 'status' })
                         ]
                     }).run().each(r => {
-                        const numId  = String(r.getValue({ name: 'inventorynumber' }));
-                        const sn     = reverseMap[numId];
-                        const binId  = r.getValue({ name: 'binnumber' });
-                        const status = r.getValue({ name: 'status' });
-                        if (sn && binId && !currentBin[sn]) currentBin[sn] = String(binId);
+                        const numId     = String(r.getValue({ name: 'inventorynumber' }));
+                        const sn        = reverseMap[numId];
+                        const binId     = r.getValue({ name: 'binnumber' });
+                        const status    = r.getValue({ name: 'status' });
+                        const statusTxt = r.getText({ name: 'status' }) || '';
+                        if (!sn) return true;
+                        sawOnHand[sn] = true;
+                        if (!onHandStatusText[sn]) onHandStatusText[sn] = statusTxt;
+                        // Availability gate: a unit sitting in a non-pickable inventory
+                        // status (Not Counted, Not Tested, Hold, etc.) is on hand but must
+                        // NOT be staged/fulfilled on a pick. Leaving currentBin unset routes
+                        // it to the `unavailable` hard-block below.
+                        if (isNonPickableStatus(status)) return true;
+                        if (binId && !currentBin[sn]) currentBin[sn] = String(binId);
                         // Remember the unit's ACTUAL status so the transfer (and the
                         // fulfillment) resolve it where it really is, not in Good.
-                        if (sn && status && !statusBySerial[sn]) statusBySerial[sn] = String(status);
+                        if (status && !statusBySerial[sn]) statusBySerial[sn] = String(status);
                         return true;
                     });
                 } catch (e) {
@@ -3237,14 +3576,20 @@ define([
             // Instead, collect them and abort the whole pick up front with a
             // clear message — no transfer is created, so nothing to orphan.
             // Serials already sitting in the staging bin are genuinely staged
-            // and simply need no move.
+            // and simply need no move. A serial on hand only in a non-pickable
+            // status (Not Counted, Not Tested, Hold, etc.) is a hard block.
             serials.forEach(s => {
                 const cur = currentBin[s];
-                if (!cur) {
+                if (cur) {
+                    if (cur !== String(SO_PICK_STAGING_BIN_ID)) {
+                        if (!toMoveByItem[itemId]) toMoveByItem[itemId] = [];
+                        toMoveByItem[itemId].push(s);
+                    }
+                } else if (sawOnHand[s]) {
+                    const st = onHandStatusText[s];
+                    unavailable.push('Item ' + itemId + ' \u2192 ' + s + (st ? ' (' + st + ')' : ''));
+                } else {
                     unstageable.push('Item ' + itemId + ' \u2192 ' + s);
-                } else if (cur !== String(SO_PICK_STAGING_BIN_ID)) {
-                    if (!toMoveByItem[itemId]) toMoveByItem[itemId] = [];
-                    toMoveByItem[itemId].push(s);
                 }
             });
         });
@@ -3260,6 +3605,16 @@ define([
                 nonSerialToMove.push(m);
             }
         });
+
+        // Availability block: serials on hand but sitting in a non-available
+        // inventory status (Not Counted, Hold, etc.) can never be picked. Abort
+        // the whole pick before any Bin Transfer is created \u2014 nothing to orphan.
+        if (unavailable.length) {
+            const shown = unavailable.slice(0, 15).join('  |  ') + (unavailable.length > 15 ? '  (+' + (unavailable.length - 15) + ' more)' : '');
+            const err = new Error('Cannot pick \u2014 these serial(s) are in a non-available inventory status and are not pickable: ' + shown + '. Move them to an available status first, or re-scan.');
+            err.name = 'UnavailableStatus';
+            throw err;
+        }
 
         if (unstageable.length) {
             const shown = unstageable.slice(0, 15).join('  |  ') + (unstageable.length > 15 ? '  (+' + (unstageable.length - 15) + ' more)' : '');
@@ -3312,7 +3667,8 @@ define([
                     const bn = String(r.getValue({ name: 'binnumber' }) || '');
                     const st = String(r.getValue({ name: 'status' })    || '');
                     const av = parseFloat(r.getValue({ name: 'available' }) || 0);
-                    if (!it || !bn || !st || av <= 0) return true; // skip statuses with nothing available (Hold/Defective/etc.)
+                    if (!it || !bn || !st || av <= 0) return true; // skip statuses with nothing available
+                    if (isNonPickableStatus(st)) return true;      // never pull non-pickable statuses (Not Counted, Not Tested, Hold, etc.)
                     const key = it + '|' + bn;
                     if (!raw[key]) raw[key] = {};
                     raw[key][st] = (raw[key][st] || 0) + av;
@@ -3755,6 +4111,12 @@ define([
                             invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'inventorystatus', value: parseInt(matchedLine.inventoryStatusId) });
                             invDetail.commitLine({ sublistId: 'inventoryassignment' });
                             nsAssigned = requestedQty;
+                        } else if (matchedLine.binAllocations && matchedLine.binAllocations.length) {
+                            // Multi-order pick: this line's qty was split across several
+                            // source bins. Draw each bin's slice from its own staged pool.
+                            matchedLine.binAllocations.forEach(a => {
+                                nsAssigned += assignNonSerialFromPool(invDetail, String(matchedLine.itemId), String(a.binId), parseFloat(a.qty) || 0, SO_PICK_STAGING_BIN_ID);
+                            });
                         } else {
                             nsAssigned = assignNonSerialFromPool(invDetail, String(matchedLine.itemId), String(matchedLine.binId), requestedQty, SO_PICK_STAGING_BIN_ID);
                         }
@@ -3881,6 +4243,10 @@ define([
         const startIndex = (data && data.startIndex) || 0;
         let itemId   = (data && data.itemId)   || null;   // reference item across chunks
         let itemText = (data && data.itemText) || null;
+        // Whether the batch's single item is serialized. Drives which Step-2 UI
+        // the client shows (scan serials vs. enter qty + bin). Carried across
+        // chunks so every chunk agrees, same as itemId/itemText.
+        let itemIsSerialized = (data && typeof data.itemIsSerialized === 'boolean') ? data.itemIsSerialized : null;
 
         const scriptObj = runtime.getCurrentScript();
         const startTime = Date.now();
@@ -3914,18 +4280,27 @@ define([
                 continue;
             }
 
-            // Only serialized lines with remaining quantity are pickable here.
-            const pickLines = (res.lines || []).filter(l => l.isSerialized && l.quantityRemaining > 0);
+            // Pickable lines: any inventory-tracked line (serialized OR non-
+            // serialized) with remaining qty. Kits and non-inventory lines aren't
+            // handled by the multi picker. Committed special-order non-serial
+            // lines fulfill from their own commitment via a different path, so
+            // they're excluded here — serialized parity is unchanged (serialized
+            // lines are included regardless of committed, exactly as before).
+            const pickLines = (res.lines || []).filter(l =>
+                l.quantityRemaining > 0 && !l.isKit && !l.isNonInventory &&
+                (l.isSerialized || !l.isCommitted));
             const remaining = pickLines.reduce((a, l) => a + l.quantityRemaining, 0);
             if (!pickLines.length || remaining <= 0) {
-                problems.push({ soNumber: res.soTranId || soNum, message: 'Nothing left to pick (no serialized items or already fulfilled).' });
+                problems.push({ soNumber: res.soTranId || soNum, message: 'Nothing left to pick (no pickable items or already fulfilled).' });
                 continue;
             }
 
-            // Enforce single-item invariant across every line and every SO.
+            // Enforce single-item invariant across every line and every SO. Because
+            // every order in the batch is the same item, the item's serialized-ness
+            // is consistent too — capture it once when the reference item is set.
             let mixed = false;
             for (const l of pickLines) {
-                if (itemId === null) { itemId = String(l.itemId); itemText = l.itemText; }
+                if (itemId === null) { itemId = String(l.itemId); itemText = l.itemText; itemIsSerialized = !!l.isSerialized; }
                 else if (String(l.itemId) !== itemId) { mixed = true; break; }
             }
             if (mixed) {
@@ -3940,9 +4315,11 @@ define([
                 soDate: res.soDate || '',
                 itemId: String(pickLines[0].itemId),
                 itemText: pickLines[0].itemText,
+                isSerialized: !!pickLines[0].isSerialized,
                 qty: remaining,
-                // Keep each serialized line's remaining qty so fulfill can rebuild
-                // exact per-line serial slices (usually a single line).
+                // Keep each line's remaining qty so fulfill can rebuild exact
+                // per-line slices — serials (serialized) or bin-allocated qty
+                // (non-serialized). Usually a single line.
                 lines: pickLines.map(l => ({ lineNum: l.lineNum, itemId: String(l.itemId), quantityRemaining: l.quantityRemaining })),
                 openFulfillments: (res.openFulfillments || []).map(f => ({ tranId: f.tranId, statusText: f.statusText }))
             });
@@ -3956,6 +4333,7 @@ define([
             problems,
             itemId,
             itemText,
+            isSerialized: itemIsSerialized,
             nextIndex,
             processedTo: i,
             totalScanned: ordered.length
@@ -3995,14 +4373,25 @@ define([
             done++;
 
             const o = orders[i];
-            // Normalize the per-line payload (defensive: ensure serialized shape).
-            const lines = (o.lines || []).map(l => ({
-                lineNum: l.lineNum,
-                itemId: String(l.itemId),
-                isSerialized: true,
-                serialNumbers: l.serialNumbers || [],
-                quantity: (l.serialNumbers || []).length
-            }));
+            // Normalize the per-line payload. Serialized lines carry scanned
+            // serials; non-serialized lines carry qty split across one or more
+            // source bins (binAllocations), which pickSOItems stages + fulfills.
+            const lines = (o.lines || []).map(l => {
+                if (l.isSerialized === false) {
+                    const binAllocations = (l.binAllocations || [])
+                        .map(a => ({ binId: String(a.binId), qty: parseFloat(a.qty) || 0 }))
+                        .filter(a => a.binId && a.qty > 0);
+                    const quantity = binAllocations.reduce((s, a) => s + a.qty, 0);
+                    return { lineNum: l.lineNum, itemId: String(l.itemId), isSerialized: false, binAllocations: binAllocations, quantity: quantity };
+                }
+                return {
+                    lineNum: l.lineNum,
+                    itemId: String(l.itemId),
+                    isSerialized: true,
+                    serialNumbers: l.serialNumbers || [],
+                    quantity: (l.serialNumbers || []).length
+                };
+            });
 
             try {
                 const r = pickSOItems({ soId: o.soId, soTranId: o.soTranId, locationId: locationId, lines: lines });
@@ -5688,6 +6077,7 @@ define([
             groups.forEach(group => {
                 const serialCount = group.serials.length;
                 const itemCost = costCache[group.itemId] || 0;
+                const foundBinId = group.binOverrideId || getBackToStockBinId();
                 adjRecord.selectNewLine({ sublistId: 'inventory' });
                 adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'item', value: group.itemId });
                 adjRecord.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'location', value: group.locationId });
@@ -5698,7 +6088,7 @@ define([
                     addDetail.selectNewLine({ sublistId: 'inventoryassignment' });
                     addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'receiptinventorynumber', value: serial.serialNumber });
                     addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity', value: 1 });
-                    addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', value: getBackToStockBinId() });
+                    addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', value: foundBinId });
                     addDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'inventorystatus', value: _ovStatus(serial.statusOverride, BACK_TO_STOCK_STATUS_ID) });
                     addDetail.commitLine({ sublistId: 'inventoryassignment' });
                 });
@@ -6950,6 +7340,8 @@ define([
                     }
 
                     function showInventoryFoundModal() {
+                        var binEl = document.getElementById('if_bin');
+                        if (binEl && window.WAAC) WAAC.attach(binEl, { type: 'bin', datalistId: 'ns-bin-datalist' });
                         var modal = document.getElementById('inventoryFoundModal');
                         if (modal) modal.style.display = 'flex';
                         var itemInput = document.getElementById('if_item_name');
@@ -6972,6 +7364,10 @@ define([
                         if (ifSerialsField) ifSerialsField.value = serialsRaw;
                         var ifMemoHidden = document.getElementById('custpage_if_memo');
                         if (ifMemoHidden) ifMemoHidden.value = (document.getElementById('if_memo') || {}).value || '';
+                        var ifBinHidden = document.getElementById('custpage_if_bin');
+                        if (ifBinHidden) ifBinHidden.value = ((document.getElementById('if_bin') || {}).value || '').trim();
+                        var ifStatusHidden = document.getElementById('custpage_if_status');
+                        if (ifStatusHidden) ifStatusHidden.value = (document.getElementById('if_status') || {}).value || '';
                         var actionInput = document.createElement('input');
                         actionInput.type = 'hidden'; actionInput.name = 'custpage_action'; actionInput.value = 'process_inventory_found';
                         form.appendChild(actionInput); _disableAllBtns(); form.submit();
@@ -7374,6 +7770,10 @@ define([
                         <input type="text" id="if_item_name" placeholder="Exact item name" style="width:100%;padding:12px;border:1.5px solid #d1d5db;border-radius:8px;font-size:16px;margin-bottom:14px;min-height:44px;">
                         <label style="display:block;font-weight:700;margin-bottom:5px;color:#374151;font-size:13px;">Serial Numbers (one per line)</label>
                         <textarea id="if_serials" rows="5" placeholder="Scan or type serials" style="width:100%;padding:12px;border:1.5px solid #d1d5db;border-radius:8px;font-size:16px;resize:vertical;margin-bottom:14px;font-family:'SF Mono',Monaco,monospace;"></textarea>
+                        <label style="display:block;font-weight:700;margin-bottom:5px;color:#374151;font-size:13px;">Destination Bin (optional)</label>
+                        <input type="text" id="if_bin" list="ns-bin-datalist" autocomplete="off" placeholder="Leave blank for Back to Stock bin" style="width:100%;padding:12px;border:1.5px solid #d1d5db;border-radius:8px;font-size:16px;margin-bottom:14px;min-height:44px;">
+                        <label style="display:block;font-weight:700;margin-bottom:5px;color:#374151;font-size:13px;">Status (optional)</label>
+                        <select id="if_status" style="width:100%;padding:12px;border:1.5px solid #d1d5db;border-radius:8px;font-size:16px;margin-bottom:14px;min-height:44px;color:#374151;">${getStatusOverrideOptionsHtml()}</select>
                         <label style="display:block;font-weight:700;margin-bottom:5px;color:#374151;font-size:13px;">Memo (optional)</label>
                         <input type="text" id="if_memo" placeholder="Add a note to this adjustment..." maxlength="255" style="width:100%;padding:12px;border:1.5px solid #d1d5db;border-radius:8px;font-size:16px;margin-bottom:18px;min-height:44px;">
                         <div style="display:flex;gap:10px;justify-content:flex-end;">
@@ -7420,6 +7820,10 @@ define([
             nsMemoField.updateDisplayType({ displayType: serverWidget.FieldDisplayType.HIDDEN }); nsMemoField.defaultValue = '';
             const ifMemoField = form.addField({ id: 'custpage_if_memo', type: serverWidget.FieldType.TEXT, label: 'IF Memo' });
             ifMemoField.updateDisplayType({ displayType: serverWidget.FieldDisplayType.HIDDEN }); ifMemoField.defaultValue = '';
+            const ifBinField = form.addField({ id: 'custpage_if_bin', type: serverWidget.FieldType.TEXT, label: 'IF Bin' });
+            ifBinField.updateDisplayType({ displayType: serverWidget.FieldDisplayType.HIDDEN }); ifBinField.defaultValue = '';
+            const ifStatusField = form.addField({ id: 'custpage_if_status', type: serverWidget.FieldType.TEXT, label: 'IF Status' });
+            ifStatusField.updateDisplayType({ displayType: serverWidget.FieldDisplayType.HIDDEN }); ifStatusField.defaultValue = '';
 
             const containerEnd = form.addField({ id: 'custpage_container_end', type: serverWidget.FieldType.INLINEHTML, label: ' ' });
             containerEnd.defaultValue = `</div>
@@ -7818,6 +8222,35 @@ define([
             actions.forEach(a => { if (a.action && a.action !== '') actionMap[a.index] = { action: a.action, newSerial: a.newSerial || '', newItemName: a.newItemName || '', upcharge: parseFloat(a.upcharge) || 0, statusOverride: a.statusOverride || '' }; });
             if (Object.keys(actionMap).length === 0) { createResultsPage(context, serialData, 'Select an action for at least one serial number.', 'warning'); return; }
 
+            // ── Duplicate-serial guard (cross-item) ──
+            // A serial on hand (qty>0, any status) under a DIFFERENT item than the
+            // one it's being acted on is a duplicate serial number — not allowed in
+            // any condition. New serial strings introduced by a serial/part change
+            // must not be on hand under ANY item. Hard block before anything is built.
+            try {
+                const dupSerials = [];
+                const dupAllowed = {}; // SERIAL(UPPER) -> allowed owner itemId ('' = must exist under none)
+                for (const [idxStr, ad] of Object.entries(actionMap)) {
+                    const s = serialData.valid[parseInt(idxStr, 10)];
+                    if (!s || !s.serialNumber) continue;
+                    const up = String(s.serialNumber).trim().toUpperCase();
+                    dupSerials.push(s.serialNumber);
+                    dupAllowed[up] = String(s.itemId || '');
+                    // A renamed / new serial string must not already live under any item.
+                    if (['serial_change', 'serial_change_stock', 'part_serial_change', 'part_serial_change_stock'].indexOf(ad.action) !== -1 && ad.newSerial) {
+                        const nu = String(ad.newSerial).trim().toUpperCase();
+                        if (nu) { dupSerials.push(ad.newSerial); if (!(nu in dupAllowed)) dupAllowed[nu] = ''; }
+                    }
+                }
+                const dupes = findCrossItemDuplicateSerials(dupSerials, dupAllowed);
+                if (dupes.length) {
+                    const shown = dupes.slice(0, 12).map(d => d.serial + ' → also in stock under ' + d.otherItems.map(o => o.itemName).join(', ')).join('  |  ');
+                    const extra = dupes.length > 12 ? '  (+' + (dupes.length - 12) + ' more)' : '';
+                    createResultsPage(context, serialData, 'Duplicate serial number(s) blocked — these are already in stock under a different part number, which is not allowed: ' + shown + extra + '. Resolve the duplicate before proceeding.', 'error');
+                    return;
+                }
+            } catch (dupErr) { log.error('WH Assistant duplicate-serial guard failed', dupErr.message); }
+
             const ADJUSTMENT_ACTIONS = ['likenew', 'likenew_stock'];
             const BIN_TRANSFER_ACTIONS = ['move_testing', 'move_refurbishing', 'move_not_counted', 'back_to_stock', 'defective', 'trash', 'return_to_vendor'];
             const SERIAL_CHANGE_ACTIONS = ['serial_change', 'serial_change_stock'];
@@ -8028,16 +8461,40 @@ define([
             const itemName = (context.request.parameters.custpage_if_item_name || '').trim();
             const serialsRaw = (context.request.parameters.custpage_if_serials || '').trim();
             const userMemo = (context.request.parameters.custpage_if_memo || '').trim();
+            const binText = (context.request.parameters.custpage_if_bin || '').trim();
+            const statusOverride = (context.request.parameters.custpage_if_status || '').trim();
             if (!itemName) { createEntryForm(context, 'Item name is required.', 'error'); return; }
             if (!serialsRaw) { createEntryForm(context, 'At least one serial number is required.', 'error'); return; }
             const item = findItemByName(itemName);
             if (!item) { createEntryForm(context, 'Item not found: ' + itemName, 'error'); return; }
+            let binOverrideId = null;
+            if (binText) {
+                const bin = findBinByNumberAtLocation(binText, '1');
+                if (!bin) { createEntryForm(context, 'Bin not found in this warehouse: ' + binText, 'error'); return; }
+                binOverrideId = bin.id;
+            }
             const serials = serialsRaw.split(/[\r\n]+/).map(function(s) { return s.trim(); }).filter(function(s) { return s.length > 0; });
             const uniqueSerials = []; const seen = {};
             serials.forEach(function(s) { if (!seen[s]) { seen[s] = true; uniqueSerials.push(s); } });
             if (uniqueSerials.length === 0) { createEntryForm(context, 'No valid serial numbers.', 'error'); return; }
 
-            const groups = [{ itemId: item.id, itemText: item.displayname || item.itemid, itemDescription: item.description, locationId: '1', action: 'inventory_found', serials: uniqueSerials.map(function(s) { return { serialNumber: s, serialId: null, binId: null }; }) }];
+            // ── Duplicate-serial guard (cross-item) ──
+            // Inventory Found introduces serials to `item`. Any serial already on
+            // hand (qty>0, any status) under a DIFFERENT item is a duplicate serial
+            // number and must never be adjusted in. Hard block before the adjustment.
+            try {
+                const ifAllowed = {}; // every found serial's only allowed owner is the target item
+                uniqueSerials.forEach(function(s) { ifAllowed[String(s).trim().toUpperCase()] = String(item.id); });
+                const ifDupes = findCrossItemDuplicateSerials(uniqueSerials, ifAllowed);
+                if (ifDupes.length) {
+                    const shown = ifDupes.slice(0, 12).map(function(d) { return d.serial + ' → already in stock under ' + d.otherItems.map(function(o) { return o.itemName; }).join(', '); }).join('  |  ');
+                    const extra = ifDupes.length > 12 ? '  (+' + (ifDupes.length - 12) + ' more)' : '';
+                    createEntryForm(context, 'Duplicate serial number(s) blocked — already in stock under a different part number, which is not allowed: ' + shown + extra + '. Resolve the duplicate before adjusting in.', 'error');
+                    return;
+                }
+            } catch (ifDupErr) { log.error('Inventory Found duplicate-serial guard failed', ifDupErr.message); }
+
+            const groups = [{ itemId: item.id, itemText: item.displayname || item.itemid, itemDescription: item.description, locationId: '1', action: 'inventory_found', binOverrideId: binOverrideId, serials: uniqueSerials.map(function(s) { return { serialNumber: s, serialId: null, binId: null, statusOverride: statusOverride }; }) }];
             try {
                 const r = createInventoryFoundAdjustment(groups, userMemo || 'Inv Found via WH Assistant');
                 createSuccessPage(context, null, null, [{ itemId: item.id, itemText: item.displayname || item.itemid, description: item.description, action: 'inventory_found', serialNumbers: uniqueSerials }], null, r.tranId, null);
@@ -11947,7 +12404,62 @@ setTimeout(doPrint, 2000);
     // ═══════════════════════════════════════════════════════════
     //  SERVE THE HTML PAGE
     // ═══════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════
+    //  PER-USER PERMISSIONS
+    //  customrecord_warehouse_assistant_permiss: one row per employee links
+    //  them (custrecord_wh_assistant_employee) to a multi-select of allowed
+    //  feature IDs (custrecord_permission_list). IDs match the permission list
+    //  record: 1 Warehouse Assistant, 2 Print Label, 3 PO Receiving, 4 SO
+    //  Picking, 5 Bin Putaway, 6 Pick Amazon, 7 Inventory Status Change,
+    //  8 Bin Consolidation, 9 Item Lookup, 10 TQ License Plates, 11 Stock
+    //  Counts, 12 Stock Count Approval. Returns the granted IDs, or null when
+    //  the user has NO permission record at all (→ full lockout).
+    // ═══════════════════════════════════════════════════════════
+    const getUserPermissionIds = () => {
+        let userId;
+        try { userId = runtime.getCurrentUser().id; } catch (e) { return null; }
+        if (!userId) return null;
+        let recId = null;
+        try {
+            search.create({
+                type: 'customrecord_warehouse_assistant_permiss',
+                filters: [['custrecord_wh_assistant_employee', 'anyof', userId], 'AND', ['isinactive', 'is', 'F']],
+                columns: ['internalid']
+            }).run().each(function (r) { recId = r.id; return false; });
+        } catch (e) { log.error('getUserPermissionIds search', e.message); return null; }
+        if (!recId) return null; // no record → caller locks the user out entirely
+        const ids = [];
+        try {
+            const lk = search.lookupFields({ type: 'customrecord_warehouse_assistant_permiss', id: recId, columns: ['custrecord_permission_list'] });
+            (lk.custrecord_permission_list || []).forEach(function (o) {
+                const v = parseInt(o.value, 10);
+                if (!isNaN(v)) ids.push(v);
+            });
+        } catch (e) { log.error('getUserPermissionIds lookup', e.message); }
+        return ids;
+    };
+
+    const buildAccessDeniedPage = () => {
+        return '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">' +
+            '<meta name="viewport" content="width=device-width, initial-scale=1">' +
+            '<title>Warehouse Assistant — Access Denied</title></head>' +
+            '<body style="margin:0;font-family:-apple-system,Segoe UI,Roboto,sans-serif;background:#f4f6f9;color:#1a1d27;">' +
+            '<div style="max-width:520px;margin:12vh auto;padding:32px;background:#fff;border:1px solid #e0e4ea;border-radius:14px;text-align:center;box-shadow:0 6px 24px rgba(0,0,0,.06);">' +
+            '<div style="font-size:44px;line-height:1;margin-bottom:14px;">🔒</div>' +
+            '<h1 style="font-size:20px;margin:0 0 8px;">Access Denied</h1>' +
+            '<p style="color:#5f6577;font-size:15px;margin:0;">You don’t have permission to use the Warehouse Assistant. Please contact your administrator to be granted access.</p>' +
+            '</div></body></html>';
+    };
+
     const servePage = (context) => {
+        // Per-user permissions. No record — or a record with no permissions
+        // selected — means the user gets no access at all → full lockout.
+        const perms = getUserPermissionIds();
+        if (perms === null || perms.length === 0) {
+            context.response.write(buildAccessDeniedPage());
+            return;
+        }
+
         const suiteletUrl = url.resolveScript({
             scriptId: runtime.getCurrentScript().id,
             deploymentId: runtime.getCurrentScript().deploymentId,
@@ -11966,20 +12478,21 @@ setTimeout(doPrint, 2000);
             .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
             .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 
-        const html = buildHtml(suiteletUrl, userName);
+        const html = buildHtml(suiteletUrl, userName, JSON.stringify(perms));
         context.response.write(html);
     };
 
     // ═══════════════════════════════════════════════════════════
     //  BUILD THE FULL HTML PAGE
     // ═══════════════════════════════════════════════════════════
-    const buildHtml = (apiUrl, userName) => {
+    const buildHtml = (apiUrl, userName, permsJson) => {
         return `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Warehouse Assistant</title>
+<script>window.WH_PERMS = ${permsJson};<\/script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/html5-qrcode/2.3.8/html5-qrcode.min.js"><\/script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"><\/script>
 <style>
@@ -12209,6 +12722,10 @@ textarea { resize:vertical; min-height:80px; font-family:var(--mono); font-size:
 
 /* ─── TABLE ─── */
 .table-wrap { overflow-x:auto; border-radius:var(--radius); border:1px solid var(--border); }
+.scd-pagination { align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; margin-top:12px; font-size:12px; color:var(--text-muted); }
+.scd-pag-btns { display:inline-flex; align-items:center; gap:8px; }
+.scd-pag-page { font-weight:600; color:var(--text); }
+.scd-pagination .btn[disabled] { opacity:.45; cursor:default; pointer-events:none; }
 table { width:100%; border-collapse:collapse; font-size:13px; }
 th { background:var(--surface-active); padding:10px 14px; text-align:left; font-weight:600; font-size:11px; text-transform:uppercase; letter-spacing:.8px; color:var(--text-muted); white-space:nowrap; }
 td { padding:10px 14px; border-top:1px solid var(--border); white-space:nowrap; }
@@ -12350,6 +12867,18 @@ textarea.dupe-shake { animation:porcvShake .45s ease; }
 /* Bin Putaway scan box keeps the red border + ring but NO background fill, so the
    in-field highlight backdrop (bad serials painted red) shows through cleanly. */
 #bpaw-serials.sopick-has-error { border-color:#dc2626 !important; box-shadow:0 0 0 3px rgba(220,38,38,.25) !important; }
+/* Bin Transfer (single item) scan box mirrors Bin Putaway: red border + ring, no
+   background fill so the in-field red highlight backdrop shows through. */
+#bti-serials.sopick-has-error { border-color:#dc2626 !important; box-shadow:0 0 0 3px rgba(220,38,38,.25) !important; }
+/* Bin Transfer (single item) step indicator */
+.bti-steps { display:flex; align-items:center; gap:4px; margin-bottom:14px; overflow-x:auto; padding-bottom:2px; }
+.bti-step-chip { display:flex; align-items:center; gap:6px; flex-shrink:0; opacity:.45; }
+.bti-step-chip.active, .bti-step-chip.done { opacity:1; }
+.bti-step-num { width:24px; height:24px; border-radius:50%; background:var(--border); color:var(--text); display:flex; align-items:center; justify-content:center; font-size:12px; font-weight:700; flex-shrink:0; }
+.bti-step-chip.active .bti-step-num { background:var(--primary); color:#fff; }
+.bti-step-chip.done .bti-step-num { background:var(--success,#16a34a); color:#fff; }
+.bti-step-lbl { font-size:12px; font-weight:600; white-space:nowrap; }
+.bti-step-sep { flex:1; height:2px; background:var(--border); min-width:10px; }
 .bpaw-hl-wrap { position:relative; display:block; }
 .bpaw-hl-wrap > textarea { position:relative; z-index:2; background:transparent; }
 .bpaw-hl-wrap.has-bad > textarea, .bpaw-hl-wrap.has-bad > #bpaw-serials.sopick-has-error { background:transparent !important; }
@@ -12573,6 +13102,25 @@ button.stock-sheet-row-chosen, button.stock-sheet-row-chosen:hover { background:
     .sce-detail-card { padding:12px; }
     .sce-item-name { font-size:16px; }
     .sce-chip-list { max-height:38vh; }
+
+    /* The sticky action bar floated mid-list on mobile: .main (the scroll
+       container) carries a large padding-bottom to clear the fixed bottom nav,
+       and sticky bottom:0 anchors to that padded box instead of the viewport.
+       Pin it as a real edge-to-edge toolbar directly above the bottom nav. It
+       lives inside #view-sc-execute (display:none when inactive), so it only
+       renders on the count screen. */
+    .sce-action-bar {
+        position:fixed; left:0; right:0;
+        bottom:calc(56px + env(safe-area-inset-bottom, 0));
+        z-index:210; margin-top:0;
+        border:none; border-top:1px solid var(--border); border-radius:0;
+        box-shadow:0 -3px 12px rgba(0,0,0,.12);
+        padding:10px max(10px, env(safe-area-inset-left)) 10px max(10px, env(safe-area-inset-right));
+    }
+    /* Extra scroll room so the last item clears the fixed toolbar + bottom nav. */
+    .main:has(#view-sc-execute.active) {
+        padding-bottom:calc(56px + 78px + env(safe-area-inset-bottom, 0));
+    }
 }
 
 /* ─── TOAST NOTIFICATIONS ─── */
@@ -12994,6 +13542,10 @@ button.stock-sheet-row-chosen, button.stock-sheet-row-chosen:hover { background:
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/><rect x="9" y="9" width="6" height="6" rx="1"/></svg>
         Bin Transfer (All)
     </div>
+    <div class="mob-more-item" data-view="bintransferitem" onclick="mobNavTo('bintransferitem')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/><circle cx="12" cy="12" r="1.6"/></svg>
+        Bin Transfer
+    </div>
     <div class="mob-more-item" data-view="consolidate" onclick="mobNavTo('consolidate')">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 3h16l-6 8v7l-4 3v-10z"/></svg>
         Bin Consolidation
@@ -13101,6 +13653,10 @@ button.stock-sheet-row-chosen, button.stock-sheet-row-chosen:hover { background:
     <div class="nav-item" data-view="bintransferall">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/><rect x="9" y="9" width="6" height="6" rx="1"/></svg>
         Bin Transfer (All)
+    </div>
+    <div class="nav-item" data-view="bintransferitem">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/><circle cx="12" cy="12" r="1.6"/></svg>
+        Bin Transfer
     </div>
     <div class="nav-item" data-view="consolidate">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 3h16l-6 8v7l-4 3v-10z"/></svg>
@@ -13221,6 +13777,10 @@ button.stock-sheet-row-chosen, button.stock-sheet-row-chosen:hover { background:
             <button class="home-tile" onclick="navigateTo('bintransferall')">
                 <div class="home-tile-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/><rect x="9" y="9" width="6" height="6" rx="1"/></svg></div>
                 <div class="home-tile-title">Bin Transfer (All)</div>
+            </button>
+            <button class="home-tile" onclick="navigateTo('bintransferitem')">
+                <div class="home-tile-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/><circle cx="12" cy="12" r="1.6"/></svg></div>
+                <div class="home-tile-title">Bin Transfer</div>
             </button>
             <button class="home-tile" onclick="navigateTo('consolidate')">
                 <div class="home-tile-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 3h16l-6 8v7l-4 3v-10z"/></svg></div>
@@ -13840,6 +14400,111 @@ button.stock-sheet-row-chosen, button.stock-sheet-row-chosen:hover { background:
     </div>
 </div>
 
+<!-- ═══════ BIN TRANSFER (SINGLE ITEM) VIEW ═══════ -->
+<div class="view" id="view-bintransferitem">
+    <div class="page-header">
+        <div><div class="page-title">Bin Transfer</div><div class="page-subtitle">Move a chosen quantity of one item from one bin to another</div></div>
+    </div>
+
+    <!-- Step indicator -->
+    <div class="bti-steps" id="bti-steps">
+        <div class="bti-step-chip active" data-step="1"><span class="bti-step-num">1</span><span class="bti-step-lbl">Bin</span></div>
+        <div class="bti-step-sep"></div>
+        <div class="bti-step-chip" data-step="2"><span class="bti-step-num">2</span><span class="bti-step-lbl">Item</span></div>
+        <div class="bti-step-sep"></div>
+        <div class="bti-step-chip" data-step="3"><span class="bti-step-num">3</span><span class="bti-step-lbl">Quantity</span></div>
+        <div class="bti-step-sep"></div>
+        <div class="bti-step-chip" data-step="4"><span class="bti-step-num">4</span><span class="bti-step-lbl">Destination</span></div>
+    </div>
+
+    <!-- STEP 1: Source bin -->
+    <div class="card bti-step" id="bti-step-1">
+        <div class="card-title">Source Bin</div>
+        <div class="form-grid">
+            <div class="form-group">
+                <label class="form-label">Warehouse (Location)</label>
+                <select id="bti-location"></select>
+            </div>
+            <div class="form-group">
+                <label class="form-label">Source Bin *</label>
+                <input type="text" id="bti-source-bin" list="bti-source-bin-datalist" autocomplete="off" placeholder="Scan or type the source bin…">
+                <datalist id="bti-source-bin-datalist"></datalist>
+            </div>
+        </div>
+        <div style="margin-top:14px;display:flex;gap:8px;">
+            <button class="btn btn-primary" onclick="btiLoadContents()" id="bti-load-btn">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+                Load Bin Contents
+            </button>
+            <button class="btn" onclick="btiReset()">Reset</button>
+        </div>
+    </div>
+
+    <!-- STEP 2: Pick item -->
+    <div class="card bti-step" id="bti-step-2" style="display:none;">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-bottom:10px;">
+            <div class="card-title" style="margin:0;display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+                Items in <span id="bti-bin-name" style="font-weight:700;color:var(--primary);"></span>
+                <span id="bti-item-count" class="badge badge-info" style="font-size:11px;"></span>
+            </div>
+            <button class="btn btn-sm" onclick="btiGoStep(1)">← Change bin</button>
+        </div>
+        <input type="text" id="bti-item-filter" placeholder="Filter items…" oninput="btiRenderItems()" style="width:100%;margin-bottom:12px;">
+        <div id="bti-items-list"></div>
+    </div>
+
+    <!-- STEP 3: Quantity -->
+    <div class="card bti-step" id="bti-step-3" style="display:none;">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-bottom:8px;">
+            <div class="card-title" id="bti-detail-title" style="margin:0;flex:1;min-width:0;"></div>
+            <div style="display:flex;gap:6px;align-items:center;flex-shrink:0;">
+                <button type="button" class="stock-lookup-btn" onclick="btiShowStock()" title="Where is this item stocked?"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg></button>
+                <button class="btn btn-sm" onclick="btiGoStep(2)">← Items</button>
+            </div>
+        </div>
+        <div id="bti-detail-source" style="font-size:13px;margin-bottom:12px;"></div>
+        <div id="bti-qty-section"></div>
+        <div style="margin-top:16px;">
+            <button class="btn btn-primary" onclick="btiNextToDest()" id="bti-next-btn" style="width:100%;justify-content:center;padding:14px;">
+                Next: Destination
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg>
+            </button>
+        </div>
+    </div>
+
+    <!-- STEP 4: Destination -->
+    <div class="card bti-step" id="bti-step-4" style="display:none;">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-bottom:8px;">
+            <div class="card-title" style="margin:0;">Transfer To</div>
+            <button class="btn btn-sm" onclick="btiGoStep(3)">← Quantity</button>
+        </div>
+        <div id="bti-dest-summary" style="font-size:13px;margin-bottom:14px;padding:10px 12px;background:var(--bg-soft,#f5f7fa);border:1px solid var(--border);border-radius:8px;"></div>
+        <div class="form-grid">
+            <div class="form-group">
+                <label class="form-label">Destination Bin *</label>
+                <input type="text" id="bti-dest-bin" list="bti-dest-bin-datalist" autocomplete="off" placeholder="Scan or type the destination bin…">
+                <datalist id="bti-dest-bin-datalist"></datalist>
+            </div>
+            <div class="form-group">
+                <label class="form-label">Change Status (optional)</label>
+                <select id="bti-to-status">
+                    <option value="">— Keep current status —</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label class="form-label">Memo (optional)</label>
+                <input type="text" id="bti-memo" placeholder="Reason / note">
+            </div>
+        </div>
+        <div style="margin-top:16px;">
+            <button class="btn btn-success" onclick="btiSubmit()" id="bti-submit-btn" style="width:100%;justify-content:center;padding:14px;">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg>
+                Execute Bin Transfer
+            </button>
+        </div>
+    </div>
+</div>
+
 <!-- ═══════ BIN TRANSFER VIEW ═══════ -->
 <div class="view" id="view-transfer">
     <div class="page-header">
@@ -14212,7 +14877,7 @@ button.stock-sheet-row-chosen, button.stock-sheet-row-chosen:hover { background:
     <!-- STEP 1: scan SO numbers -->
     <div class="card" id="somulti-load-card" style="margin-top:8px;">
         <div class="card-title" style="font-size:18px;">1 &middot; Scan Sales Orders</div>
-        <div style="font-size:12px;color:var(--text-muted);margin-bottom:10px;">Scan one SO per line, then Load. Every order must be for the same serialized item.</div>
+        <div style="font-size:12px;color:var(--text-muted);margin-bottom:10px;">Scan one SO per line, then Load. Every order must be for the same item (serialized or not).</div>
         <div class="form-grid" style="grid-template-columns:1fr;gap:10px;">
             <div class="form-group" style="margin:0;max-width:240px;">
                 <label class="form-label">Warehouse</label>
@@ -14241,7 +14906,8 @@ button.stock-sheet-row-chosen, button.stock-sheet-row-chosen:hover { background:
             </div>
         </div>
 
-        <div class="card">
+        <!-- STEP 2A: serialized batch — scan every serial -->
+        <div class="card" id="somulti-serial-block">
             <div class="card-title" style="font-size:18px;">2 &middot; Scan Serial Numbers</div>
             <div style="font-size:12px;color:var(--text-muted);margin-bottom:10px;">Scan every serial for all orders. They're auto-assigned to orders in scan order.</div>
             <div class="form-group" style="margin:0;">
@@ -14256,6 +14922,24 @@ button.stock-sheet-row-chosen, button.stock-sheet-row-chosen:hover { background:
                 Fulfill All
             </button>
         </div>
+
+        <!-- STEP 2B: non-serialized batch — enter qty by bin, auto-allocated to orders -->
+        <div class="card" id="somulti-nonserial-block" style="display:none;">
+            <div class="card-title" style="font-size:18px;">2 &middot; Enter Quantities by Bin</div>
+            <div style="font-size:12px;color:var(--text-muted);margin-bottom:10px;">Add each bin you're picking from and how many units. The total must equal the units needed; they're allocated to orders in scan order.</div>
+            <div id="somulti-bin-rows"></div>
+            <button type="button" class="btn" onclick="somultiAddBinRow()" style="margin-top:4px;padding:6px 12px;font-size:13px;">+ Add bin</button>
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-top:12px;padding-top:10px;border-top:1px solid var(--border);font-weight:700;">
+                <span>Allocated</span>
+                <span><span id="somulti-ns-total">0</span> / <span id="somulti-ns-needed">0</span> units</span>
+            </div>
+            <div id="somulti-ns-preview" style="margin-top:8px;"></div>
+            <button class="btn btn-success" onclick="somultiFulfillAllNonSerial()" id="somulti-ns-fulfill-btn" disabled style="width:100%;justify-content:center;padding:14px;margin-top:12px;opacity:.55;">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+                Fulfill All
+            </button>
+        </div>
+        <datalist id="somulti-bin-datalist"></datalist>
     </div>
 
     <!-- STEP 3: results -->
@@ -14378,11 +15062,11 @@ button.stock-sheet-row-chosen, button.stock-sheet-row-chosen:hover { background:
                 <thead>
                     <tr>
                         <th style="width:70px;">ID</th>
-                        <th>Location</th>
                         <th>Bin</th>
                         <th>Assigned To</th>
                         <th style="width:80px;">Items</th>
                         <th style="width:120px;">Status</th>
+                        <th style="width:110px;" title="Time from Start Count to submitted for approval">Duration</th>
                         <th style="width:140px;">Created</th>
                         <th style="width:140px;">Actions</th>
                     </tr>
@@ -14392,6 +15076,7 @@ button.stock-sheet-row-chosen, button.stock-sheet-row-chosen:hover { background:
                 </tbody>
             </table>
         </div>
+        <div id="scd-pagination" class="scd-pagination" style="display:none;"></div>
     </div>
 </div>
 
@@ -14413,12 +15098,13 @@ button.stock-sheet-row-chosen, button.stock-sheet-row-chosen:hover { background:
                         <th>Bin</th>
                         <th>Assigned To</th>
                         <th style="width:80px;">Items</th>
+                        <th style="width:110px;" title="Time from Start Count to submitted for approval">Duration</th>
                         <th style="width:140px;">Created</th>
                         <th style="width:140px;">Actions</th>
                     </tr>
                 </thead>
                 <tbody id="scpr-table-body">
-                    <tr><td colspan="7" style="text-align:center;color:var(--text-dim)">Loading...</td></tr>
+                    <tr><td colspan="8" style="text-align:center;color:var(--text-dim)">Loading...</td></tr>
                 </tbody>
             </table>
         </div>
@@ -14463,6 +15149,7 @@ button.stock-sheet-row-chosen, button.stock-sheet-row-chosen:hover { background:
         <!-- Sticky action bar -->
         <div class="sce-action-bar">
             <button class="btn" id="sce-save-btn" onclick="sceSaveProgress()" style="flex:1;">Save progress</button>
+            <button class="btn" id="sce-pause-btn" onclick="scePauseCount()" style="flex:1;">Pause</button>
             <button class="btn" id="sce-complete-btn" onclick="sceCompleteCount()" style="background:var(--success);color:white;flex:1.2;">Complete count</button>
         </div>
     </div>
@@ -14744,6 +15431,48 @@ ${getAutocompleteJs()}
 //  APP STATE & CONFIG
 // ═══════════════════════════════════════════════════════════
 const API = '${apiUrl}';
+
+// ── Per-user permissions (injected as window.WH_PERMS by the server) ──
+// IDs: 1 Warehouse Assistant, 2 Print Label, 3 PO Receiving, 4 SO Picking,
+// 5 Bin Putaway, 6 Pick Amazon, 7 Inventory Status Change, 8 Bin Consolidation,
+// 9 Item Lookup, 10 TQ License Plates, 11 Stock Counts, 12 Stock Count Approval.
+const WH_PERMS = Array.isArray(window.WH_PERMS) ? window.WH_PERMS : [];
+function hasPerm(id) { return WH_PERMS.indexOf(id) !== -1; }
+// view id → required permission id. Views not listed (home, etc.) are always allowed.
+const VIEW_PERM = {
+    warehouse: 1, printlabel: 2, poreceive: 3, sopick: 4, sopickmulti: 4,
+    binputaway: 5, bintransferall: 5, bintransferitem: 5, pickamazon: 6, inventorystatuschange: 7,
+    consolidate: 8, itemlookup: 9,
+    dashboard: 10, scan: 10, create: 10, search: 10, transfer: 10, fulfill: 10, poimport: 10, irimport: 10,
+    'sc-dashboard': 11, 'sc-create': 11, 'sc-execute': 11,
+    'sc-pending-review': 12, 'sc-review': 12
+};
+function viewAllowed(view) { const p = VIEW_PERM[view]; return p === undefined ? true : hasPerm(p); }
+// Hide every entry point (sidebar, mobile nav, "More" menu, home tiles) the
+// user lacks permission for, then collapse now-empty nav groups.
+function applyPermissions() {
+    document.querySelectorAll('.nav-item[data-view]').forEach(function (el) {
+        if (!viewAllowed(el.dataset.view)) el.style.display = 'none';
+    });
+    document.querySelectorAll('.mob-nav-btn[data-view], .mob-more-item[data-view]').forEach(function (el) {
+        if (!viewAllowed(el.dataset.view)) el.style.display = 'none';
+    });
+    document.querySelectorAll('.home-tile').forEach(function (btn) {
+        const m = (btn.getAttribute('onclick') || '').match(/navigateTo\\('([^']+)'\\)/);
+        if (m && !viewAllowed(m[1])) btn.style.display = 'none';
+    });
+    document.querySelectorAll('.nav-group').forEach(function (g) {
+        const subs = g.querySelectorAll('.nav-item.nav-sub');
+        const anyVisible = Array.prototype.some.call(subs, function (s) { return s.style.display !== 'none'; });
+        if (subs.length && !anyVisible) g.style.display = 'none';
+    });
+    // Collapse home-screen sections whose tiles are now all hidden.
+    document.querySelectorAll('.home-section').forEach(function (sec) {
+        const tiles = sec.querySelectorAll('.home-tile');
+        const anyVisible = Array.prototype.some.call(tiles, function (t) { return t.style.display !== 'none'; });
+        if (tiles.length && !anyVisible) sec.style.display = 'none';
+    });
+}
 let cameraScanner = null;
 let cameraActive = false;
 let currentTransferPlate = null;
@@ -15232,6 +15961,7 @@ let _scdLoaded = false;
 let _scprLoaded = false;
 
 function navigateTo(view) {
+    if (!viewAllowed(view)) { toast('You do not have permission to access this feature.', 'error'); return; }
     const navItem = document.querySelector('.nav-item[data-view="' + view + '"]');
     if (navItem) {
         navItem.click();
@@ -15247,6 +15977,7 @@ function navigateTo(view) {
 }
 document.querySelectorAll('.nav-item[data-view]').forEach(el => {
     el.addEventListener('click', () => {
+        if (!viewAllowed(el.dataset.view)) { toast('You do not have permission to access this feature.', 'error'); return; }
         document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
         document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
         el.classList.add('active');
@@ -15295,6 +16026,7 @@ document.querySelectorAll('.nav-item[data-view]').forEach(el => {
         if (el.dataset.view === 'inventorystatuschange') { iscInit(); }
         if (el.dataset.view === 'irimport') document.getElementById('ir-number-input').focus();
         if (el.dataset.view === 'consolidate') consInit();
+        if (el.dataset.view === 'bintransferitem') { btiInit(); document.getElementById('bti-source-bin').focus(); }
     });
 });
 
@@ -16057,6 +16789,487 @@ async function initBinTransferAllForm() {
     document.getElementById('bta-source-bin').addEventListener('keydown', e => {
         if (e.key === 'Enter') { e.preventDefault(); btaLoadContents(); }
     });
+}
+
+// ═══════════════════════════════════════════════════════════
+//  BIN TRANSFER (SINGLE ITEM) — 4-step wizard
+//  1 Bin  ->  2 Item  ->  3 Quantity  ->  4 Destination
+//  Reuses the executeBulkBinTransfer endpoint with a single-item
+//  payload. The item's other bins are shown via the shared stock
+//  lookup sheet (same as SO Picking). After a successful move it
+//  reloads the same bin and re-opens the same item so the operator
+//  can keep working without starting over.
+// ═══════════════════════════════════════════════════════════
+let _bti = null;          // { locationId, binId, binName, items: [] }
+let _btiOpenIdx = -1;     // index of the open item in _bti.items
+let _btiStep = 1;         // current wizard step (1..4)
+let _btiPlan = null;      // { item, count } captured going into step 4
+let _btiInitDone = false;
+
+// Show one wizard step; update the step indicator (done / active).
+function btiGoStep(n) {
+    _btiStep = n;
+    [1, 2, 3, 4].forEach(i => { const el = document.getElementById('bti-step-' + i); if (el) el.style.display = (i === n) ? 'block' : 'none'; });
+    document.querySelectorAll('#bti-steps .bti-step-chip').forEach(chip => {
+        const s = parseInt(chip.getAttribute('data-step'), 10);
+        chip.classList.toggle('active', s === n);
+        chip.classList.toggle('done', s < n);
+    });
+    const view = document.getElementById('view-bintransferitem');
+    if (view && view.scrollIntoView) view.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+// "Where is this item stocked?" — reuse the shared stock lookup sheet
+// (same bottom sheet SO Picking uses; shows on-hand/available per bin).
+function btiShowStock() {
+    if (!_bti || _btiOpenIdx < 0 || !_bti.items[_btiOpenIdx]) return;
+    const it = _bti.items[_btiOpenIdx];
+    openStockLookup(it.itemId, it.itemName, _bti.locationId, {});
+}
+
+async function btiInit() {
+    if (_btiInitDone) return;
+    _btiInitDone = true;
+    const locs = await loadLocations();
+    populateSelect(document.getElementById('bti-location'), locs);
+    document.getElementById('bti-location').value = '1';
+    // Optional "change status" dropdown (blank = keep current status).
+    try {
+        const statuses = await loadStatusCodes();
+        const sel = document.getElementById('bti-to-status');
+        if (sel) statuses.forEach(s => { const o = document.createElement('option'); o.value = s.id; o.textContent = s.name; sel.appendChild(o); });
+    } catch (e) { /* non-fatal */ }
+    await btiRefreshBins('1');
+    document.getElementById('bti-location').addEventListener('change', async function() { await btiRefreshBins(this.value); });
+    document.getElementById('bti-source-bin').addEventListener('keydown', e => {
+        if (e.key === 'Enter') { e.preventDefault(); btiLoadContents(); }
+    });
+}
+
+async function btiRefreshBins(locationId) {
+    if (!locationId) return;
+    const bins = await loadBins(locationId);
+    ['bti-source-bin-datalist', 'bti-dest-bin-datalist'].forEach(dlId => {
+        const dl = document.getElementById(dlId);
+        if (!dl) return;
+        dl.innerHTML = '';
+        bins.forEach(b => { const opt = document.createElement('option'); opt.value = b.name; dl.appendChild(opt); });
+    });
+}
+
+function btiReset() {
+    _bti = null; _btiOpenIdx = -1;
+    _btiErrorSerials = new Set();
+    _btiValIssues = [];
+    const submitBtn = document.getElementById('bti-submit-btn');
+    if (submitBtn) submitBtn.disabled = false;
+    document.getElementById('bti-source-bin').value = '';
+    document.getElementById('bti-item-filter').value = '';
+    document.getElementById('bti-items-list').innerHTML = '';
+    btiGoStep(1);
+    document.getElementById('bti-source-bin').focus();
+}
+
+async function btiLoadContents(keepOpenItemId) {
+    const loadBtn = document.getElementById('bti-load-btn');
+    const locationId = document.getElementById('bti-location').value;
+    const binNumber  = document.getElementById('bti-source-bin').value.trim();
+    if (!locationId) { toast('Select a warehouse.', 'error'); return; }
+    if (!binNumber)  { toast('Enter or scan a source bin.', 'error'); return; }
+
+    _btnWait(loadBtn);
+    showProcessing('Loading Bin…', 'Reading on-hand inventory');
+    try {
+        const data = await apiGet('getBinContents', { locationId, binNumber });
+        if (!data.success) { toast(data.message || 'Could not load bin.', 'error'); return; }
+        _bti = { locationId, binId: data.binId, binName: data.binName, items: data.items || [] };
+
+        document.getElementById('bti-bin-name').textContent = data.binName || binNumber;
+        document.getElementById('bti-item-count').textContent = (data.items || []).length + ' item(s)';
+        document.getElementById('bti-item-filter').value = '';
+        _btiOpenIdx = -1;
+        btiRenderItems();
+
+        // After a completed transfer, re-open the same item (step 3) if it still
+        // has stock; otherwise land on the item list (step 2) to pick the next one.
+        if (keepOpenItemId) {
+            const idx = _bti.items.findIndex(it => String(it.itemId) === String(keepOpenItemId));
+            if (idx >= 0) { btiOpenItem(idx); return; }
+        }
+        btiGoStep(2);
+    } catch (err) { toast('Error: ' + err.message, 'error'); }
+    finally { hideProcessing(); _btnReset(loadBtn); }
+}
+
+function btiRenderItems() {
+    const list = document.getElementById('bti-items-list');
+    if (!_bti || !_bti.items.length) {
+        list.innerHTML = '<div style="text-align:center;padding:24px;color:var(--text-muted);">This bin has no on-hand inventory.</div>';
+        return;
+    }
+    const filter = (document.getElementById('bti-item-filter').value || '').trim().toLowerCase();
+    const rows = _bti.items.map((it, idx) => ({ it, idx }))
+        .filter(o => !filter || (o.it.itemName || '').toLowerCase().indexOf(filter) !== -1);
+    if (!rows.length) {
+        list.innerHTML = '<div style="text-align:center;padding:16px;color:var(--text-muted);">No items match “' + escHtml(filter) + '”.</div>';
+        return;
+    }
+    list.innerHTML = rows.map(({ it, idx }) => {
+        const subtitle = it.isSerialized
+            ? (it.serials.length + ' serial(s)')
+            : (it.totalQty + ' unit(s)' + (it.statusBuckets && it.statusBuckets.length > 1 ? ' across ' + it.statusBuckets.length + ' statuses' : ''));
+        const active = (idx === _btiOpenIdx);
+        return '<div onclick="btiOpenItem(' + idx + ')" style="display:flex;align-items:center;gap:10px;padding:10px 12px;border:1px solid ' + (active ? 'var(--primary)' : 'var(--border)') + ';border-radius:6px;margin-bottom:8px;cursor:pointer;background:var(--surface);">' +
+            '<div style="flex:1;min-width:0;">' +
+                '<div style="font-weight:600;font-size:13px;color:var(--text);">' + escHtml(it.itemName) + (it.isSerialized ? ' <span class="badge badge-info" style="font-size:10px;">SERIAL</span>' : '') + '</div>' +
+                '<div style="font-size:12px;color:var(--text-muted);margin-top:2px;">' + escHtml(subtitle) + '</div>' +
+            '</div>' +
+            '<div style="font-weight:700;font-size:14px;color:var(--primary);flex-shrink:0;">' + it.totalQty + '</div>' +
+            '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="color:var(--text-dim);flex-shrink:0;"><polyline points="9 18 15 12 9 6"/></svg>' +
+        '</div>';
+    }).join('');
+}
+
+function btiOpenItem(idx) {
+    if (!_bti || !_bti.items[idx]) return;
+    _btiOpenIdx = idx;
+    btiRenderItems(); // refresh the active-row highlight
+    const it = _bti.items[idx];
+
+    document.getElementById('bti-detail-title').textContent = it.itemName;
+    document.getElementById('bti-detail-source').innerHTML =
+        '<span style="color:var(--text-muted);">In</span> <strong style="color:var(--primary);">' + escHtml(_bti.binName) + '</strong> — ' +
+        '<strong>' + it.totalQty + '</strong> ' + (it.isSerialized ? 'serial(s) on hand' : 'unit(s) on hand') +
+        ' <span style="color:var(--text-dim);">· tap the chart icon to see its other bins</span>';
+
+    document.getElementById('bti-qty-section').innerHTML = btiBuildQtyHtml(it);
+
+    // Reset the transfer inputs for the newly opened item.
+    document.getElementById('bti-dest-bin').value = '';
+    document.getElementById('bti-to-status').value = '';
+    document.getElementById('bti-memo').value = '';
+    const submitBtn0 = document.getElementById('bti-submit-btn');
+    if (submitBtn0) submitBtn0.disabled = false;
+
+    // Serialized items: arm the scan box (valid set = this bin's on-hand serials).
+    if (it.isSerialized) {
+        btiSetupSerials(it);
+        btiRecount();
+        btiUpdateMoving();
+        btiRenderIssuesPanel();
+        btiRefreshHighlight();
+    }
+
+    btiGoStep(3);
+    if (it.isSerialized) { const ser = document.getElementById('bti-serials'); if (ser) ser.focus(); }
+}
+
+// Read the chosen quantity off step 3 into an executeBulkBinTransfer item
+// payload. Returns { item, count } or null (after toasting) if invalid.
+function btiCollectQty() {
+    if (!_bti || _btiOpenIdx < 0 || !_bti.items[_btiOpenIdx]) return null;
+    const it = _bti.items[_btiOpenIdx];
+    const item = { itemId: it.itemId, itemName: it.itemName, isSerialized: it.isSerialized };
+    let count = 0;
+    if (it.isSerialized) {
+        btiValidateSerials(true);
+        if (_btiErrorSerials.size > 0) { toast('Fix invalid serial(s) before continuing.', 'error'); return null; }
+        const ta = document.getElementById('bti-serials');
+        const lines = (ta ? ta.value : '').split(/\\r?\\n/).map(s => s.trim()).filter(Boolean);
+        const serials = [];
+        lines.forEach(s => { const u = s.toUpperCase(); if (_btiValidSerials.has(u)) serials.push(_btiSerialOrig[u] || s); });
+        if (!serials.length) { toast('Scan at least one serial to move.', 'error'); return null; }
+        item.serials = serials; count = serials.length;
+    } else {
+        const inp = document.querySelector('#bti-qty-section input.bti-qty-input');
+        const max = inp ? (parseFloat(inp.getAttribute('data-bti-max')) || 0) : 0;
+        const want = inp ? (parseFloat(inp.value) || 0) : 0;
+        if (want > max) { toast('Quantity cannot exceed what is on hand.', 'error'); return null; }
+        if (want <= 0) { toast('Enter a quantity greater than 0.', 'error'); return null; }
+        // Seamlessly allocate the requested quantity across the bin's status
+        // buckets so NetSuite can source it (Good + non-Good) without the
+        // operator picking statuses. Each unit keeps its own status on the move.
+        const srcBuckets = (it.statusBuckets && it.statusBuckets.length)
+            ? it.statusBuckets
+            : [{ statusId: '', qty: it.totalQty }];
+        const buckets = [];
+        let remaining = want;
+        for (let i = 0; i < srcBuckets.length && remaining > 0; i++) {
+            const avail = parseFloat(srcBuckets[i].qty) || 0;
+            const take = Math.min(remaining, avail);
+            if (take > 0) { buckets.push({ statusId: srcBuckets[i].statusId || '', qty: take }); remaining -= take; }
+        }
+        count = want - remaining;
+        item.statusBuckets = buckets;
+    }
+    return { item: item, count: count };
+}
+
+// Step 3 -> Step 4: lock in the quantity and show the destination step.
+function btiNextToDest() {
+    const plan = btiCollectQty();
+    if (!plan) return;
+    _btiPlan = plan;
+    const it = _bti.items[_btiOpenIdx];
+    document.getElementById('bti-dest-summary').innerHTML =
+        'Moving <strong>' + plan.count + '</strong> ' + (it.isSerialized ? 'serial(s)' : 'unit(s)') +
+        ' of <strong>' + escHtml(it.itemName) + '</strong> out of <strong style="color:var(--primary);">' + escHtml(_bti.binName) + '</strong>';
+    btiGoStep(4);
+    const dest = document.getElementById('bti-dest-bin');
+    if (dest) dest.focus();
+}
+
+// Build the quantity picker for the open item: a serial checklist for
+// serialized items, or a per-status count for non-serialized ones.
+function btiBuildQtyHtml(it) {
+    if (it.isSerialized) {
+        const total = (it.serials || []).length;
+        return '<div style="font-weight:600;font-size:12px;color:var(--text-muted);margin-bottom:6px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px;">' +
+                '<span>Scan serials to move</span>' +
+                '<span class="porcv-serial-count" id="bti-serial-count" style="font-weight:600;">0 scanned</span>' +
+            '</div>' +
+            '<textarea id="bti-serials" rows="6" placeholder="Scan serial numbers, one per line…" oninput="btiSerialInput()" onblur="btiSerialBlur()" style="font-family:var(--mono);font-size:13px;width:100%;"></textarea>' +
+            '<div class="porcv-serial-count" id="bti-serial-dupe" style="display:none;color:#dc2626;margin-top:4px;"></div>' +
+            '<div class="sopick-serial-issues" id="bti-serial-issues" style="display:none;"></div>' +
+            '<div style="margin-top:8px;font-size:13px;color:var(--text-muted);">Moving: <strong id="bti-serial-moving">0</strong> of ' + total + ' serial(s) on hand</div>';
+    }
+    // Non-serialized: a single total quantity. The operator never deals with
+    // statuses — the move draws the requested amount from whatever statuses the
+    // bin holds automatically (allocated in btiCollectQty).
+    const total = it.totalQty;
+    return '<label class="form-label">Quantity to move <span style="color:var(--text-dim);">(max ' + total + ')</span></label>' +
+        '<input type="number" class="bti-qty-input" data-bti-max="' + total + '" min="0" max="' + total + '" value="' + total + '" style="width:160px;">';
+}
+
+// ── Serialized scanning (mirrors Bin Putaway's scan box + restrictions) ──
+// A serial is "valid" only if it is actually on hand for THIS item in THIS
+// source bin (the set comes from getBinContents). Anything else is rejected
+// exactly like a "not in stock" scan in Bin Putaway: red-flagged in the box,
+// listed in the issues panel, and the submit button is blocked until removed.
+let _btiValidSerials = new Set(); // UPPERCASE serials on hand in the source bin
+let _btiSerialOrig   = {};        // UPPERCASE -> exact serial text (for the payload)
+let _btiErrorSerials = new Set(); // serials currently flagged invalid (as typed)
+let _btiValIssues    = [];        // [{ serial, label, detail }]
+let _btiIssuesTimer  = null;
+
+function btiSetupSerials(it) {
+    _btiValidSerials = new Set();
+    _btiSerialOrig = {};
+    (it.serials || []).forEach(s => {
+        const t = String(s).trim(); if (!t) return;
+        const u = t.toUpperCase();
+        _btiValidSerials.add(u);
+        _btiSerialOrig[u] = t;
+    });
+    _btiErrorSerials = new Set();
+    _btiValIssues = [];
+    if (_btiIssuesTimer) { clearTimeout(_btiIssuesTimer); _btiIssuesTimer = null; }
+}
+
+function btiSerialInput() {
+    const ta = document.getElementById('bti-serials');
+    const dupeEl = document.getElementById('bti-serial-dupe');
+    if (!ta) return;
+    // Reject duplicate scans (case-insensitive), keeping first occurrence.
+    const raw = ta.value.split(/\\r?\\n/);
+    const seen = new Set(); const dupes = []; const kept = [];
+    raw.forEach(s => { const t = s.trim(); if (!t) return; const u = t.toUpperCase(); if (seen.has(u)) { dupes.push(t); return; } seen.add(u); kept.push(t); });
+    if (dupes.length) {
+        const hadTrailing = ta.value.endsWith('\\n');
+        ta.value = kept.join('\\n') + (hadTrailing && kept.length ? '\\n' : '');
+        if (dupeEl) { dupeEl.textContent = '⚠ Duplicate rejected: ' + [...new Set(dupes)].join(', '); dupeEl.style.display = 'block'; }
+        ta.classList.add('has-dupe');
+        if (typeof porcvDing === 'function') porcvDing();
+        setTimeout(() => ta.classList.remove('has-dupe'), 600);
+    } else if (dupeEl) { dupeEl.style.display = 'none'; }
+    btiValidateSerials(false);
+    btiRecount();
+    btiRefreshHighlight();
+}
+
+function btiSerialBlur() {
+    btiValidateSerials(true);
+    btiRecount();
+    btiRefreshHighlight();
+}
+
+function btiValidateSerials(includeTrailing) {
+    const ta = document.getElementById('bti-serials');
+    if (!ta) return;
+    const text = ta.value;
+    const rawLines = text.split('\\n').map(s => s.trim());
+    // The last line (no trailing newline) is treated as still being typed unless
+    // includeTrailing is set (blur), so mid-scan characters don't false-flag.
+    const completeLines = (includeTrailing || text.endsWith('\\n'))
+        ? rawLines.filter(Boolean)
+        : rawLines.slice(0, -1).filter(Boolean);
+
+    // Drop errors / issues no longer present in the box.
+    for (const s of [..._btiErrorSerials]) { if (!completeLines.includes(s)) _btiErrorSerials.delete(s); }
+    _btiValIssues = _btiValIssues.filter(iss => completeLines.includes(iss.serial));
+
+    // Flag every completed line that isn't on hand for this item in this bin.
+    completeLines.forEach(s => {
+        if (!_btiValidSerials.has(s.toUpperCase()) && !_btiErrorSerials.has(s)) {
+            btiRejectBadSerial(s);
+        }
+    });
+
+    if (_btiErrorSerials.size > 0) ta.classList.add('sopick-has-error');
+    else ta.classList.remove('sopick-has-error');
+
+    btiRenderIssuesPanel();
+    btiRefreshHighlight();
+    btiUpdateMoving();
+    btiSyncSerialSubmit();
+}
+
+function btiRejectBadSerial(serial) {
+    const t = (serial || '').trim();
+    if (!t) return;
+    _btiErrorSerials.add(t);
+    const ta = document.getElementById('bti-serials');
+    if (ta) { ta.classList.add('sopick-has-error'); ta.classList.remove('dupe-shake'); void ta.offsetWidth; ta.classList.add('dupe-shake'); }
+    if (typeof porcvDing === 'function') porcvDing();
+    toast('⚠ <strong>NOT IN THIS BIN</strong>: <code>' + escHtml(t) + '</code> — not on hand for this item here', 'error');
+    _btiValIssues = _btiValIssues.filter(iss => iss.serial !== t);
+    _btiValIssues.push({ serial: t, label: 'NOT IN THIS BIN', detail: 'not on hand for this item in this bin' });
+}
+
+function btiRenderIssuesPanel() {
+    const panel = document.getElementById('bti-serial-issues');
+    if (!panel) return;
+    const issues = _btiValIssues || [];
+    if (!issues.length) { panel.style.display = 'none'; panel.innerHTML = ''; return; }
+    const byLabel = {};
+    issues.forEach(function (iss) { byLabel[iss.label] = (byLabel[iss.label] || 0) + 1; });
+    const parts = Object.keys(byLabel).map(function (lbl) { return '<strong>' + byLabel[lbl] + ' ' + escHtml(lbl) + '</strong>'; });
+    panel.innerHTML =
+        '<div class="sopick-serial-issues-head">' +
+            '<span>⚠ ' + parts.join(' · ') + '</span>' +
+            '<button type="button" class="sopick-serial-issues-clear" onclick="btiClearIssues()">clear</button>' +
+        '</div>' +
+        '<div class="sopick-serial-issue">Highlighted in red below — remove or rescan to continue.</div>';
+    panel.style.display = 'block';
+    if (_btiIssuesTimer) clearTimeout(_btiIssuesTimer);
+    _btiIssuesTimer = setTimeout(btiClearIssues, 8000);
+}
+
+function btiClearIssues() {
+    _btiValIssues = [];
+    if (_btiIssuesTimer) { clearTimeout(_btiIssuesTimer); _btiIssuesTimer = null; }
+    btiRenderIssuesPanel();
+}
+
+// In-field highlight: a transparent-text backdrop mirrors the textarea and paints
+// any flagged serial red. The textarea sits on top with a transparent background.
+function btiEnsureHighlightLayer() {
+    const ta = document.getElementById('bti-serials');
+    if (!ta) return null;
+    let backdrop = document.getElementById('bti-hl-backdrop');
+    if (backdrop) return backdrop;
+    const wrap = document.createElement('div');
+    wrap.className = 'bpaw-hl-wrap';
+    ta.parentNode.insertBefore(wrap, ta);
+    backdrop = document.createElement('div');
+    backdrop.id = 'bti-hl-backdrop';
+    backdrop.className = 'bpaw-hl-backdrop';
+    backdrop.setAttribute('aria-hidden', 'true');
+    wrap.appendChild(backdrop);
+    wrap.appendChild(ta);
+    ta.addEventListener('scroll', function () { backdrop.scrollTop = ta.scrollTop; backdrop.scrollLeft = ta.scrollLeft; });
+    return backdrop;
+}
+
+function btiRefreshHighlight() {
+    const ta = document.getElementById('bti-serials');
+    if (!ta) return;
+    const backdrop = btiEnsureHighlightLayer();
+    if (!backdrop) return;
+    const cs = window.getComputedStyle(ta);
+    ['fontFamily', 'fontSize', 'fontWeight', 'fontStyle', 'letterSpacing', 'lineHeight',
+     'textTransform', 'wordSpacing', 'textIndent', 'tabSize', 'boxSizing', 'borderRadius',
+     'paddingTop', 'paddingRight', 'paddingBottom', 'paddingLeft',
+     'borderTopWidth', 'borderRightWidth', 'borderBottomWidth', 'borderLeftWidth'
+    ].forEach(function (p) { backdrop.style[p] = cs[p]; });
+    backdrop.style.borderStyle = 'solid';
+    backdrop.style.borderColor = 'transparent';
+
+    const bad = _btiErrorSerials || new Set();
+    const lines = (ta.value || '').split('\\n');
+    backdrop.innerHTML = lines.map(function (line) {
+        const safe = escHtml(line);
+        const key = line.trim();
+        if (key && bad.has(key)) return '<mark class="bpaw-hl-bad">' + (safe || ' ') + '</mark>';
+        return safe;
+    }).join('\\n');
+
+    const wrap = ta.parentNode;
+    if (wrap && wrap.classList) wrap.classList.toggle('has-bad', bad.size > 0);
+    backdrop.scrollTop = ta.scrollTop;
+    backdrop.scrollLeft = ta.scrollLeft;
+}
+
+function btiRecount() {
+    const ta = document.getElementById('bti-serials');
+    const c = document.getElementById('bti-serial-count');
+    if (ta && c) c.textContent = ta.value.split(/\\r?\\n/).map(s => s.trim()).filter(Boolean).length + ' scanned';
+}
+
+function btiUpdateMoving() {
+    const ta = document.getElementById('bti-serials');
+    const el = document.getElementById('bti-serial-moving');
+    if (!ta || !el) return;
+    let n = 0;
+    ta.value.split(/\\r?\\n/).map(s => s.trim()).filter(Boolean).forEach(s => { if (_btiValidSerials.has(s.toUpperCase())) n++; });
+    el.textContent = n;
+}
+
+// Block submit while any invalid serial is still sitting in the scan box.
+function btiSyncSerialSubmit() {
+    const btn = document.getElementById('bti-submit-btn');
+    if (btn) btn.disabled = _btiErrorSerials.size > 0;
+}
+
+async function btiSubmit() {
+    if (!_bti || _btiOpenIdx < 0 || !_bti.items[_btiOpenIdx]) { toast('Open an item first.', 'error'); return; }
+    const it = _bti.items[_btiOpenIdx];
+
+    // Re-read the quantity (source of truth = step 3 inputs); bounce back if bad.
+    const plan = btiCollectQty();
+    if (!plan) { btiGoStep(3); return; }
+    const item = plan.item;
+
+    const destBinName = document.getElementById('bti-dest-bin').value.trim();
+    if (!destBinName) { toast('Enter a destination bin.', 'error'); return; }
+    const bins = _bins[_bti.locationId] || [];
+    const match = bins.find(b => b.name === destBinName);
+    if (!match) { toast('Destination bin not found. Pick one from the list.', 'error'); return; }
+    const destBinId = match.id;
+    if (String(destBinId) === String(_bti.binId)) { toast('Source and destination bin are the same.', 'error'); return; }
+
+    const submitBtn = document.getElementById('bti-submit-btn');
+    submitBtn.disabled = true;
+    showProcessing('Creating Bin Transfer…', 'Moving ' + it.itemName);
+    try {
+        const statusSel = document.getElementById('bti-to-status');
+        const result = await apiPost('executeBulkBinTransfer', {
+            locationId: _bti.locationId,
+            fromBinId:  _bti.binId,
+            toBinId:    destBinId,
+            items:      [item],
+            memo:       document.getElementById('bti-memo').value.trim(),
+            toStatusId: statusSel ? (statusSel.value || '') : ''
+        });
+        if (result.success) {
+            toast('Bin transfer ' + (result.tranId || '') + ' created.', 'success');
+            // Return to the same bin/item screen with refreshed quantities.
+            await btiLoadContents(it.itemId);
+        } else {
+            toast(result.message || 'Transfer failed.', 'error');
+        }
+    } catch (err) { toast('Error: ' + err.message, 'error'); }
+    finally { hideProcessing(); submitBtn.disabled = false; }
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -17374,7 +18587,7 @@ async function porcvDoneItem() {
 
         if (stockRes && stockRes.success) {
             const hard = stockRes.blocked || [];
-            const soft = stockRes.warned  || [];
+            const soft = stockRes.blockedOther || stockRes.warned  || [];
             // Hard (already in stock for this item): auto-clear and stop — never stage.
             if (hard.length) {
                 const removed = porcvStripSerials(hard.map(b => b.serial));
@@ -17388,9 +18601,19 @@ async function porcvDoneItem() {
                 toast(removed.length + ' serial' + (removed.length === 1 ? '' : 's') + ' already in stock \u2014 removed. Review and tap Done again.', 'error');
                 return;
             }
-            // Soft (other item): overridable confirmation.
+            // Cross-item duplicate (same serial number under a DIFFERENT part
+            // number): not allowed in any condition. Hard block, no override —
+            // strip the offenders and stop so they can never be received.
             if (soft.length) {
-                porcvShowInStockSheet([], soft, line.itemText, proceedAfterStock);
+                const removedDup = porcvStripSerials(soft.map(b => b.serial));
+                porcvDing();
+                const warnEl = document.getElementById('porcv-item-stock-warn');
+                if (warnEl) {
+                    warnEl.textContent = 'Duplicate serial(s) already in stock under a different part number - removed: ' + soft.map(b => b.serial + ' (' + (b.belongsToItemName || b.belongsToItemId || 'other item') + ')').join(', ');
+                    warnEl.style.color = 'var(--danger)';
+                    warnEl.style.display = 'block';
+                }
+                toast(removedDup.length + ' duplicate serial' + (removedDup.length === 1 ? '' : 's') + ' already in stock under a different part number - not allowed. Removed; review and tap Done again.', 'error');
                 return;
             }
         }
@@ -19450,6 +20673,9 @@ function _sopickRejectBadSerial(textareaId, info, expectedItemName) {
     } else if (info.reason === 'not_found') {
         reasonLabel  = 'NOT FOUND';
         reasonDetail = 'this serial does not exist in NetSuite inventory';
+    } else if (info.reason === 'unavailable_status') {
+        reasonLabel  = 'UNAVAILABLE STATUS';
+        reasonDetail = 'serial is in a non-available status' + (info.statusText ? ' (<strong>' + escHtml(info.statusText) + '</strong>)' : '') + ' and cannot be picked';
     } else {
         reasonLabel  = 'INVALID';
         reasonDetail = 'serial is not available for picking';
@@ -19797,14 +21023,14 @@ async function somultiLoadSOs() {
     // Loading a full SO record is heavy, so the server processes the list in
     // chunks and hands back a nextIndex; we loop here until the whole list is
     // loaded, carrying the reference item across chunks.
-    let orders = [], problems = [], itemId = null, itemText = null;
+    let orders = [], problems = [], itemId = null, itemText = null, isSerialized = null;
     let startIndex = 0, guard = 0;
     const total = soNumbers.length;
     try {
         while (startIndex !== null && guard < 1000) {
             guard++;
             showProcessing('Loading Orders...', 'Loaded ' + orders.length + ' of ' + total + ' order(s)');
-            const data = await apiPost('loadMultipleSOForPicking', { soNumbers: soNumbers, startIndex: startIndex, itemId: itemId, itemText: itemText });
+            const data = await apiPost('loadMultipleSOForPicking', { soNumbers: soNumbers, startIndex: startIndex, itemId: itemId, itemText: itemText, itemIsSerialized: isSerialized });
             if (!data || !data.success) {
                 toast((data && data.message) || 'Could not load orders.', 'error');
                 hideProcessing(); btn.disabled = false; return;
@@ -19812,6 +21038,7 @@ async function somultiLoadSOs() {
             orders = orders.concat(data.orders || []);
             problems = problems.concat(data.problems || []);
             if (data.itemId) { itemId = data.itemId; itemText = data.itemText; }
+            if (typeof data.isSerialized === 'boolean' && isSerialized === null) isSerialized = data.isSerialized;
             startIndex = (data.nextIndex === null || data.nextIndex === undefined) ? null : data.nextIndex;
         }
     } catch (err) {
@@ -19822,22 +21049,190 @@ async function somultiLoadSOs() {
     btn.disabled = false;
 
     if (!orders.length) {
-        let msg = 'None of the scanned SOs have serialized items to pick.';
+        let msg = 'None of the scanned SOs have pickable items.';
         if (problems.length) msg += '  ' + problems.slice(0, 5).map(function(p){ return p.soNumber + ': ' + p.message; }).join(' | ');
         toast(msg, 'error');
         return;
     }
 
+    // Fall back to the orders' own flag if the batch-level one didn't come through.
+    if (isSerialized === null) isSerialized = !!(orders[0] && orders[0].isSerialized);
+
     const totalQty = orders.reduce(function(a, o){ return a + (o.qty || 0); }, 0);
-    currentSOMultiData = { itemId: itemId, itemText: itemText, orders: orders, problems: problems, totalQty: totalQty, orderCount: orders.length };
+    currentSOMultiData = { itemId: itemId, itemText: itemText, isSerialized: isSerialized, orders: orders, problems: problems, totalQty: totalQty, orderCount: orders.length };
     _somultiTotalNeeded = totalQty;
     somultiRenderSummary(currentSOMultiData);
     document.getElementById('somulti-load-card').style.display = 'none';
     document.getElementById('somulti-summary-section').style.display = 'block';
     document.getElementById('somulti-success').style.display = 'none';
-    document.getElementById('somulti-serials').value = '';
-    somultiOnSerialInput();
-    setTimeout(function(){ document.getElementById('somulti-serials').focus(); }, 60);
+
+    // Branch Step 2 on the batch's item type: scan serials, or enter qty by bin.
+    const serialBlock = document.getElementById('somulti-serial-block');
+    const nonserialBlock = document.getElementById('somulti-nonserial-block');
+    if (isSerialized) {
+        serialBlock.style.display = '';
+        nonserialBlock.style.display = 'none';
+        document.getElementById('somulti-serials').value = '';
+        somultiOnSerialInput();
+        setTimeout(function(){ document.getElementById('somulti-serials').focus(); }, 60);
+    } else {
+        serialBlock.style.display = 'none';
+        nonserialBlock.style.display = '';
+        await somultiInitNonSerial();
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  MULTI-SO NON-SERIALIZED: enter qty per bin, auto-allocate to orders
+// ─────────────────────────────────────────────────────────────
+async function somultiInitNonSerial() {
+    // Populate the bin datalist for the chosen warehouse, then start with one
+    // empty bin row. Bins are resolved by name at fulfill time against _bins.
+    const locId = document.getElementById('somulti-location').value;
+    try {
+        const bins = await loadBins(locId);
+        const dl = document.getElementById('somulti-bin-datalist');
+        if (dl) {
+            dl.innerHTML = '';
+            (bins || []).forEach(function(b){ const o = document.createElement('option'); o.value = b.name; dl.appendChild(o); });
+        }
+    } catch (e) { /* typeahead is advisory; name is still validated on submit */ }
+    document.getElementById('somulti-ns-needed').textContent = _somultiTotalNeeded;
+    document.getElementById('somulti-bin-rows').innerHTML = '';
+    somultiAddBinRow();
+}
+
+function somultiAddBinRow() {
+    const wrap = document.getElementById('somulti-bin-rows');
+    const row = document.createElement('div');
+    row.className = 'somulti-bin-row';
+    row.style.cssText = 'display:flex;gap:8px;align-items:flex-end;margin-bottom:8px;';
+    row.innerHTML =
+        '<div class="form-group" style="margin:0;flex:1;">' +
+            '<label class="form-label">Bin *</label>' +
+            '<input type="text" class="somulti-bin-input sopick-bin-input" list="somulti-bin-datalist" autocomplete="off" placeholder="Type to search bins…" oninput="somultiOnBinRowInput()">' +
+        '</div>' +
+        '<div class="form-group" style="margin:0;width:110px;">' +
+            '<label class="form-label">Quantity</label>' +
+            '<input type="number" class="somulti-bin-qty" min="1" step="1" placeholder="0" oninput="somultiOnBinRowInput()">' +
+        '</div>' +
+        '<button type="button" class="btn" title="Remove bin" onclick="somultiRemoveBinRow(this)" style="padding:8px 12px;margin-bottom:1px;">×</button>';
+    wrap.appendChild(row);
+    // Wire the shared bin typeahead so scanning/typing autocompletes bin names.
+    if (window.WAAC) {
+        const el = row.querySelector('.somulti-bin-input');
+        if (el) WAAC.attach(el, { type: 'bin', datalistId: 'somulti-bin-datalist' });
+    }
+    somultiOnBinRowInput();
+}
+
+function somultiRemoveBinRow(btn) {
+    const row = btn.closest('.somulti-bin-row');
+    if (!row) return;
+    const rows = document.querySelectorAll('#somulti-bin-rows .somulti-bin-row');
+    if (rows.length <= 1) {
+        // Keep at least one row — just clear it instead of removing.
+        const b = row.querySelector('.somulti-bin-input'); if (b) b.value = '';
+        const q = row.querySelector('.somulti-bin-qty');   if (q) q.value = '';
+    } else {
+        row.remove();
+    }
+    somultiOnBinRowInput();
+}
+
+// Read the bin rows into [{ binId, binName, qty }], resolving each bin name to
+// its id against the loaded bin list for the selected warehouse.
+function _somultiReadBinRows() {
+    const locId = document.getElementById('somulti-location').value;
+    const bins = _bins[locId] || [];
+    const out = [];
+    document.querySelectorAll('#somulti-bin-rows .somulti-bin-row').forEach(function(row){
+        const name = (row.querySelector('.somulti-bin-input').value || '').trim();
+        const qty = parseFloat(row.querySelector('.somulti-bin-qty').value) || 0;
+        const match = bins.find(function(b){ return b.name === name; });
+        out.push({ binName: name, binId: match ? match.id : null, qty: qty });
+    });
+    return out;
+}
+
+// Allocate the entered bin rows across the scanned orders in scan order:
+// consume the bins in row order, filling order 1 fully, then order 2, etc.
+// Each order's line(s) get binAllocations describing which bins fed them.
+function _somultiComputeNonSerialAllocation(orders, binRows) {
+    const pool = binRows.map(function(r){ return { binId: r.binId, binName: r.binName, qty: r.qty }; });
+    let pi = 0;
+    const assigned = [];
+    orders.forEach(function(o){
+        const lines = (o.lines || []).map(function(l){
+            let need = l.quantityRemaining;
+            const binAllocations = [];
+            while (need > 0 && pi < pool.length) {
+                if (pool[pi].qty <= 0) { pi++; continue; }
+                const take = Math.min(need, pool[pi].qty);
+                binAllocations.push({ binId: pool[pi].binId, binName: pool[pi].binName, qty: take });
+                pool[pi].qty -= take;
+                need -= take;
+            }
+            return { lineNum: l.lineNum, itemId: String(l.itemId), isSerialized: false, binAllocations: binAllocations, quantity: l.quantityRemaining - need };
+        });
+        assigned.push({ soId: o.soId, soTranId: o.soTranId, qty: o.qty, lines: lines });
+    });
+    return assigned;
+}
+
+function somultiOnBinRowInput() {
+    if (!currentSOMultiData) return;
+    const binRows = _somultiReadBinRows();
+    const total = binRows.reduce(function(a, r){ return a + (r.qty || 0); }, 0);
+    document.getElementById('somulti-ns-total').textContent = total;
+    document.getElementById('somulti-ns-needed').textContent = _somultiTotalNeeded;
+
+    // Every row that has a qty must resolve to a real bin; total must match need.
+    const hasBadBin = binRows.some(function(r){ return r.qty > 0 && !r.binId; });
+    const ready = _somultiTotalNeeded > 0 && total === _somultiTotalNeeded && !hasBadBin;
+
+    const btn = document.getElementById('somulti-ns-fulfill-btn');
+    btn.disabled = !ready;
+    btn.style.opacity = ready ? '1' : '.55';
+
+    // Live allocation preview so the picker sees which order draws from which bin.
+    const preview = document.getElementById('somulti-ns-preview');
+    if (hasBadBin) {
+        preview.innerHTML = '<div style="font-size:12px;color:var(--danger,#dc2626);">Select a valid bin from the list for every row with a quantity.</div>';
+        return;
+    }
+    if (total <= 0) { preview.innerHTML = ''; return; }
+    const assigned = _somultiComputeNonSerialAllocation(currentSOMultiData.orders, binRows);
+    let html = '<div style="font-size:12px;color:var(--text-muted);margin-bottom:4px;">Allocation preview</div>';
+    assigned.forEach(function(a){
+        const parts = [];
+        a.lines.forEach(function(l){
+            (l.binAllocations || []).forEach(function(ba){ parts.push(ba.qty + ' from ' + escHtml(ba.binName || '?')); });
+        });
+        const short = a.qty - a.lines.reduce(function(s, l){ return s + l.quantity; }, 0);
+        const detail = parts.length ? parts.join(', ') : '<span style="color:var(--danger,#dc2626);">unallocated</span>';
+        html += '<div style="display:flex;justify-content:space-between;gap:10px;font-size:12px;padding:3px 0;border-bottom:1px dashed var(--border);">' +
+            '<span>' + escHtml(a.soTranId) + ' <span style="color:var(--text-muted);">(' + a.qty + ')</span></span>' +
+            '<span style="text-align:right;">' + detail + (short > 0 ? ' <span style="color:var(--danger,#dc2626);">(short ' + short + ')</span>' : '') + '</span>' +
+        '</div>';
+    });
+    preview.innerHTML = html;
+}
+
+async function somultiFulfillAllNonSerial() {
+    if (!currentSOMultiData) { toast('Load orders first.', 'error'); return; }
+    const binRows = _somultiReadBinRows();
+    const total = binRows.reduce(function(a, r){ return a + (r.qty || 0); }, 0);
+    if (total !== _somultiTotalNeeded) {
+        toast('Entered ' + total + ' unit(s), but need ' + _somultiTotalNeeded + '.', 'error'); return;
+    }
+    if (binRows.some(function(r){ return r.qty > 0 && !r.binId; })) {
+        toast('Select a valid bin for every row with a quantity.', 'error'); return;
+    }
+    const assigned = _somultiComputeNonSerialAllocation(currentSOMultiData.orders, binRows);
+    const btn = document.getElementById('somulti-ns-fulfill-btn');
+    btn.disabled = true;
+    await _somultiRunFulfill(assigned);
 }
 
 function somultiRenderSummary(data) {
@@ -19919,6 +21314,7 @@ async function somultiValidateSerials(serials, token) {
         const rows = issues.slice(0, 20).map(function(v){
             const why = v.reason === 'wrong_item' ? ('belongs to ' + escHtml(v.belongsToItemName || 'another item'))
                 : v.reason === 'depleted' ? 'not in stock'
+                : v.reason === 'unavailable_status' ? ('non-available status' + (v.statusText ? ' (' + escHtml(v.statusText) + ')' : ''))
                 : 'not found';
             return '<div class="sopick-serial-issue"><code>' + escHtml(v.serial) + '</code> — ' + why + '</div>';
         }).join('');
@@ -19956,9 +21352,16 @@ async function somultiFulfillAll() {
         assigned.push({ soId: o.soId, soTranId: o.soTranId, qty: o.qty, lines: lines });
     });
 
-    const locationId = document.getElementById('somulti-location').value;
     const btn = document.getElementById('somulti-fulfill-btn');
     btn.disabled = true;
+    await _somultiRunFulfill(assigned);
+}
+
+// Shared chunked fulfill + result render for both the serialized (serials
+// pre-assigned) and non-serialized (qty/bin pre-allocated) batches. Each order
+// in the batch is self-contained, so the server can fulfill any slice of them.
+async function _somultiRunFulfill(assigned) {
+    const locationId = document.getElementById('somulti-location').value;
 
     // Fulfillment is heavy (staging + transform + save per SO), so the server
     // processes the batch in chunks and hands back a nextIndex; loop until done.
@@ -20032,6 +21435,11 @@ function somultiReset() {
     document.getElementById('somulti-load-card').style.display = '';
     const btn = document.getElementById('somulti-fulfill-btn');
     btn.disabled = true; btn.style.opacity = '.55';
+    // Reset the non-serialized block (bin rows + fulfill button) too.
+    const nsRows = document.getElementById('somulti-bin-rows'); if (nsRows) nsRows.innerHTML = '';
+    const nsPrev = document.getElementById('somulti-ns-preview'); if (nsPrev) nsPrev.innerHTML = '';
+    const nsTotal = document.getElementById('somulti-ns-total'); if (nsTotal) nsTotal.textContent = '0';
+    const nsBtn = document.getElementById('somulti-ns-fulfill-btn'); if (nsBtn) { nsBtn.disabled = true; nsBtn.style.opacity = '.55'; }
     setTimeout(function(){ document.getElementById('somulti-so-input').focus(); }, 60);
 }
 
@@ -20391,6 +21799,12 @@ async function scdInitUserFilter() {
     }
 }
 
+// All stock counts for the current filter set, plus the active page. The server
+// returns the full (filtered) list; we page it 10-at-a-time on the client.
+let _scdResults = [];
+let _scdPage = 1;
+const SCD_PAGE_SIZE = 10;
+
 async function scdLoadStockCounts() {
     scdInitUserFilter();
     const status     = document.getElementById('scd-status-filter').value;
@@ -20399,6 +21813,7 @@ async function scdLoadStockCounts() {
     const serial     = document.getElementById('scd-serial-filter').value.trim();
     const tbody = document.getElementById('scd-table-body');
     tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--text-dim)">Loading...</td></tr>';
+    scdRenderPagination();
 
     try {
         const params = {};
@@ -20408,39 +21823,88 @@ async function scdLoadStockCounts() {
         if (serial)     params.serial     = serial;
         const data = await apiGet('getStockCounts', params);
         if (!data.success) {
+            _scdResults = [];
             tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--danger)">' + escHtml(data.message || 'Failed to load') + '</td></tr>';
+            scdRenderPagination();
             return;
         }
-        const results = data.results || [];
-        if (results.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--text-dim)">No stock counts found</td></tr>';
-            return;
-        }
-        tbody.innerHTML = results.map(sc => {
-            const statusBadge = scdGetStatusBadge(sc.status);
-            const actionBtn = scdGetActionButton(sc);
-            return '<tr>' +
-                '<td data-label="ID" style="font-weight:500;">#' + escHtml(sc.id) + '</td>' +
-                '<td data-label="Location">' + escHtml(sc.location || '—') + '</td>' +
-                '<td data-label="Bin">' + escHtml(sc.binName || '—') + '</td>' +
-                '<td data-label="Assigned">' + escHtml(sc.assignedTo || '—') + '</td>' +
-                '<td data-label="Items" style="text-align:center;">' + sc.itemCount + '</td>' +
-                '<td data-label="Status">' + statusBadge + '</td>' +
-                '<td data-label="Created" style="font-size:12px;">' + escHtml(sc.created || '—') + '</td>' +
-                '<td data-label="" class="sc-cell-action" style="white-space:nowrap;">' + actionBtn +
-                    '<button class="btn btn-danger btn-sm" style="padding:6px 10px;font-size:12px;margin-left:6px;" onclick="scdDeleteStockCount(' + sc.id + ',' + (sc.adjustmentId ? 'true' : 'false') + ')">Delete</button>' +
-                '</td>' +
-                '</tr>';
-        }).join('');
+        _scdResults = data.results || [];
+        _scdPage = 1;
+        scdRenderPage();
     } catch (err) {
+        _scdResults = [];
         tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--danger)">Error: ' + escHtml(err.message) + '</td></tr>';
+        scdRenderPagination();
     }
+}
+
+// Render just the rows for the current page, then refresh the pager.
+function scdRenderPage() {
+    const tbody = document.getElementById('scd-table-body');
+    if (!tbody) return;
+    const total = _scdResults.length;
+    if (total === 0) {
+        tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--text-dim)">No stock counts found</td></tr>';
+        scdRenderPagination();
+        return;
+    }
+    const pageCount = Math.max(1, Math.ceil(total / SCD_PAGE_SIZE));
+    if (_scdPage > pageCount) _scdPage = pageCount;
+    if (_scdPage < 1) _scdPage = 1;
+    const start = (_scdPage - 1) * SCD_PAGE_SIZE;
+    const pageRows = _scdResults.slice(start, start + SCD_PAGE_SIZE);
+
+    tbody.innerHTML = pageRows.map(sc => {
+        const statusBadge = scdGetStatusBadge(sc);
+        const actionBtn = scdGetActionButton(sc);
+        return '<tr>' +
+            '<td data-label="ID" style="font-weight:500;">#' + escHtml(sc.id) + '</td>' +
+            '<td data-label="Bin">' + escHtml(sc.binName || '—') + '</td>' +
+            '<td data-label="Assigned">' + escHtml(sc.assignedTo || '—') + '</td>' +
+            '<td data-label="Items" style="text-align:center;">' + sc.itemCount + '</td>' +
+            '<td data-label="Status">' + statusBadge + '</td>' +
+            '<td data-label="Duration" style="font-size:12px;" title="' + escHtml(scDurationTitle(sc)) + '">' + scFmtDuration(sc.durationMinutes) + '</td>' +
+            '<td data-label="Created" style="font-size:12px;">' + escHtml(sc.created || '—') + '</td>' +
+            '<td data-label="" class="sc-cell-action" style="white-space:nowrap;">' + actionBtn +
+                (hasPerm(12) ? '<button class="btn btn-danger btn-sm" style="padding:6px 10px;font-size:12px;margin-left:6px;" onclick="scdDeleteStockCount(' + sc.id + ',' + (sc.adjustmentId ? 'true' : 'false') + ')">Delete</button>' : '') +
+            '</td>' +
+            '</tr>';
+    }).join('');
+    scdRenderPagination();
+}
+
+// Prev / page-count / Next bar under the table. Hidden when a single page.
+function scdRenderPagination() {
+    const el = document.getElementById('scd-pagination');
+    if (!el) return;
+    const total = _scdResults.length;
+    const pageCount = Math.ceil(total / SCD_PAGE_SIZE);
+    if (pageCount <= 1) { el.style.display = 'none'; el.innerHTML = ''; return; }
+    const start = (_scdPage - 1) * SCD_PAGE_SIZE + 1;
+    const end = Math.min(_scdPage * SCD_PAGE_SIZE, total);
+    el.style.display = 'flex';
+    el.innerHTML =
+        '<span class="scd-pag-info">' + start + '–' + end + ' of ' + total + '</span>' +
+        '<span class="scd-pag-btns">' +
+            '<button class="btn btn-sm" ' + (_scdPage <= 1 ? 'disabled' : '') + ' onclick="scdGoToPage(' + (_scdPage - 1) + ')">Prev</button>' +
+            '<span class="scd-pag-page">Page ' + _scdPage + ' / ' + pageCount + '</span>' +
+            '<button class="btn btn-sm" ' + (_scdPage >= pageCount ? 'disabled' : '') + ' onclick="scdGoToPage(' + (_scdPage + 1) + ')">Next</button>' +
+        '</span>';
+}
+
+function scdGoToPage(p) {
+    const pageCount = Math.max(1, Math.ceil(_scdResults.length / SCD_PAGE_SIZE));
+    _scdPage = Math.min(Math.max(1, p), pageCount);
+    scdRenderPage();
+    const card = document.getElementById('scd-table-body');
+    if (card && card.scrollIntoView) card.scrollIntoView({ block: 'nearest' });
 }
 
 // Delete (soft-remove) a stock count from the dashboard. Approved counts carry a
 // posted inventory adjustment that is NOT reversed — the confirm text says so.
 async function scdDeleteStockCount(id, hasAdj) {
-    if (!scrPasswordOk('Enter password to delete this stock count:')) return;
+    // Stock Count Approve/Delete (perm 12) gates deleting a count.
+    if (!hasPerm(12)) { toast('You do not have permission to delete stock counts.', 'error'); return; }
     const msg = hasAdj
         ? 'Delete stock count #' + id + '?\\n\\nIts posted inventory adjustment will NOT be reversed — only the count record is removed from the dashboard.'
         : 'Delete stock count #' + id + '?\\n\\nThis removes it from the dashboard and cannot be undone here.';
@@ -20460,18 +21924,18 @@ async function scdDeleteStockCount(id, hasAdj) {
 
 async function scprLoadPendingReview() {
     const tbody = document.getElementById('scpr-table-body');
-    tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--text-dim)">Loading...</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--text-dim)">Loading...</td></tr>';
 
     try {
         const data = await apiGet('getStockCounts', { status: 'completed' });
         if (!data.success) {
-            tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--danger)">' + escHtml(data.message || 'Failed to load') + '</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--danger)">' + escHtml(data.message || 'Failed to load') + '</td></tr>';
             return;
         }
         // Filter only completed counts without adjustment ID (pending review)
         const results = (data.results || []).filter(sc => !sc.adjustmentId);
         if (results.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--text-dim)">No counts pending review</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--text-dim)">No counts pending review</td></tr>';
             return;
         }
         tbody.innerHTML = results.map(sc => {
@@ -20481,20 +21945,53 @@ async function scprLoadPendingReview() {
                 '<td data-label="Bin">' + escHtml(sc.binName || '—') + '</td>' +
                 '<td data-label="Assigned">' + escHtml(sc.assignedTo || '—') + '</td>' +
                 '<td data-label="Items" style="text-align:center;">' + sc.itemCount + '</td>' +
+                '<td data-label="Duration" style="font-size:12px;" title="' + escHtml(scDurationTitle(sc)) + '">' + scFmtDuration(sc.durationMinutes) + '</td>' +
                 '<td data-label="Created" style="font-size:12px;">' + escHtml(sc.created || '—') + '</td>' +
-                '<td data-label="" class="sc-cell-action"><button class="btn" style="padding:6px 12px;font-size:12px;background:var(--warning);color:#000;" onclick="scrStartReview(' + sc.id + ')">Review</button></td>' +
+                '<td data-label="" class="sc-cell-action">' + (hasPerm(12) ? '<button class="btn" style="padding:6px 12px;font-size:12px;background:var(--warning);color:#000;" onclick="scrStartReview(' + sc.id + ')">Review</button>' : '') + '</td>' +
                 '</tr>';
         }).join('');
     } catch (err) {
-        tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--danger)">Error: ' + escHtml(err.message) + '</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--danger)">Error: ' + escHtml(err.message) + '</td></tr>';
     }
 }
 
-function scdGetStatusBadge(status) {
+// Format a minutes value into a compact human duration: "45m", "2h 15m",
+// "1d 3h". Returns "—" when timing is unavailable (never started/finished, or
+// the date fields are Date-only so no meaningful elapsed time was captured).
+function scFmtDuration(mins) {
+    if (mins === null || mins === undefined || isNaN(mins) || mins < 0) return '—';
+    const m = Math.round(mins);
+    if (m < 1)  return '<1m';
+    if (m < 60) return m + 'm';
+    const h = Math.floor(m / 60), rem = m % 60;
+    if (h < 24) return h + 'h' + (rem ? ' ' + rem + 'm' : '');
+    const d = Math.floor(h / 24), hr = h % 24;
+    return d + 'd' + (hr ? ' ' + hr + 'h' : '');
+}
+
+// Hover tooltip showing the raw start/end stamps behind a duration cell.
+function scDurationTitle(sc) {
+    if (!sc || (!sc.startDate && !sc.endDate)) return 'Not yet timed';
+    let t = 'Started: ' + (sc.startDate || '—') + '  →  Submitted: ' + (sc.endDate || '—');
+    if (sc.pausedSecs && sc.pausedSecs > 0) {
+        t += '  (excludes ' + scFmtDuration(Math.round(sc.pausedSecs / 60)) + ' paused)';
+    }
+    return t;
+}
+
+function scdGetStatusBadge(sc) {
+    // Back-compat: accept either a status string or the full sc row.
+    const status = (sc && typeof sc === 'object') ? sc.status : sc;
+    const paused = (sc && typeof sc === 'object') ? sc.paused : false;
     switch(status) {
         case 'pending':
             return '<span class="badge" style="background:var(--surface-hover);color:var(--text);">Pending</span>';
         case 'in_progress':
+            if (paused) {
+                const reason = (sc && typeof sc === 'object') ? (sc.pauseReason || '') : '';
+                const tip = reason ? ' title="Reason: ' + escHtml(reason) + '"' : '';
+                return '<span class="badge" style="background:var(--warning);color:#000;"' + tip + '>Paused</span>';
+            }
             return '<span class="badge badge-info">In Progress</span>';
         case 'completed':
             return '<span class="badge" style="background:var(--warning);color:#000;">Pending Review</span>';
@@ -20511,11 +22008,14 @@ function scdGetActionButton(sc) {
     if (sc.status === 'pending') {
         return '<button class="btn btn-primary" style="padding:6px 12px;font-size:12px;" onclick="sceStartCount(' + sc.id + ')">Start Count</button>';
     } else if (sc.status === 'in_progress') {
-        return '<button class="btn" style="padding:6px 12px;font-size:12px;" onclick="sceStartCount(' + sc.id + ')">Continue</button>';
+        const label = sc.paused ? 'Resume' : 'Continue';
+        return '<button class="btn" style="padding:6px 12px;font-size:12px;" onclick="sceStartCount(' + sc.id + ')">' + label + '</button>';
     } else if (sc.status === 'completed' && !sc.adjustmentId) {
-        return '<button class="btn" style="padding:6px 12px;font-size:12px;background:var(--warning);color:#000;" onclick="scrStartReview(' + sc.id + ')">Review</button>';
+        // Reviewing/approving results requires Stock Count Approval (perm 12).
+        return hasPerm(12) ? '<button class="btn" style="padding:6px 12px;font-size:12px;background:var(--warning);color:#000;" onclick="scrStartReview(' + sc.id + ')">Review</button>' : '';
     } else {
-        return '<button class="btn" style="padding:6px 12px;font-size:12px;" onclick="scrViewApproved(' + sc.id + ')">View</button>';
+        // Viewing approved results also requires Stock Count Approval (perm 12).
+        return hasPerm(12) ? '<button class="btn" style="padding:6px 12px;font-size:12px;" onclick="scrViewApproved(' + sc.id + ')">View</button>' : '';
     }
 }
 
@@ -20549,6 +22049,10 @@ async function sceStartCount(id) {
 
         if (_sceData.status === 'pending') {
             await apiPost('updateStockCount', { id: _sceData.id, status: 'in_progress' });
+        } else if (_sceData.status === 'in_progress' && _sceData.paused) {
+            // Re-entering a paused count = resume: bank the break and restart the clock.
+            await apiPost('updateStockCount', { id: _sceData.id, pauseAction: 'resume' });
+            _sceData.paused = false;
         }
         navigateTo('sc-execute');
         sceRenderUI();
@@ -20973,6 +22477,43 @@ function sceRecountItem(idx) {
     if (c) sceOpenItem(c.itemId);
 }
 
+// Pause the count for a break: save whatever's been counted, stamp the pause
+// (server stops billing time from now), and drop back to the dashboard where the
+// count shows a "Paused" badge and a "Resume" button.
+async function scePauseCount() {
+    if (!_sceData) {
+        toast('No stock count loaded.', 'error');
+        return;
+    }
+    // Mandatory free-text reason (single line, no length limit).
+    const reason = (window.prompt('Reason for pausing this count? (required)') || '').trim();
+    if (!reason) {
+        toast('Pause cancelled — a reason is required.', 'info');
+        return;
+    }
+    const btn = document.getElementById('sce-pause-btn');
+    _btnWait(btn);
+    try {
+        const data = await apiPost('updateStockCount', {
+            id: _sceData.id,
+            countedJson: JSON.stringify(_sceCounted),
+            pauseAction: 'pause',
+            pauseReason: reason
+        });
+        if (data.success) {
+            toast('Count paused — timer stopped. Resume from the dashboard when you’re back.', 'success');
+            navigateTo('sc-dashboard');
+            scdLoadStockCounts();
+        } else {
+            toast(data.message || 'Failed to pause count.', 'error');
+        }
+    } catch (err) {
+        toast('Error: ' + err.message, 'error');
+    } finally {
+        _btnReset(btn);
+    }
+}
+
 async function sceSaveProgress() {
     if (!_sceData) {
         toast('No stock count loaded.', 'error');
@@ -21039,20 +22580,9 @@ async function sceCompleteCount() {
 let _scrData = null;
 let _scrDiscrepancies = [];
 
-// Password gate — anyone opening a stock count's results/approval screen must
-// enter this password first. Prompted on every open (no session unlock) so the
-// results are never viewable without it. Password is intentionally hard-coded.
-const SC_REVIEW_PASSWORD = '010203';
-function scrPasswordOk(message) {
-    const entry = prompt(message || 'Enter password to view stock count results:');
-    if (entry === null) return false;            // user cancelled
-    if (entry === SC_REVIEW_PASSWORD) return true;
-    toast('Incorrect password.', 'error');
-    return false;
-}
-
 async function scrStartReview(id) {
-    if (!scrPasswordOk()) return;
+    // Stock Count Approve/Delete (perm 12) gates viewing results & approving.
+    if (!hasPerm(12)) { toast('You do not have permission to view or approve stock count results.', 'error'); return; }
     showProcessing('Loading stock count...');
     try {
         const data = await apiGet('getStockCountById', { id });
@@ -21802,6 +23332,9 @@ function scrViewApproved(id) {
 //  INIT
 // ═══════════════════════════════════════════════════════════
 (async function init() {
+    // Hide every feature the current user lacks permission for, up front.
+    applyPermissions();
+
     // Set initial padding for warehouse view (default)
     document.querySelector('.main').style.padding = '0';
 

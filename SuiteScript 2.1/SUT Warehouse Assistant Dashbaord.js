@@ -18,8 +18,9 @@ define([
     'N/task',
     'N/encode',
     'N/render',
-    'N/format'
-], (serverWidget, record, search, log, runtime, url, task, encode, render, format) => {
+    'N/format',
+    'N/file'
+], (serverWidget, record, search, log, runtime, url, task, encode, render, format, file) => {
 
     const RECORD_TYPE = 'customrecord_tq_license_plate';
 
@@ -235,6 +236,17 @@ define([
                     return respondJson(context, getSerialsInBins(context.request.parameters));
                 case 'getItemBinSerials':
                     return respondJson(context, getItemBinSerials(context.request.parameters));
+                // ── Item Lookup: "What's in the Box" ─────────────
+                case 'getBoxStatus':
+                    return respondJson(context, ilBoxGetStatus(context.request.parameters));
+                case 'printBox':
+                    return ilBoxHandlePrint(context);
+                case 'getItemNotes':
+                    return respondJson(context, getItemNotes(context.request.parameters));
+                case 'saveItemNotes':
+                    return respondJson(context, saveItemNotes(JSON.parse(context.request.body)));
+                case 'saveNonSerializedItemNote':
+                    return respondJson(context, saveNonSerializedItemNote(JSON.parse(context.request.body)));
                 case 'getBinContents':
                     return respondJson(context, getBinContents(context.request.parameters));
                 case 'getFragmentedItems':
@@ -644,7 +656,10 @@ define([
 
         const itemsMap = {}; // itemId -> { itemId, itemName, isSerialized, totalQty, serials, statusBuckets }
         try {
-            search.create({
+            // A dense bin (e.g. A-F-01) can hold well over 4000 serial rows.
+            // runPaged pages through the full result set; .each()/.getRange()
+            // would throw the "No more than 4000 search results" error.
+            const balSearch = search.create({
                 type: 'inventorybalance',
                 filters: [
                     ['location', 'anyof', [locationId]], 'AND',
@@ -658,34 +673,38 @@ define([
                     search.createColumn({ name: 'status' }),
                     search.createColumn({ name: 'binnumber' })
                 ]
-            }).run().each(r => {
-                const itemId   = String(r.getValue({ name: 'item' }));
-                const itemText = r.getText({ name: 'item' }) || itemId;
-                const serial   = r.getText({ name: 'inventorynumber' }) || '';
-                const qty      = parseFloat(r.getValue({ name: 'onhand' })) || 0;
-                const statusId = r.getValue({ name: 'status' }) || '';
-                const statusText = r.getText({ name: 'status' }) || '';
-                if (qty <= 0) return true;
-                if (!binName) binName = r.getText({ name: 'binnumber' }) || '';
+            });
 
-                if (!itemsMap[itemId]) {
-                    itemsMap[itemId] = {
-                        itemId, itemName: itemText, isSerialized: false,
-                        totalQty: 0, serials: [], statusBuckets: {}
-                    };
-                }
-                const it = itemsMap[itemId];
-                if (serial) {
-                    it.isSerialized = true;
-                    it.serials.push(serial);
-                    it.totalQty += qty; // qty per serial row is 1
-                } else {
-                    it.totalQty += qty;
-                    const key = statusId || '_default';
-                    if (!it.statusBuckets[key]) it.statusBuckets[key] = { statusId: statusId || '', statusText, qty: 0 };
-                    it.statusBuckets[key].qty += qty;
-                }
-                return true;
+            const pagedData = balSearch.runPaged({ pageSize: 1000 });
+            pagedData.pageRanges.forEach(pr => {
+                pagedData.fetch({ index: pr.index }).data.forEach(r => {
+                    const itemId   = String(r.getValue({ name: 'item' }));
+                    const itemText = r.getText({ name: 'item' }) || itemId;
+                    const serial   = r.getText({ name: 'inventorynumber' }) || '';
+                    const qty      = parseFloat(r.getValue({ name: 'onhand' })) || 0;
+                    const statusId = r.getValue({ name: 'status' }) || '';
+                    const statusText = r.getText({ name: 'status' }) || '';
+                    if (qty <= 0) return;
+                    if (!binName) binName = r.getText({ name: 'binnumber' }) || '';
+
+                    if (!itemsMap[itemId]) {
+                        itemsMap[itemId] = {
+                            itemId, itemName: itemText, isSerialized: false,
+                            totalQty: 0, serials: [], statusBuckets: {}
+                        };
+                    }
+                    const it = itemsMap[itemId];
+                    if (serial) {
+                        it.isSerialized = true;
+                        it.serials.push(serial);
+                        it.totalQty += qty; // qty per serial row is 1
+                    } else {
+                        it.totalQty += qty;
+                        const key = statusId || '_default';
+                        if (!it.statusBuckets[key]) it.statusBuckets[key] = { statusId: statusId || '', statusText, qty: 0 };
+                        it.statusBuckets[key].qty += qty;
+                    }
+                });
             });
         } catch (e) {
             log.debug('getBinContents error', e.message);
@@ -719,18 +738,23 @@ define([
                 ['onhand', 'greaterthan', 0]
             ];
             if (locationId) { filters.push('AND'); filters.push(['location', 'anyof', [locationId]]); }
-            search.create({
+            const statusSearch = search.create({
                 type: 'inventorybalance',
                 filters: filters,
                 columns: [
                     search.createColumn({ name: 'inventorynumber' }),
                     search.createColumn({ name: 'status' })
                 ]
-            }).run().each(r => {
-                const sn = (r.getText({ name: 'inventorynumber' }) || '').trim();
-                const st = r.getValue({ name: 'status' }) || '';
-                if (sn) map[sn.toUpperCase()] = st;
-                return true;
+            });
+            // Page the results so a very high serial count for one item in a
+            // dense bin cannot trip the 4000-row cap of .each().
+            const pagedData = statusSearch.runPaged({ pageSize: 1000 });
+            pagedData.pageRanges.forEach(pr => {
+                pagedData.fetch({ index: pr.index }).data.forEach(r => {
+                    const sn = (r.getText({ name: 'inventorynumber' }) || '').trim();
+                    const st = r.getValue({ name: 'status' }) || '';
+                    if (sn) map[sn.toUpperCase()] = st;
+                });
             });
         } catch (e) { log.debug('getSerialStatusMap error', e.message); }
         return map;
@@ -1851,6 +1875,11 @@ define([
             if (params.assignedTo) {
                 filters.push('AND');
                 filters.push(['custrecord_sc_assigned_to', 'anyof', params.assignedTo]);
+            }
+            // Bin name is a stored text field, so it filters at the search level too.
+            if (params.bin && params.bin.trim()) {
+                filters.push('AND');
+                filters.push(['custrecord_sc_bin_name', 'contains', params.bin.trim()]);
             }
             // Item / serial live inside the items JSON blob, not searchable fields —
             // they are applied as a post-filter over each row's parsed items below.
@@ -4579,6 +4608,17 @@ define([
             itemMap[s.itemId].currentBins[bk] = (itemMap[s.itemId].currentBins[bk] || 0) + 1;
         });
 
+        // Per-serial notes (inventory-number memo) for the scanned serials, so
+        // the lookup can surface operator notes next to the item. Best-effort.
+        const memoMap = getSerialMemoMap(serialTexts, null);
+        const notesByItem = {}; // itemId -> [{ sn, bin, memo }]
+        (serialData.valid || []).forEach(s => {
+            const memo = memoMap[s.serialNumber];
+            if (!memo) return;
+            if (!notesByItem[s.itemId]) notesByItem[s.itemId] = [];
+            notesByItem[s.itemId].push({ sn: s.serialNumber, bin: s.binText || '', memo: memo });
+        });
+
         // For each unique item, pull all bin balances at that item's location.
         // Reuses getBinInventory so kit/regular logic and inventorybalance
         // summary search stay in one place.
@@ -4596,7 +4636,8 @@ define([
                 itemName: it.itemName,
                 scannedCount: it.scannedCount,
                 currentBins: Object.keys(it.currentBins).map(b => ({ bin: b, count: it.currentBins[b] })),
-                bins: bins
+                bins: bins,
+                notes: notesByItem[it.itemId] || []
             };
         });
 
@@ -4819,13 +4860,235 @@ define([
             return { success: false, message: 'Could not retrieve serials: ' + e.message };
         }
 
+        // Attach any operator note (inventory-number memo) to each serial so the
+        // Item Lookup bin popup can display it. Best-effort; scoped to the item(s).
+        const allSerials = [];
+        Object.keys(binMap).forEach(b => binMap[b].serials.forEach(s => allSerials.push(s.sn)));
+        const memoMap = getSerialMemoMap(allSerials, lookupItems);
+
         const bins = Object.keys(binMap).map(b => {
             const slot = binMap[b];
+            slot.serials.forEach(s => { s.memo = memoMap[s.sn] || ''; });
             slot.serials.sort((a, c) => String(a.sn).localeCompare(String(c.sn), undefined, { numeric: true, sensitivity: 'base' }));
             return slot;
         }).sort((a, c) => c.onHand - a.onHand);
 
         return { success: true, bins: bins, isKit: isKit };
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  ITEM NOTES  (memo on the inventory-number / serial record)
+    //  - getSerialMemoMap: best-effort { serialText: memo } lookup,
+    //    reused by Item Lookup to surface notes alongside serials.
+    //  - getItemNotes:  resolve pasted serials -> editable rows.
+    //  - saveItemNotes: overwrite the memo field on each matching
+    //    inventory-number record.
+    // ═══════════════════════════════════════════════════════════
+
+    // Best-effort serial -> memo map. Searches the inventory-number records
+    // directly (independent of stock/location) so notes surface even for
+    // out-of-stock serials. Any failure returns whatever was gathered so far
+    // and never breaks the caller's core lookup. Optionally scope by item.
+    const getSerialMemoMap = (serialTexts, itemIds) => {
+        const out = {};
+        const trimmed = (serialTexts || []).map(s => String(s || '').trim()).filter(s => s);
+        if (!trimmed.length) return out;
+        try {
+            const BATCH = 50; // long OR filter chains get unreliable past ~100
+            for (let off = 0; off < trimmed.length; off += BATCH) {
+                const chunk = trimmed.slice(off, off + BATCH);
+                const serialFilter = [];
+                chunk.forEach((s, i) => {
+                    if (i > 0) serialFilter.push('OR');
+                    serialFilter.push(['inventorynumber', 'is', s]);
+                });
+                const filters = (itemIds && itemIds.length)
+                    ? [['item', 'anyof', itemIds], 'AND', serialFilter]
+                    : serialFilter;
+                search.create({
+                    type: 'inventorynumber',
+                    filters: filters,
+                    columns: [
+                        search.createColumn({ name: 'inventorynumber' }),
+                        search.createColumn({ name: 'memo' })
+                    ]
+                }).run().each(r => {
+                    const sn = (r.getValue({ name: 'inventorynumber' }) || '').trim();
+                    const memo = (r.getValue({ name: 'memo' }) || '').trim();
+                    if (sn && memo && !out[sn]) out[sn] = memo;
+                    return true;
+                });
+            }
+        } catch (e) {
+            log.debug('getSerialMemoMap failed', e.message);
+        }
+        return out;
+    };
+
+    // Resolve pasted serials into editor rows: [{ serial, found, itemName, memo }].
+    // Resolves against the inventory-number records so a serial can be annotated
+    // even when it is not currently in a lookup location / in stock.
+    const getItemNotes = (params) => {
+        try {
+            const serialTexts = cleanSerialInput(params.serials || '');
+            if (!serialTexts.length) return { success: false, message: 'No serials provided.' };
+
+            const info = {}; // serialText -> { itemName, memo }
+            const BATCH = 50;
+            for (let off = 0; off < serialTexts.length; off += BATCH) {
+                const chunk = serialTexts.slice(off, off + BATCH);
+                const serialFilter = [];
+                chunk.forEach((s, i) => {
+                    if (i > 0) serialFilter.push('OR');
+                    serialFilter.push(['inventorynumber', 'is', s]);
+                });
+                search.create({
+                    type: 'inventorynumber',
+                    filters: serialFilter,
+                    columns: [
+                        search.createColumn({ name: 'inventorynumber' }),
+                        search.createColumn({ name: 'item' }),
+                        search.createColumn({ name: 'memo' })
+                    ]
+                }).run().each(r => {
+                    const sn = (r.getValue({ name: 'inventorynumber' }) || '').trim();
+                    if (sn && !info[sn]) {
+                        info[sn] = {
+                            itemName: r.getText({ name: 'item' }) || '',
+                            memo: (r.getValue({ name: 'memo' }) || '')
+                        };
+                    }
+                    return true;
+                });
+            }
+
+            const rows = [];
+            const invalid = [];
+            serialTexts.forEach(sn => {
+                if (info[sn]) {
+                    rows.push({ serial: sn, found: true, itemName: info[sn].itemName, memo: info[sn].memo });
+                } else {
+                    rows.push({ serial: sn, found: false, itemName: '', memo: '' });
+                    invalid.push(sn);
+                }
+            });
+            return { success: true, rows: rows, invalid: invalid };
+        } catch (e) {
+            log.error('getItemNotes Error', e.message);
+            return { success: false, message: e.message };
+        }
+    };
+
+    // Overwrite the memo field on each serial's inventory-number record.
+    // Input: { notes: [{ serial, memo }] }. A serial string that resolves to
+    // more than one record (same serial reused across items) has every match
+    // updated with the same memo.
+    const saveItemNotes = (data) => {
+        try {
+            const notes = (data && data.notes) || [];
+            if (!notes.length) return { success: false, message: 'No serials provided.' };
+
+            const memoBySerial = {};
+            const serialTexts = [];
+            notes.forEach(n => {
+                const sn = String((n && n.serial) || '').trim();
+                if (!sn) return;
+                memoBySerial[sn] = String((n && n.memo) != null ? n.memo : '');
+                serialTexts.push(sn);
+            });
+            if (!serialTexts.length) return { success: false, message: 'No serials provided.' };
+
+            // Resolve each serial to its inventory-number internal id(s).
+            const serialToIds = {};
+            const BATCH = 50;
+            for (let off = 0; off < serialTexts.length; off += BATCH) {
+                const chunk = serialTexts.slice(off, off + BATCH);
+                const serialFilter = [];
+                chunk.forEach((s, i) => {
+                    if (i > 0) serialFilter.push('OR');
+                    serialFilter.push(['inventorynumber', 'is', s]);
+                });
+                search.create({
+                    type: 'inventorynumber',
+                    filters: serialFilter,
+                    columns: [search.createColumn({ name: 'inventorynumber' })]
+                }).run().each(r => {
+                    const sn = (r.getValue({ name: 'inventorynumber' }) || '').trim();
+                    if (!sn) return true;
+                    if (!serialToIds[sn]) serialToIds[sn] = [];
+                    serialToIds[sn].push(r.id);
+                    return true;
+                });
+            }
+
+            const updated = [];
+            const notFound = [];
+            serialTexts.forEach(sn => {
+                const ids = serialToIds[sn];
+                if (!ids || !ids.length) { notFound.push(sn); return; }
+                ids.forEach(id => {
+                    record.submitFields({
+                        type: 'inventorynumber',
+                        id: id,
+                        values: { memo: memoBySerial[sn] }
+                    });
+                });
+                updated.push(sn);
+            });
+
+            log.audit('Item Notes Saved', updated.length + ' serial(s) updated; ' + notFound.length + ' not found.');
+            return {
+                success: true,
+                updatedCount: updated.length,
+                updated: updated,
+                notFound: notFound
+            };
+        } catch (e) {
+            log.error('saveItemNotes Error', e.message);
+            return { success: false, message: e.message };
+        }
+    };
+
+    // Non-serialized items have no per-unit inventory-number record to hold a
+    // memo, so a note is attached to the ITEM as a standard NetSuite User Note
+    // (the `note` record, which supports an `item` association). Each save adds a
+    // new note (author + date default), so the item's Notes subtab keeps history.
+    // The quantity is captured in the note body since it can't be a per-unit tag.
+    // Input: { itemId, quantity, note }. itemId comes from the item typeahead.
+    const saveNonSerializedItemNote = (data) => {
+        try {
+            const itemId = data && data.itemId ? String(data.itemId).trim() : '';
+            const qty = parseInt(data && data.quantity, 10) || 0;
+            const noteText = String((data && data.note) || '').trim();
+            if (!itemId) return { success: false, message: 'Select an item from the list.' };
+            if (qty <= 0) return { success: false, message: 'Enter a valid quantity.' };
+            if (!noteText) return { success: false, message: 'Enter a note.' };
+
+            // Confirm the item exists and grab its name for the title/response.
+            let itemName = '';
+            try {
+                const l = search.lookupFields({ type: search.Type.ITEM, id: itemId, columns: ['itemid'] });
+                itemName = l.itemid || '';
+            } catch (e) {
+                return { success: false, message: 'Item not found.' };
+            }
+
+            const body = 'Qty: ' + qty + '\n' + noteText;
+            let title = 'WH Note — Qty ' + qty + (itemName ? ' — ' + itemName : '');
+            if (title.length > 90) title = title.slice(0, 90); // note title is length-limited
+
+            const noteRec = record.create({ type: 'note' });
+            noteRec.setValue({ fieldId: 'title', value: title });
+            noteRec.setValue({ fieldId: 'note',  value: body });
+            noteRec.setValue({ fieldId: 'item',  value: itemId });
+            const noteId = noteRec.save();
+
+            log.audit('NS Item Note Saved', 'Item ' + itemId + ' (' + itemName + '), qty ' + qty + ', note ' + noteId);
+            return { success: true, noteId: noteId, itemName: itemName };
+        } catch (e) {
+            log.error('saveNonSerializedItemNote Error', e.message);
+            return { success: false, message: e.message };
+        }
     };
 
     // ═══════════════════════════════════════════════════════════
@@ -5356,6 +5619,8 @@ define([
         const RETURN_TO_VENDOR_STATUS_ID = 21;
         const NOT_COUNTED_BIN_ID = 4278;
         const NOT_COUNTED_STATUS_ID = 14;
+        const INCOMPLETE_BIN_ID = 4806;
+        const INCOMPLETE_STATUS_ID = 23;
         const AMAZON_PICK_BIN_ID = 4809;
 
         // ====================================================================
@@ -5858,7 +6123,83 @@ define([
             return { adjId: adjId, tranId: tranId };
         }
 
-        function createBinTransfer(groups, memo) {
+        // ====================================================================
+        // OPTIONAL TRASH PHOTO
+        // A photo the scanner attaches when sending stock to Trash. It is saved
+        // to File Cabinet folder -10 and its internal id is stamped on the Bin
+        // Transfer's custbody_bin_transfer_image (a Document field — it references
+        // a File Cabinet file by internal id, and unlike an Image field it can
+        // reference files in the system folder -10). We still only accept image
+        // file types. Everything here is best-effort: a bad/oversized image never
+        // blocks the transfer — it just isn't attached.
+        // ====================================================================
+        // Normal File Cabinet folder "Trash Folder". Must NOT be a system folder
+        // (e.g. -10 "Attachments Received"): file-reference custom fields reject
+        // files stored in system folders as an "Invalid Field Value".
+        const TRASH_IMAGE_FOLDER_ID = 17353638;
+        const TRASH_IMAGE_FIELD_ID = 'custbody_bin_transfer_image';
+
+        // dataUrl is a browser FileReader/canvas result: "data:image/jpeg;base64,AAAA...".
+        // Returns the saved file's internal id, or null when nothing usable was supplied.
+        function saveTrashImageFile(dataUrl, fileName) {
+            if (!dataUrl) return null;
+            try {
+                const m = String(dataUrl).match(/^data:([^;]+);base64,(.*)$/);
+                if (!m) return null;
+                const mime = String(m[1]).toLowerCase();
+                const base64 = m[2];
+                if (!base64) return null;
+                const typeMap = {
+                    'image/jpeg': file.Type.JPGIMAGE,
+                    'image/jpg':  file.Type.JPGIMAGE,
+                    'image/png':  file.Type.PNGIMAGE,
+                    'image/gif':  file.Type.GIFIMAGE,
+                    'image/bmp':  file.Type.BMPIMAGE,
+                    'image/tiff': file.Type.TIFFIMAGE
+                };
+                const fileType = typeMap[mime];
+                if (!fileType) return null; // Image fields only accept image files
+                const ext = mime.split('/')[1].replace('jpeg', 'jpg');
+                // Unique, filesystem-safe name so File Cabinet never rejects a duplicate.
+                const stamp = new Date().getTime();
+                let base = String(fileName || 'bin_transfer_trash').replace(/\.[^.]+$/, '').replace(/[^A-Za-z0-9_\-]+/g, '_');
+                if (!base) base = 'bin_transfer_trash';
+                const img = file.create({
+                    name: base + '_' + stamp + '.' + ext,
+                    fileType: fileType,
+                    contents: base64,
+                    folder: TRASH_IMAGE_FOLDER_ID,
+                    description: 'Bin Transfer trash photo (WH Assistant)'
+                });
+                return img.save();
+            } catch (e) {
+                log.error('saveTrashImageFile failed', e.message);
+                return null;
+            }
+        }
+
+        // Save a Bin Transfer that may carry an optional Trash photo. The image is
+        // stamped only when the transfer actually moves stock to Trash. Critically,
+        // an Image field is validated at SAVE time (not setValue time), so if
+        // NetSuite ever rejects the file we drop the image and re-save — the stock
+        // move must never fail because of a photo.
+        function saveBinTransferWithImage(rec, imageFileId, isTrash) {
+            const wantImage = !!(imageFileId && isTrash);
+            if (wantImage) {
+                try { rec.setValue({ fieldId: TRASH_IMAGE_FIELD_ID, value: imageFileId }); }
+                catch (e) { log.error('set trash image failed', e.message); }
+            }
+            try {
+                return rec.save({ enableSourcing: true, ignoreMandatoryFields: false });
+            } catch (saveErr) {
+                if (!wantImage) throw saveErr;
+                log.error('Bin transfer save failed with image, retrying without it', saveErr.message);
+                try { rec.setValue({ fieldId: TRASH_IMAGE_FIELD_ID, value: '' }); } catch (e2) {}
+                return rec.save({ enableSourcing: true, ignoreMandatoryFields: false });
+            }
+        }
+
+        function createBinTransfer(groups, memo, imageFileId) {
             const transferRecord = record.create({ type: record.Type.BIN_TRANSFER, isDynamic: true });
             transferRecord.setValue({ fieldId: 'subsidiary', value: '1' });
             transferRecord.setValue({ fieldId: 'memo', value: memo || 'Via WH Assistant' });
@@ -5870,6 +6211,7 @@ define([
                 if (group.action === 'move_testing') { toBinId = TESTING_BIN_ID; toStatusId = TESTING_STATUS_ID; }
                 else if (group.action === 'move_refurbishing') { toBinId = REFURBISHING_BIN_ID; toStatusId = REFURBISHING_STATUS_ID; }
                 else if (group.action === 'move_not_counted') { toBinId = NOT_COUNTED_BIN_ID; toStatusId = NOT_COUNTED_STATUS_ID; }
+                else if (group.action === 'incomplete') { toBinId = INCOMPLETE_BIN_ID; toStatusId = INCOMPLETE_STATUS_ID; }
                 else if (group.action === 'back_to_stock') { toBinId = getBackToStockBinId(); toStatusId = BACK_TO_STOCK_STATUS_ID; }
                 else if (group.action === 'defective') { toBinId = DEFECTIVE_BIN_ID; toStatusId = DEFECTIVE_STATUS_ID; }
                 else if (group.action === 'trash') { toBinId = TRASH_BIN_ID; toStatusId = TRASH_STATUS_ID; }
@@ -5892,7 +6234,7 @@ define([
                 transferRecord.commitLine({ sublistId: 'inventory' });
             });
 
-            const transferId = transferRecord.save({ enableSourcing: true, ignoreMandatoryFields: false });
+            const transferId = saveBinTransferWithImage(transferRecord, imageFileId, groups.some(g => g.action === 'trash'));
             let tranId = String(transferId);
             try { const l = search.lookupFields({ type: record.Type.BIN_TRANSFER, id: transferId, columns: ['tranid'] }); tranId = l.tranid || String(transferId); } catch (e) {}
             return { transferId: transferId, tranId: tranId };
@@ -5986,7 +6328,7 @@ define([
             return { adjId: adjId, tranId: tranId };
         }
 
-        function createNonSerializedBinTransfer(data, memo) {
+        function createNonSerializedBinTransfer(data, memo, imageFileId) {
             const tr = record.create({ type: record.Type.BIN_TRANSFER, isDynamic: true });
             tr.setValue({ fieldId: 'subsidiary', value: '1' });
             tr.setValue({ fieldId: 'memo', value: memo || 'Via WH Assistant' });
@@ -6002,7 +6344,7 @@ define([
             if (data.toStatusId) invDetail.setCurrentSublistValue({ sublistId: 'inventoryassignment', fieldId: 'toinventorystatus', value: data.toStatusId });
             invDetail.commitLine({ sublistId: 'inventoryassignment' });
             tr.commitLine({ sublistId: 'inventory' });
-            const transferId = tr.save({ enableSourcing: true, ignoreMandatoryFields: false });
+            const transferId = saveBinTransferWithImage(tr, imageFileId, data.action === 'trash');
             let tranId = String(transferId);
             try { const l = search.lookupFields({ type: record.Type.BIN_TRANSFER, id: transferId, columns: ['tranid'] }); tranId = l.tranid || String(transferId); } catch (e) {}
             return { transferId: transferId, tranId: tranId };
@@ -6035,7 +6377,7 @@ define([
             }
         }
 
-        function createNonSerializedBinTransferMulti(rows, memo) {
+        function createNonSerializedBinTransferMulti(rows, memo, imageFileId) {
             const tr = record.create({ type: record.Type.BIN_TRANSFER, isDynamic: true });
             tr.setValue({ fieldId: 'subsidiary', value: '1' });
             tr.setValue({ fieldId: 'memo', value: memo || 'Via WH Assistant' });
@@ -6057,7 +6399,7 @@ define([
                 invDetail.commitLine({ sublistId: 'inventoryassignment' });
                 tr.commitLine({ sublistId: 'inventory' });
             });
-            const transferId = tr.save({ enableSourcing: true, ignoreMandatoryFields: false });
+            const transferId = saveBinTransferWithImage(tr, imageFileId, rows.some(function(r) { return r.action === 'trash'; }));
             let tranId = String(transferId);
             try { const l = search.lookupFields({ type: record.Type.BIN_TRANSFER, id: transferId, columns: ['tranid'] }); tranId = l.tranid || String(transferId); } catch (e) {}
             return { transferId: transferId, tranId: tranId };
@@ -6466,6 +6808,69 @@ define([
         // ====================================================================
         // STYLES — v2 (modern, mobile-first, scanner-optimized)
         // ====================================================================
+
+        // ====================================================================
+        // OPTIONAL TRASH PHOTO — shared client-side helper
+        // Defines two globals used by both the serialized results page and the
+        // non-serialized entry form:
+        //   __whCompressPhoto(file, cb)  — downscale to <=1600px, JPEG q0.70.
+        //     Compression keeps the base64 payload small enough to ride through
+        //     a normal form POST (a raw phone photo would be far too large).
+        //   __whHandlePhoto(inputId, hiddenId, nameId, statusId) — wire a file
+        //     input to stash the compressed data-URL into a hidden field.
+        // ====================================================================
+        function getTrashPhotoHelperJs() {
+            return `
+            <script>
+                function __whCompressPhoto(f, cb) {
+                    var reader = new FileReader();
+                    reader.onload = function(e) {
+                        var img = new Image();
+                        img.onload = function() {
+                            try {
+                                var MAXDIM = 1600;
+                                var w = img.naturalWidth || img.width, h = img.naturalHeight || img.height;
+                                var scale = Math.min(1, MAXDIM / Math.max(w, h));
+                                var cw = Math.max(1, Math.round(w * scale)), ch = Math.max(1, Math.round(h * scale));
+                                var canvas = document.createElement('canvas');
+                                canvas.width = cw; canvas.height = ch;
+                                canvas.getContext('2d').drawImage(img, 0, 0, cw, ch);
+                                cb(null, canvas.toDataURL('image/jpeg', 0.70));
+                            } catch (err) { cb(err); }
+                        };
+                        img.onerror = function() { cb(new Error('decode failed')); };
+                        img.src = e.target.result;
+                    };
+                    reader.onerror = function() { cb(new Error('read failed')); };
+                    reader.readAsDataURL(f);
+                }
+                function __whHandlePhoto(inputId, hiddenId, nameId, statusId) {
+                    var inp = document.getElementById(inputId);
+                    var hid = document.getElementById(hiddenId);
+                    var nm  = document.getElementById(nameId);
+                    var st  = document.getElementById(statusId);
+                    if (hid) hid.value = '';
+                    if (nm) nm.value = '';
+                    if (!inp || !inp.files || !inp.files.length) { if (st) st.textContent = ''; return; }
+                    var f = inp.files[0];
+                    if (String(f.type).indexOf('image/') !== 0) { alert('Please choose an image file.'); inp.value = ''; if (st) st.textContent = ''; return; }
+                    if (st) st.textContent = 'Processing photo…';
+                    __whCompressPhoto(f, function(err, dataUrl) {
+                        if (err || !dataUrl) { if (st) st.textContent = 'Could not read photo — try again'; return; }
+                        if (hid) hid.value = dataUrl;
+                        var base = String(f.name || 'trash_photo').replace(/\\.[^.]+$/, '');
+                        if (nm) nm.value = base + '.jpg';
+                        if (st) st.textContent = '✓ Photo attached (' + Math.round(dataUrl.length / 1024) + ' KB)';
+                    });
+                }
+                function __whClearPhoto(inputId, hiddenId, nameId, statusId) {
+                    var inp = document.getElementById(inputId); if (inp) inp.value = '';
+                    var hid = document.getElementById(hiddenId); if (hid) hid.value = '';
+                    var nm  = document.getElementById(nameId); if (nm) nm.value = '';
+                    var st  = document.getElementById(statusId); if (st) st.textContent = '';
+                }
+            </script>`;
+        }
 
         function getStyles() {
             return `
@@ -6929,6 +7334,7 @@ define([
                         + '<option value="move_refurbishing">Move to Refurbishing</option>'
                         + '<option value="move_testing">Move to Testing</option>'
                         + '<option value="move_not_counted">Move to Not Counted</option>'
+                        + '<option value="incomplete">Incomplete</option>'
                         + '<option value="part_number_change">Part Number Change</option>'
                         + '<option value="part_number_change_stock">Part Number Change &amp; Back to Stock</option>'
                         + '<option value="return_to_vendor">Return to Vendor</option>'
@@ -7006,6 +7412,7 @@ define([
                         var tbody = document.getElementById('ns-grid-body');
                         var countEl = document.getElementById('ns_row_count');
                         if (tbody && countEl) countEl.textContent = tbody.children.length;
+                        updateNsTrashPhotoVisibility();
                     }
 
                     function clearNsGrid() {
@@ -7045,6 +7452,20 @@ define([
                         // Cue the Status field: amber when a Back-to-Stock action needs a status.
                         var soEl = row.querySelector('.ns-status-override');
                         if (soEl) soEl.style.borderColor = (_nsIsBackToStockAction(selectEl.value) && !soEl.value) ? '#f59e0b' : '#d1d5db';
+                        updateNsTrashPhotoVisibility();
+                    }
+
+                    // Show the optional Trash-photo picker only while at least one NS
+                    // grid row (or the bulk selector) is set to Trash.
+                    function updateNsTrashPhotoVisibility() {
+                        var anyTrash = false;
+                        var selects = document.querySelectorAll('#ns-grid-body .ns-action-input');
+                        for (var i = 0; i < selects.length; i++) { if (selects[i].value === 'trash') { anyTrash = true; break; } }
+                        var bulk = document.getElementById('ns-bulk-action');
+                        if (bulk && bulk.value === 'trash') anyTrash = true;
+                        var row = document.getElementById('ns-trash-photo-row');
+                        if (row) row.style.display = anyTrash ? 'block' : 'none';
+                        if (!anyTrash) __whClearPhoto('ns-trash-photo-input','custpage_ns_trash_image','custpage_ns_trash_image_name','ns-trash-photo-status');
                     }
 
                     // ── Apply same action to all NS rows (mirrors serialized page) ──
@@ -7057,6 +7478,7 @@ define([
 
                         var selects = document.querySelectorAll('#ns-grid-body .ns-action-input');
                         for (var i = 0; i < selects.length; i++) { selects[i].value = value; handleNsActionChange(selects[i]); }
+                        updateNsTrashPhotoVisibility();
 
                         if (isPnc) {
                             var bulkItemName = bulkNewItem ? bulkNewItem.value.trim() : '';
@@ -7526,6 +7948,19 @@ define([
                         for (var i = 0; i < selects.length; i++) { if (selects[i].value !== '') count++; }
                         var display = document.getElementById('action_count');
                         if (display) display.textContent = count;
+                        updateTrashPhotoVisibility();
+                    }
+
+                    // Show the optional Trash-photo picker only while at least one row
+                    // is set to Trash. Clear any staged photo when Trash is deselected
+                    // so it never rides along with a non-Trash submit.
+                    function updateTrashPhotoVisibility() {
+                        var selects = document.querySelectorAll('select.action-select[data-index]');
+                        var anyTrash = false;
+                        for (var i = 0; i < selects.length; i++) { if (selects[i].value === 'trash') { anyTrash = true; break; } }
+                        var row = document.getElementById('trash-photo-row');
+                        if (row) row.style.display = anyTrash ? 'flex' : 'none';
+                        if (!anyTrash) __whClearPhoto('trash-photo-input','custpage_trash_image','custpage_trash_image_name','trash-photo-status');
                     }
 
                     function submitActions() {
@@ -7677,7 +8112,7 @@ define([
             const suiteletUrl = url.resolveScript({ scriptId: runtime.getCurrentScript().id, deploymentId: runtime.getCurrentScript().deploymentId });
 
             const styleField = form.addField({ id: 'custpage_styles', type: serverWidget.FieldType.INLINEHTML, label: ' ' });
-            styleField.defaultValue = getStyles() + getEntryFormScript(suiteletUrl) + getAutocompleteJs();
+            styleField.defaultValue = getStyles() + getTrashPhotoHelperJs() + getEntryFormScript(suiteletUrl) + getAutocompleteJs();
 
             let msgHtml = '';
             if (message) {
@@ -7731,6 +8166,13 @@ define([
                                     <label class="custom-label">Memo (optional)</label>
                                     <input type="text" id="ns_memo" placeholder="Add a note to all transactions..." maxlength="255"
                                         style="width:100%;padding:12px 14px;border:1.5px solid #d1d5db;border-radius:8px;font-size:15px;color:#374151;min-height:44px;">
+                                </div>
+                                <div id="ns-trash-photo-row" class="input-group" style="display:none;margin-top:14px;margin-bottom:0;">
+                                    <label class="custom-label">🗑️ Trash photo <span style="font-weight:400;color:#9ca3af;">(optional)</span></label>
+                                    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+                                        <input type="file" id="ns-trash-photo-input" accept="image/*" capture="environment" onchange="__whHandlePhoto('ns-trash-photo-input','custpage_ns_trash_image','custpage_ns_trash_image_name','ns-trash-photo-status')" style="flex:1;min-width:160px;font-size:14px;">
+                                        <span id="ns-trash-photo-status" style="font-size:12px;color:#6b7280;"></span>
+                                    </div>
                                 </div>
                             </div>
 
@@ -7804,6 +8246,7 @@ define([
             nsActionField.addSelectOption({ value: 'move_refurbishing', text: 'Move to Refurbishing' });
             nsActionField.addSelectOption({ value: 'move_testing', text: 'Move to Testing' });
             nsActionField.addSelectOption({ value: 'move_not_counted', text: 'Move to Not Counted' });
+            nsActionField.addSelectOption({ value: 'incomplete', text: 'Incomplete' });
             nsActionField.addSelectOption({ value: 'part_number_change', text: 'Part Number Change' });
             nsActionField.addSelectOption({ value: 'part_number_change_stock', text: 'Part Number Change & Back to Stock' });
             nsActionField.addSelectOption({ value: 'return_to_vendor', text: 'Return to Vendor' });
@@ -7818,6 +8261,11 @@ define([
             nsCartDataField.updateDisplayType({ displayType: serverWidget.FieldDisplayType.HIDDEN }); nsCartDataField.defaultValue = '';
             const nsMemoField = form.addField({ id: 'custpage_ns_memo', type: serverWidget.FieldType.TEXT, label: 'NS Memo' });
             nsMemoField.updateDisplayType({ displayType: serverWidget.FieldDisplayType.HIDDEN }); nsMemoField.defaultValue = '';
+            // Optional Trash photo for non-serialized Trash transfers (base64 + name).
+            const nsTrashImgField = form.addField({ id: 'custpage_ns_trash_image', type: serverWidget.FieldType.LONGTEXT, label: 'NS Trash Image' });
+            nsTrashImgField.updateDisplayType({ displayType: serverWidget.FieldDisplayType.HIDDEN }); nsTrashImgField.defaultValue = '';
+            const nsTrashImgNameField = form.addField({ id: 'custpage_ns_trash_image_name', type: serverWidget.FieldType.TEXT, label: 'NS Trash Image Name' });
+            nsTrashImgNameField.updateDisplayType({ displayType: serverWidget.FieldDisplayType.HIDDEN }); nsTrashImgNameField.defaultValue = '';
             const ifMemoField = form.addField({ id: 'custpage_if_memo', type: serverWidget.FieldType.TEXT, label: 'IF Memo' });
             ifMemoField.updateDisplayType({ displayType: serverWidget.FieldDisplayType.HIDDEN }); ifMemoField.defaultValue = '';
             const ifBinField = form.addField({ id: 'custpage_if_bin', type: serverWidget.FieldType.TEXT, label: 'IF Bin' });
@@ -7856,7 +8304,7 @@ define([
             const suiteletUrl = url.resolveScript({ scriptId: runtime.getCurrentScript().id, deploymentId: runtime.getCurrentScript().deploymentId });
 
             const styleField = form.addField({ id: 'custpage_styles', type: serverWidget.FieldType.INLINEHTML, label: ' ' });
-            styleField.defaultValue = getStyles() + getResultsPageScript(suiteletUrl);
+            styleField.defaultValue = getStyles() + getTrashPhotoHelperJs() + getResultsPageScript(suiteletUrl);
 
             let rows = '';
             const statusOverrideOptions = getStatusOverrideOptionsHtml();
@@ -7881,6 +8329,7 @@ define([
                     + '<option value="move_refurbishing">Move to Refurbishing</option>'
                     + '<option value="move_testing">Move to Testing</option>'
                     + '<option value="move_not_counted">Move to Not Counted</option>'
+                    + '<option value="incomplete">Incomplete</option>'
                     + '<option value="part_number_change">Part Number Change</option>'
                     + '<option value="part_number_change_stock">Part Number Change &amp; Back to Stock</option>'
                     + '<option value="part_serial_change">Part &amp; Serial Change</option>'
@@ -7931,6 +8380,7 @@ define([
                                     <option value="move_refurbishing">Move to Refurbishing</option>
                                     <option value="move_testing">Move to Testing</option>
                                     <option value="move_not_counted">Move to Not Counted</option>
+                                    <option value="incomplete">Incomplete</option>
                                     <option value="part_number_change">Part Number Change</option>
                                     <option value="part_number_change_stock">Part Number Change &amp; Back to Stock</option>
                                     <option value="part_serial_change">Part &amp; Serial Change</option>
@@ -7955,6 +8405,11 @@ define([
                                         <button type="button" class="custom-btn btn-success" style="padding:10px 20px;margin:0;" onclick="submitActions()">Submit</button>
                                         <button type="button" class="custom-btn btn-outline" style="padding:10px 20px;margin:0;" onclick="goBack()">Back</button>
                                     </div>
+                                </div>
+                                <div id="trash-photo-row" style="display:none;align-items:center;gap:10px;flex-wrap:wrap;width:100%;margin-top:8px;padding-top:8px;border-top:1px dashed #e5e7eb;">
+                                    <label style="color:#6b7280;font-weight:600;font-size:13px;">🗑️ Trash photo <span style="font-weight:400;color:#9ca3af;">(optional)</span>:</label>
+                                    <input type="file" id="trash-photo-input" accept="image/*" capture="environment" onchange="__whHandlePhoto('trash-photo-input','custpage_trash_image','custpage_trash_image_name','trash-photo-status')" style="flex:1;min-width:160px;font-size:14px;">
+                                    <span id="trash-photo-status" style="font-size:12px;color:#6b7280;"></span>
                                 </div>
                             </div>
                             <table class="results-table">
@@ -7983,6 +8438,14 @@ define([
             const memoField = form.addField({ id: 'custpage_memo', type: serverWidget.FieldType.TEXT, label: 'Memo' });
             memoField.updateDisplayType({ displayType: serverWidget.FieldDisplayType.HIDDEN });
             memoField.defaultValue = '';
+            // Optional Trash photo (base64 data-URL + original file name), populated
+            // client-side only when a Trash action is chosen.
+            const trashImgField = form.addField({ id: 'custpage_trash_image', type: serverWidget.FieldType.LONGTEXT, label: 'Trash Image' });
+            trashImgField.updateDisplayType({ displayType: serverWidget.FieldDisplayType.HIDDEN });
+            trashImgField.defaultValue = '';
+            const trashImgNameField = form.addField({ id: 'custpage_trash_image_name', type: serverWidget.FieldType.TEXT, label: 'Trash Image Name' });
+            trashImgNameField.updateDisplayType({ displayType: serverWidget.FieldDisplayType.HIDDEN });
+            trashImgNameField.defaultValue = '';
 
             context.response.writePage(form);
         }
@@ -8018,7 +8481,7 @@ define([
             const ACTION_LABELS = {
                 'back_to_stock':'Back to Stock','defective':'Defective','likenew':'Like New',
                 'likenew_stock':'Like New + Back to Stock','move_refurbishing':'Move to Refurbishing',
-                'move_testing':'Move to Testing','move_not_counted':'Move to Not Counted','return_to_vendor':'Return to Vendor',
+                'move_testing':'Move to Testing','move_not_counted':'Move to Not Counted','incomplete':'Incomplete','return_to_vendor':'Return to Vendor',
                 'serial_change':'Serial Number Change','serial_change_stock':'Change Serial & Back to Stock',
                 'part_number_change':'Part Number Change','part_number_change_stock':'Part Number Change & Back to Stock',
                 'part_serial_change':'Part & Serial Change','part_serial_change_stock':'Part & Serial Change & Back to Stock',
@@ -8102,7 +8565,7 @@ define([
             const printRecordIdField = form.addField({ id: 'custpage_print_record_id', type: serverWidget.FieldType.TEXT, label: 'Print Record ID' });
             printRecordIdField.updateDisplayType({ displayType: serverWidget.FieldDisplayType.HIDDEN }); printRecordIdField.defaultValue = String(recordIdForPrint);
 
-            const ACTION_LABELS = {'back_to_stock':'Back to Stock','defective':'Defective','likenew':'Change to Like New','likenew_stock':'Change to Like New & Back to Stock','move_refurbishing':'Move to Refurbishing','move_testing':'Move to Testing','move_not_counted':'Move to Not Counted','return_to_vendor':'Return to Vendor','trash':'Trash','inventory_found':'Inventory Found','bin_putaway':'Bin Putaway'};
+            const ACTION_LABELS = {'back_to_stock':'Back to Stock','defective':'Defective','likenew':'Change to Like New','likenew_stock':'Change to Like New & Back to Stock','move_refurbishing':'Move to Refurbishing','move_testing':'Move to Testing','move_not_counted':'Move to Not Counted','incomplete':'Incomplete','return_to_vendor':'Return to Vendor','trash':'Trash','inventory_found':'Inventory Found','bin_putaway':'Bin Putaway'};
 
             let transactionInfoHtml = '';
             if (adjustmentTranId) transactionInfoHtml += '<p style="font-size:15px;margin:6px 0;color:#1a4971;"><strong>Inv. Adjustment:</strong> ' + escapeXml(String(adjustmentTranId)) + '</p>';
@@ -8140,7 +8603,7 @@ define([
             const printRecordIdField = form.addField({ id: 'custpage_print_record_id', type: serverWidget.FieldType.TEXT, label: 'Print Record ID' });
             printRecordIdField.updateDisplayType({ displayType: serverWidget.FieldDisplayType.HIDDEN }); printRecordIdField.defaultValue = String(recordIdForPrint);
 
-            const ACTION_LABELS = {'back_to_stock':'Back to Stock','defective':'Defective','likenew':'Change to Like New','likenew_stock':'Change to Like New & Back to Stock','move_refurbishing':'Move to Refurbishing','move_testing':'Move to Testing','move_not_counted':'Move to Not Counted','part_number_change':'Part Number Change','part_number_change_stock':'Part Number Change & Back to Stock','return_to_vendor':'Return to Vendor','trash':'Trash','inventory_found':'Inventory Found','bin_putaway':'Bin Putaway','transfer_upcharge':'Transfer to A & Upcharge'};
+            const ACTION_LABELS = {'back_to_stock':'Back to Stock','defective':'Defective','likenew':'Change to Like New','likenew_stock':'Change to Like New & Back to Stock','move_refurbishing':'Move to Refurbishing','move_testing':'Move to Testing','move_not_counted':'Move to Not Counted','incomplete':'Incomplete','part_number_change':'Part Number Change','part_number_change_stock':'Part Number Change & Back to Stock','return_to_vendor':'Return to Vendor','trash':'Trash','inventory_found':'Inventory Found','bin_putaway':'Bin Putaway','transfer_upcharge':'Transfer to A & Upcharge'};
 
             let transactionInfoHtml = '';
             if (adjustmentTranId) transactionInfoHtml += '<p style="font-size:15px;margin:6px 0;color:#1a4971;"><strong>Inv. Adjustment:</strong> ' + escapeXml(String(adjustmentTranId)) + '</p>';
@@ -8252,7 +8715,7 @@ define([
             } catch (dupErr) { log.error('WH Assistant duplicate-serial guard failed', dupErr.message); }
 
             const ADJUSTMENT_ACTIONS = ['likenew', 'likenew_stock'];
-            const BIN_TRANSFER_ACTIONS = ['move_testing', 'move_refurbishing', 'move_not_counted', 'back_to_stock', 'defective', 'trash', 'return_to_vendor'];
+            const BIN_TRANSFER_ACTIONS = ['move_testing', 'move_refurbishing', 'move_not_counted', 'incomplete', 'back_to_stock', 'defective', 'trash', 'return_to_vendor'];
             const SERIAL_CHANGE_ACTIONS = ['serial_change', 'serial_change_stock'];
             const PART_NUMBER_CHANGE_ACTIONS = ['part_number_change', 'part_number_change_stock'];
             const PART_SERIAL_CHANGE_ACTIONS = ['part_serial_change', 'part_serial_change_stock'];
@@ -8368,7 +8831,18 @@ define([
                 if (result.failed.length > 0) errors.push(result.failed.length + ' adjustment group(s) failed');
             }
             if (binTransferGroups.length > 0) {
-                const result = tryBatchThenIndividual(binTransferGroups, createBinTransfer, userMemo || 'Via WH Assistant');
+                // Optional Trash photo — only saved when a Trash bin transfer is
+                // actually being created. createBinTransfer stamps it only on the
+                // transfer(s) that move stock to Trash.
+                let trashImageFileId = null;
+                if (binTransferGroups.some(g => g.action === 'trash')) {
+                    trashImageFileId = saveTrashImageFile(
+                        context.request.parameters.custpage_trash_image || '',
+                        context.request.parameters.custpage_trash_image_name || ''
+                    );
+                }
+                const btCreateFn = (grps, m) => createBinTransfer(grps, m, trashImageFileId);
+                const result = tryBatchThenIndividual(binTransferGroups, btCreateFn, userMemo || 'Via WH Assistant');
                 if (result.tranIds.length > 0) binTransferTranId = result.tranIds.join(', ');
                 result.succeeded.forEach(g => {
                     let ex = labelGroups.find(lg => lg.itemId === g.itemId && lg.action === g.action);
@@ -8515,7 +8989,7 @@ define([
             if (!itemDetails) { createEntryForm(context, 'Could not find item details.', 'error'); return; }
 
             const ADJUSTMENT_ACTIONS = ['likenew', 'likenew_stock'];
-            const BIN_TRANSFER_ACTIONS = ['move_testing', 'move_refurbishing', 'move_not_counted', 'back_to_stock', 'defective', 'trash', 'return_to_vendor'];
+            const BIN_TRANSFER_ACTIONS = ['move_testing', 'move_refurbishing', 'move_not_counted', 'incomplete', 'back_to_stock', 'defective', 'trash', 'return_to_vendor'];
             const INVENTORY_FOUND_ACTIONS = ['inventory_found'];
             let adjustmentTranId = null, binTransferTranId = null, inventoryFoundTranId = null;
             let labelItemDetails = itemDetails;
@@ -8537,12 +9011,17 @@ define([
                 if (action === 'move_testing') { toBinId = TESTING_BIN_ID; toStatusId = TESTING_STATUS_ID; }
                 else if (action === 'move_refurbishing') { toBinId = REFURBISHING_BIN_ID; toStatusId = REFURBISHING_STATUS_ID; }
                 else if (action === 'move_not_counted') { toBinId = NOT_COUNTED_BIN_ID; toStatusId = NOT_COUNTED_STATUS_ID; }
+                else if (action === 'incomplete') { toBinId = INCOMPLETE_BIN_ID; toStatusId = INCOMPLETE_STATUS_ID; }
                 else if (action === 'back_to_stock') { toBinId = getBackToStockBinId(); toStatusId = BACK_TO_STOCK_STATUS_ID; }
                 else if (action === 'defective') { toBinId = DEFECTIVE_BIN_ID; toStatusId = DEFECTIVE_STATUS_ID; }
                 else if (action === 'trash') { toBinId = TRASH_BIN_ID; toStatusId = TRASH_STATUS_ID; }
                 else if (action === 'return_to_vendor') { toBinId = RETURN_TO_VENDOR_BIN_ID; toStatusId = RETURN_TO_VENDOR_STATUS_ID; }
                 try {
-                    const r = createNonSerializedBinTransfer({ itemId: itemId, locationId: locationId, quantity: quantity, fromBinId: fromBinId, toBinId: toBinId, toStatusId: toStatusId }, userMemo || 'Via WH Assistant');
+                    // Optional Trash photo (only when trashing) → File Cabinet folder -10.
+                    const nsTrashImageId = (action === 'trash')
+                        ? saveTrashImageFile(context.request.parameters.custpage_ns_trash_image || '', context.request.parameters.custpage_ns_trash_image_name || '')
+                        : null;
+                    const r = createNonSerializedBinTransfer({ itemId: itemId, locationId: locationId, quantity: quantity, fromBinId: fromBinId, toBinId: toBinId, toStatusId: toStatusId, action: action }, userMemo || 'Via WH Assistant', nsTrashImageId);
                     binTransferTranId = r.tranId;
                 } catch (e) { log.error('NS Bin Transfer Error', e.message); createEntryForm(context, 'Bin transfer failed: ' + e.message, 'error'); return; }
             } else if (INVENTORY_FOUND_ACTIONS.includes(action)) {
@@ -8563,7 +9042,7 @@ define([
             if (!cartRows || cartRows.length === 0) { createEntryForm(context, 'No items in the grid.', 'warning'); return; }
 
             const ADJUSTMENT_ACTIONS = ['likenew', 'likenew_stock'];
-            const BIN_TRANSFER_ACTIONS = ['move_testing', 'move_refurbishing', 'move_not_counted', 'back_to_stock', 'defective', 'trash', 'return_to_vendor'];
+            const BIN_TRANSFER_ACTIONS = ['move_testing', 'move_refurbishing', 'move_not_counted', 'incomplete', 'back_to_stock', 'defective', 'trash', 'return_to_vendor'];
             const INVENTORY_FOUND_ACTIONS = ['inventory_found'];
             const TRANSFER_UPCHARGE_ACTIONS = ['transfer_upcharge'];
             const PART_NUMBER_CHANGE_ACTIONS = ['part_number_change', 'part_number_change_stock'];
@@ -8594,6 +9073,7 @@ define([
                     if (action === 'move_testing') { toBinId = TESTING_BIN_ID; toStatusId = TESTING_STATUS_ID; }
                     else if (action === 'move_refurbishing') { toBinId = REFURBISHING_BIN_ID; toStatusId = REFURBISHING_STATUS_ID; }
                     else if (action === 'move_not_counted') { toBinId = NOT_COUNTED_BIN_ID; toStatusId = NOT_COUNTED_STATUS_ID; }
+                    else if (action === 'incomplete') { toBinId = INCOMPLETE_BIN_ID; toStatusId = INCOMPLETE_STATUS_ID; }
                     else if (action === 'back_to_stock') { toBinId = getBackToStockBinId(); toStatusId = BACK_TO_STOCK_STATUS_ID; }
                     else if (action === 'defective') { toBinId = DEFECTIVE_BIN_ID; toStatusId = DEFECTIVE_STATUS_ID; }
                     else if (action === 'trash') { toBinId = TRASH_BIN_ID; toStatusId = TRASH_STATUS_ID; }
@@ -8633,7 +9113,16 @@ define([
                 if (result.failed.length > 0) errors.push(result.failed.length + ' adjustment row(s) failed');
             }
             if (binTransferRows.length > 0) {
-                const result = tryBatchThenIndividual(binTransferRows, createNonSerializedBinTransferMulti, userMemo || 'Via WH Assistant');
+                // Optional Trash photo — saved once, stamped only on Trash transfers.
+                let nsTrashImageId = null;
+                if (binTransferRows.some(function(r) { return r.action === 'trash'; })) {
+                    nsTrashImageId = saveTrashImageFile(
+                        context.request.parameters.custpage_ns_trash_image || '',
+                        context.request.parameters.custpage_ns_trash_image_name || ''
+                    );
+                }
+                const nsBtCreateFn = function(rws, m) { return createNonSerializedBinTransferMulti(rws, m, nsTrashImageId); };
+                const result = tryBatchThenIndividual(binTransferRows, nsBtCreateFn, userMemo || 'Via WH Assistant');
                 if (result.tranIds.length > 0) binTransferTranId = result.tranIds.join(', ');
                 result.succeeded.forEach(function(row) { processedItems.push({ itemText: row.itemText, description: row.description, quantity: row.quantity, action: row.action }); });
                 result.failed.forEach(function(row) { failedItems.push({ itemText: row.itemText, description: row.description, quantity: row.quantity, action: row.action, error: row._error || 'Bin transfer failed' }); });
@@ -10507,6 +10996,27 @@ define([
                     color: #0D1F4E !important;
                     box-shadow: 0 1px 3px rgba(0,0,0,.08);
                 }
+                .il-box-slot { margin: 10px 0 4px; }
+                .il-box-btn {
+                    display: inline-flex; align-items: center; gap: 6px;
+                    width: 100%; justify-content: center;
+                    padding: 12px 16px; min-height: 48px;
+                    border: none; border-radius: 10px;
+                    background: #2A9D58; color: #fff;
+                    font-size: 15px; font-weight: 700; cursor: pointer;
+                    box-shadow: 0 1px 3px rgba(0,0,0,.12);
+                    transition: background .15s, transform .05s;
+                }
+                .il-box-btn:hover { background: #238049; }
+                .il-box-btn:active { transform: translateY(1px); }
+                .il-box-chip {
+                    display: inline-flex; align-items: center; gap: 6px;
+                    padding: 9px 12px; border-radius: 10px;
+                    background: #f3f4f6; color: #6b7280;
+                    font-size: 13px; font-weight: 600;
+                    border: 1px dashed #d1d5db;
+                }
+                .il-box-chip.il-box-loading { font-style: italic; }
                 .il-card {
                     background: #fff;
                     border: 1px solid #e5e7eb;
@@ -10787,6 +11297,7 @@ define([
                         } catch (re) { /* refurb section is best-effort; ignore failures */ }
                         // Paint the bin table immediately (serials = undefined -> "loading").
                         results.innerHTML = _ilRenderItemCard(match, bins, undefined) + refurbHtml;
+                        _ilBoxRender();
                         // Then pull the on-hand serials per bin and re-render with copy buttons.
                         try {
                             var sResp = await fetch(ilApiUrl + '&action=getItemBinSerials&itemId=' + encodeURIComponent(match.id) + '&locationId=1');
@@ -10797,9 +11308,11 @@ define([
                                 (sData.bins || []).forEach(function(b) { serialMap[b.bin] = b; });
                             }
                             results.innerHTML = _ilRenderItemCard(match, bins, serialMap) + refurbHtml;
+                            _ilBoxRender();
                         } catch (se) {
                             // Serial lookup failed — keep the bin table without serials.
                             results.innerHTML = _ilRenderItemCard(match, bins, null) + refurbHtml;
+                            _ilBoxRender();
                         }
                     } catch (e) {
                         results.innerHTML = '<div class="il-error">Error: ' + _ilEsc(e.message) + '</div>';
@@ -10834,6 +11347,7 @@ define([
                             html += _ilRenderSerialItemCard(item);
                         });
                         results.innerHTML = html;
+                        _ilBoxRender();
                     } catch (e) {
                         results.innerHTML = '<div class="il-error">Error: ' + _ilEsc(e.message) + '</div>';
                     }
@@ -10867,8 +11381,10 @@ define([
                              + '<div class="il-card-total">' + totalOH + ' OH \u00b7 ' + totalAv + ' Avail</div>'
                              + copyAllBtn
                              + '</div></div>';
+                    // "What's in the Box" control — filled in asynchronously by _ilBoxRender().
+                    var boxSlot = '<div class="il-box-slot" id="il-box-' + _ilEsc(itemMeta.id) + '" data-item="' + _ilEsc(itemMeta.id) + '"></div>';
                     if (!bins.length) {
-                        return head + '<div class="il-empty">No bin inventory for this item.</div></div>';
+                        return head + boxSlot + '<div class="il-empty">No bin inventory for this item.</div></div>';
                     }
 
                     ilModalBins = [];
@@ -10895,6 +11411,7 @@ define([
 
                     var serialTh = showSerialCol ? '<th style="text-align:right;">Serials</th>' : '';
                     return head
+                         + boxSlot
                          + '<table class="il-bin-table">'
                          + '<thead><tr><th>Bin</th><th style="text-align:right;">On Hand</th><th style="text-align:right;">Available</th>' + serialTh + '</tr></thead>'
                          + '<tbody>' + rows + '</tbody>'
@@ -10952,8 +11469,9 @@ define([
                     var listHtml = serials.map(function(s, i) {
                         var committed = s.avail ? '' : '<span class="il-sn-committed" title="Committed / reserved \u2014 not free to pick">committed</span>';
                         var qty = (s.qty && s.qty > 1) ? '<span class="il-sn-qty">\u00d7' + s.qty + '</span>' : '';
+                        var note = s.memo ? '<span class="il-sn-note" style="display:block;font-weight:400;font-size:11px;color:#b45309;margin-top:3px;white-space:normal;word-break:break-word;">\ud83d\udcdd ' + _ilEsc(s.memo) + '</span>' : '';
                         return '<div class="il-sn-row" title="Click to copy" onclick="ilCopySerial(' + idx + ',' + i + ',this)">'
-                             + '<span class="il-sn">' + _ilEsc(s.sn) + qty + '</span>'
+                             + '<span class="il-sn" style="display:flex;flex-direction:column;align-items:flex-start;min-width:0;"><span>' + _ilEsc(s.sn) + qty + '</span>' + note + '</span>'
                              + '<span class="il-sn-right">' + committed + '<span class="il-sn-copy">\u29C9</span></span>'
                              + '</div>';
                     }).join('');
@@ -11048,6 +11566,57 @@ define([
                     window._ilToastT = setTimeout(function() { t.classList.remove('show'); }, 1700);
                 }
 
+                // ── "What's in the Box" control ───────────────────────────────
+                // Each result card drops an empty .il-box-slot with its itemId.
+                // After the card paints we fetch the box status once per item and
+                // fill the slot: a printable button when the box field is
+                // verified, or a muted "blank or not verified" chip otherwise.
+                var ilBoxCache = {};    // itemId -> { hasBox, verified }
+                var ilBoxPending = {};  // itemId -> true while its status fetch is in flight
+
+                function _ilBoxFill(el, st) {
+                    var id = el.getAttribute('data-item');
+                    if (st && st.verified) {
+                        el.innerHTML = '<button type="button" class="il-box-btn" onclick="ilPrintBox(\\'' + _ilEsc(id) + '\\')">'
+                                     + '📦 What\\'s in the Box</button>';
+                    } else {
+                        el.innerHTML = '<span class="il-box-chip" title="The box-contents field is empty or not marked verified">'
+                                     + '📦 What\\'s in the box: blank or not verified</span>';
+                    }
+                }
+
+                function _ilBoxApply(id) {
+                    var el = document.getElementById('il-box-' + id);
+                    if (el && ilBoxCache[id]) _ilBoxFill(el, ilBoxCache[id]);
+                }
+
+                function _ilBoxRender() {
+                    var slots = document.querySelectorAll('.il-box-slot');
+                    for (var i = 0; i < slots.length; i++) {
+                        var slot = slots[i];
+                        var id = slot.getAttribute('data-item');
+                        if (!id) continue;
+                        if (ilBoxCache[id]) { _ilBoxFill(slot, ilBoxCache[id]); continue; }  // re-renders reuse cache
+                        if (ilBoxPending[id]) continue;                                       // fetch already in flight
+                        ilBoxPending[id] = true;
+                        slot.innerHTML = '<span class="il-box-chip il-box-loading">📦 checking…</span>';
+                        (function(itemId) {
+                            fetch(ilApiUrl + '&action=getBoxStatus&itemId=' + encodeURIComponent(itemId))
+                                .then(function(r) { return r.json(); })
+                                .then(function(st) { ilBoxCache[itemId] = (st && st.success) ? st : { hasBox: false, verified: false }; })
+                                .catch(function() { ilBoxCache[itemId] = { hasBox: false, verified: false }; })
+                                .then(function() { ilBoxPending[itemId] = false; _ilBoxApply(itemId); });
+                        })(id);
+                    }
+                }
+
+                // Synchronous window.open on the tap gesture so mobile browsers
+                // don't block the new tab (no await before this runs).
+                function ilPrintBox(id) {
+                    if (!id) return;
+                    window.open(ilApiUrl + '&action=printBox&itemId=' + encodeURIComponent(id), '_blank');
+                }
+
                 function _ilRenderSerialItemCard(item) {
                     // Item-level "where are the SCANNED serials" + full bin balances of the item
                     var scatteredBadge = (item.currentBins && item.currentBins.length > 1)
@@ -11056,6 +11625,9 @@ define([
                              + '<div><div class="il-card-title">' + _ilEsc(item.itemName) + ' ' + scatteredBadge + '</div>'
                              + '<div class="il-card-sub">' + item.scannedCount + ' scanned serial(s)</div></div>'
                              + '</div>';
+
+                    // "What's in the Box" control — filled in asynchronously by _ilBoxRender().
+                    var boxSlot = '<div class="il-box-slot" id="il-box-' + _ilEsc(item.itemId) + '" data-item="' + _ilEsc(item.itemId) + '"></div>';
 
                     // Where are the scanned serials sitting right now?
                     var scannedHtml = '';
@@ -11090,7 +11662,24 @@ define([
                         allHtml = '<div class="il-empty">No bin inventory for this item.</div>';
                     }
 
-                    return head + scannedHtml + allHtml + '</div>';
+                    // Operator notes (inventory-number memo) on the scanned serials.
+                    var notesHtml = '';
+                    if (item.notes && item.notes.length) {
+                        notesHtml += '<div style="font-size:12px;font-weight:700;color:#b45309;margin-bottom:6px;">📝 Notes on scanned serials:</div>'
+                                   + '<table class="il-bin-table" style="margin-bottom:14px;">'
+                                   + '<thead><tr><th>Serial</th><th>Bin</th><th>Note</th></tr></thead>'
+                                   + '<tbody>'
+                                   + item.notes.map(function(n) {
+                                       return '<tr>'
+                                            + '<td data-label="Serial" style="font-family:monospace;font-weight:600;word-break:break-all;">' + _ilEsc(n.sn) + '</td>'
+                                            + '<td data-label="Bin" class="il-bin-name">' + _ilEsc(n.bin || '—') + '</td>'
+                                            + '<td data-label="Note" style="color:#92400e;white-space:normal;word-break:break-word;">' + _ilEsc(n.memo) + '</td>'
+                                            + '</tr>';
+                                     }).join('')
+                                   + '</tbody></table>';
+                    }
+
+                    return head + boxSlot + scannedHtml + notesHtml + allHtml + '</div>';
                 }
 
                 document.addEventListener('DOMContentLoaded', function() {
@@ -11105,6 +11694,254 @@ define([
                 });
             </script>
         `;
+    }
+
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  ITEM LOOKUP — "What's in the Box" checklist
+    // ═══════════════════════════════════════════════════════════════════
+    // Lets a warehouse operator print the Box Contents Checklist straight from
+    // an Item Lookup result card. The PDF builder is a faithful port of the
+    // standalone "Generate What's in the Box PDF" Suitelet (English only), so it
+    // produces the same checklist + VERIFIED badge. Printing is gated on the
+    // item's `custitem_whats_in_the_box` field: it must contain the word
+    // "verified"; otherwise the card shows "blank or not verified".
+
+    const IL_BOX_COMPONENTS_FIELD  = 'custitem_whats_in_the_box';
+    const IL_BOX_FOOTER_NOTE_FIELD = 'custitem_box_note';   // optional; harmless if absent
+    const IL_BOX_LABELS = { title: 'BOX CONTENTS CHECKLIST', verified: 'VERIFIED', noComponents: 'No components listed.', mpn: 'MPN: ' };
+    // Printing gate: any occurrence of the word "verified" in the box field.
+    const IL_BOX_PRINT_GATE_PATTERN = /verified/i;
+    // Badge rendering keeps the stricter "Human Verified" standard, matching the
+    // standalone PDF: the phrase is stripped from the text and shown as a badge.
+    const IL_BOX_VERIFIED_PATTERN = /human[\s ._\-]*verified/gi;
+    const IL_BOX_VERIFIED_CHECK = '&#10004;';   // ZapfDingbats heavy-check by Unicode codepoint
+    const IL_BOX_VERIFIED_GREEN = '#2A9D58';
+    const IL_BOX_ITEM_TYPES = {
+        inventoryitem: 'inventoryitem', kititem: 'kititem', assemblyitem: 'assemblyitem',
+        noninventoryitem: 'noninventoryitem', noninventoryresaleitem: 'noninventoryitem',
+        serializedinventoryitem: 'serializedinventoryitem', lotnumberedinventoryitem: 'lotnumberedinventoryitem',
+        othercharge: 'otherchargeitem', service: 'serviceitem'
+    };
+
+    /** Resolve the real item record type so kits/assemblies load, not just inventory. */
+    function ilBoxLoadItem(itemId) {
+        let recordType = 'inventoryitem';
+        try {
+            const lk = search.lookupFields({ type: 'item', id: itemId, columns: ['recordtype'] });
+            if (lk && lk.recordtype && IL_BOX_ITEM_TYPES[lk.recordtype]) recordType = IL_BOX_ITEM_TYPES[lk.recordtype];
+        } catch (e) {
+            log.audit({ title: 'ilBox: item type lookup failed, defaulting to inventoryitem', details: e.message });
+        }
+        return record.load({ type: recordType, id: itemId });
+    }
+
+    /**
+     * Lightweight status for the result card: does the item have box contents,
+     * and does that field contain "verified" (the print gate)? No PDF is built.
+     */
+    function ilBoxGetStatus(params) {
+        const itemId = params.itemId || params.itemid;
+        if (!itemId) return { success: false, message: 'Item ID is required.' };
+        try {
+            const lk = search.lookupFields({ type: 'item', id: itemId, columns: [IL_BOX_COMPONENTS_FIELD] });
+            const raw = (lk && lk[IL_BOX_COMPONENTS_FIELD]) || '';
+            const hasBox = String(raw).trim().length > 0;
+            const verified = hasBox && IL_BOX_PRINT_GATE_PATTERN.test(String(raw));
+            return { success: true, hasBox: hasBox, verified: verified };
+        } catch (e) {
+            log.error({ title: 'ilBoxGetStatus failed', details: e.message });
+            return { success: false, message: e.message };
+        }
+    }
+
+    /**
+     * Stream the Box Contents Checklist PDF inline. Opened in a new tab by the
+     * card's "What's in the Box" button via &action=printBox&itemId=. Re-checks
+     * the print gate server-side so the PDF can't be reached for a non-verified
+     * or blank item even by hitting the URL directly.
+     */
+    function ilBoxHandlePrint(ctx) {
+        try {
+            const itemId = ctx.request.parameters.itemId || ctx.request.parameters.itemid;
+            if (!itemId) { ctx.response.write('Item ID is required.'); return; }
+
+            const itemRec = ilBoxLoadItem(itemId);
+            const rawComponents = itemRec.getValue({ fieldId: IL_BOX_COMPONENTS_FIELD }) || '';
+
+            // Gate: the box field must contain "verified"; otherwise refuse.
+            if (!String(rawComponents).trim() || !IL_BOX_PRINT_GATE_PATTERN.test(String(rawComponents))) {
+                ctx.response.write("What's in the box is blank or not verified.");
+                return;
+            }
+
+            const mpn = itemRec.getValue({ fieldId: 'mpn' }) || '';
+            let rawFooterNote = '';
+            try { rawFooterNote = itemRec.getValue({ fieldId: IL_BOX_FOOTER_NOTE_FIELD }) || ''; }
+            catch (e) { rawFooterNote = ''; }
+
+            // Pull "Human Verified" out of every text field; it becomes the corner badge.
+            let isVerified = false;
+            const description = ilBoxExtractVerified(itemRec.getValue({ fieldId: 'salesdescription' }) || '');
+            isVerified = isVerified || description.found;
+            const footer = ilBoxExtractVerified(rawFooterNote);
+            isVerified = isVerified || footer.found;
+
+            const components = [];
+            ilBoxParseComponents(rawComponents).forEach(comp => {
+                const name = ilBoxExtractVerified(comp.name);
+                const pn   = ilBoxExtractVerified(comp.pn);
+                const note = ilBoxExtractVerified(comp.note);
+                if (name.found || pn.found || note.found) isVerified = true;
+                if (!name.text && !pn.text && !note.text) return;  // line was only "Human Verified"
+                components.push({ name: name.text, pn: pn.text, note: note.text });
+            });
+
+            const pdfXml = ilBoxBuildPdfXml({
+                description: description.text, mpn: mpn, components: components,
+                footerNote: footer.text, verified: isVerified
+            });
+
+            const pdfFile = render.xmlToPdf({ xmlString: pdfXml });
+            ctx.response.setHeader({ name: 'Content-Type', value: 'application/pdf' });
+            ctx.response.setHeader({
+                name: 'Content-Disposition',
+                value: 'inline; filename="Box_Contents_' + String(mpn || itemId).replace(/[^A-Za-z0-9._-]/g, '_') + '.pdf"'
+            });
+            ctx.response.write(pdfFile.getContents());
+        } catch (e) {
+            log.error({ title: 'ilBoxHandlePrint failed', details: e });
+            ctx.response.write('Error generating PDF: ' + (e.message || String(e)));
+        }
+    }
+
+    /** Line-separated field value -> [{ name, pn, note }, ...] (ported verbatim). */
+    function ilBoxParseComponents(raw) {
+        const items = [];
+        String(raw).split(/\r?\n/).forEach(rawLine => {
+            if (!rawLine.trim()) return;
+            const isIndented = /^(\t|[ ]{2,})/.test(rawLine);               // indentation marks a sub-line
+            const line = rawLine.trim().replace(/^[-*•·–—>~]+\s*/, '').trim(); // strip leading bullets
+            if (!line) return;
+            if (line.indexOf('|') > -1) {                                   // single-line pipe form
+                const parts = line.split('|').map(p => p.trim());
+                items.push({ name: parts[0] || '', pn: parts[1] || '', note: parts[2] || '' });
+                return;
+            }
+            const current = items.length ? items[items.length - 1] : null;
+            if (current && /^p\/?n\b/i.test(line)) {                        // P/N sub-line
+                current.pn = current.pn ? current.pn + ' ' + line : line;
+                return;
+            }
+            if (current && (isIndented || /^note:/i.test(line))) {          // italic note sub-line
+                const noteText = line.replace(/^note:\s*/i, '');
+                current.note = current.note ? current.note + ' ' + noteText : noteText;
+                return;
+            }
+            items.push({ name: line, pn: '', note: '' });                   // otherwise: new component
+        });
+        return items;
+    }
+
+    /** Remove any "Human Verified" phrasing; report whether it was present. */
+    function ilBoxExtractVerified(str) {
+        const original = String(str || '');
+        const cleaned = original.replace(IL_BOX_VERIFIED_PATTERN, '');
+        return {
+            text: cleaned.replace(/\s{2,}/g, ' ').replace(/^[\s\-|:,]+|[\s\-|:,]+$/g, '').trim(),
+            found: cleaned.length !== original.length
+        };
+    }
+
+    /** XML-escape the characters that break the BFO parser (quotes left alone). */
+    function ilBoxSanitize(str) {
+        if (!str) return '';
+        return String(str).replace(/&(?!#?\w+;)/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+
+    /** Build the Box Contents Checklist XML (ported from the standalone Suitelet). */
+    function ilBoxBuildPdfXml(data) {
+        const labels = IL_BOX_LABELS;
+        let rowsXml = '';
+        if (data.components.length) {
+            const dividerRow = '<tr><td colspan="4" style="border-bottom: 0.5pt solid #C9C9C9;'
+                + ' font-size: 1pt; line-height: 1pt;">&#160;</td></tr>';
+            rowsXml += dividerRow;
+            data.components.forEach(comp => {
+                const cellStyle = 'padding-top: 15pt; padding-bottom: 16pt;';
+                let body = '<p class="item-name">' + ilBoxSanitize(comp.name) + '</p>';
+                if (comp.pn)   body += '<p class="item-pn">' + ilBoxSanitize(comp.pn) + '</p>';
+                if (comp.note) body += '<p class="item-note">' + ilBoxSanitize(comp.note) + '</p>';
+                rowsXml += '<tr>'
+                    + '<td width="24" style="' + cellStyle + '">&#160;</td>'
+                    + '<td width="30" height="50" style="' + cellStyle + '" valign="top">'
+                    + '  <table cellpadding="0" cellspacing="0"><tr>'
+                    + '    <td width="20" height="20" style="border: 1.25pt solid #111111; font-size: 1pt;">&#160;</td>'
+                    + '  </tr></table>'
+                    + '</td>'
+                    + '<td width="14" style="' + cellStyle + '">&#160;</td>'
+                    + '<td style="' + cellStyle + '" valign="top">' + body + '</td>'
+                    + '</tr>'
+                    + dividerRow;
+            });
+        } else {
+            rowsXml = '<tr><td align="center" style="font-size: 12pt; color: #999999; padding-top: 24pt;">'
+                + ilBoxSanitize(labels.noComponents) + '</td></tr>';
+        }
+
+        let footerXml = '';
+        if (data.footerNote) {
+            footerXml = '<table width="100%" cellpadding="0" cellspacing="0" style="margin-top: 40pt;">'
+                + '<tr><td style="border-bottom: 0.75pt solid #C9C9C9; font-size: 1pt;">&#160;</td></tr>'
+                + '</table>'
+                + '<p class="note">' + ilBoxSanitize(data.footerNote) + '</p>';
+        }
+
+        let badgeXml = '<table width="100%" cellpadding="0" cellspacing="0"><tr><td align="right">';
+        if (data.verified) {
+            badgeXml += '<table cellpadding="0" cellspacing="0" style="border: 1pt solid ' + IL_BOX_VERIFIED_GREEN + '; background-color: #F1F8F4;"><tr>'
+                + '<td style="padding: 5pt 6pt 5pt 9pt; font-family: ZapfDingbats; font-size: 15pt; color: ' + IL_BOX_VERIFIED_GREEN + ';" valign="middle">'
+                + IL_BOX_VERIFIED_CHECK + '</td>'
+                + '<td style="padding: 5pt 10pt 5pt 4pt; font-size: 12pt; font-weight: bold; letter-spacing: 0.8pt; color: ' + IL_BOX_VERIFIED_GREEN + ';" valign="middle">'
+                + ilBoxSanitize(labels.verified) + '</td>'
+                + '</tr></table>';
+        } else {
+            badgeXml += '&#160;';
+        }
+        badgeXml += '</td></tr></table>';
+
+        let subtitleXml = '';
+        if (data.description) subtitleXml += '<p class="subtitle" align="center">' + ilBoxSanitize(data.description) + '</p>';
+        subtitleXml += '<p class="subtitle mpn" align="center">' + ilBoxSanitize(labels.mpn) + ilBoxSanitize(data.mpn || '&#8212;') + '</p>';
+
+        return '<?xml version="1.0"?>\n'
+            + '<!DOCTYPE pdf PUBLIC "-//big.faceless.org//report" "report-1.1.dtd">\n'
+            + '<pdf>\n'
+            + '<head>\n'
+            + '  <style type="text/css">\n'
+            + '    body { font-family: Helvetica, Arial, sans-serif; color: #111111; }\n'
+            + '    .title { font-size: 25pt; font-weight: bold; letter-spacing: 1.4pt; margin: 0; }\n'
+            + '    .subtitle { font-size: 13pt; color: #333333; margin: 0; padding-top: 6pt; }\n'
+            + '    .mpn { font-weight: bold; color: #111111; }\n'
+            + '    .item-name { font-size: 13pt; font-weight: bold; margin: 0; }\n'
+            + '    .item-pn { font-size: 11.5pt; color: #333333; margin: 0; padding-top: 3pt; }\n'
+            + '    .item-note { font-size: 11pt; font-style: italic; color: #333333; margin: 0; padding-top: 3pt; }\n'
+            + '    .note { font-size: 11pt; font-style: italic; color: #333333; margin: 0; padding-top: 12pt; }\n'
+            + '  </style>\n'
+            + '</head>\n'
+            + '<body size="Letter" padding="52pt 65pt 61pt 65pt">\n'
+            + badgeXml + '\n'
+            + '  <p class="title" align="center" style="padding-top: 10pt;">' + ilBoxSanitize(labels.title) + '</p>\n'
+            + subtitleXml + '\n'
+            + '  <table width="100%" cellpadding="0" cellspacing="0" style="margin-top: 14pt;">\n'
+            + '    <tr><td style="border-bottom: 2.5pt solid #111111; font-size: 1pt;">&#160;</td></tr>\n'
+            + '  </table>\n'
+            + '  <table width="100%" cellpadding="0" cellspacing="0" style="margin-top: 14pt;">\n'
+            + rowsXml + '\n'
+            + '  </table>\n'
+            + footerXml + '\n'
+            + '</body>\n'
+            + '</pdf>';
     }
 
 
@@ -13331,14 +14168,19 @@ button.stock-sheet-row-chosen, button.stock-sheet-row-chosen:hover { background:
         height:calc(100dvh - 48px - 56px); display:block;
     }
 
-    /* ── Cards ── */
-    .card { padding:12px; margin-bottom:8px; border-radius:8px; }
+    /* ── Cards ── (uniform rhythm across every native view) */
+    .card { padding:12px; margin-bottom:10px; border-radius:10px; }
+    .card + .card { margin-top:0; }
     .card-title { font-size:13px; margin-bottom:10px; }
 
-    /* ── Page headers ── */
-    .page-header { margin-bottom:10px; }
-    .page-title { font-size:17px; }
-    .page-subtitle { font-size:11px; }
+    /* ── Page headers ── (compact, consistent; subtitle stays a quiet second line) */
+    .page-header { margin-bottom:10px; gap:10px; }
+    .page-title { font-size:17px; letter-spacing:-.2px; }
+    .page-subtitle { font-size:11px; margin-top:1px; }
+
+    /* ── Vertical rhythm: keep section gaps on one predictable scale ── */
+    .stats-row { margin-bottom:10px; }
+    .form-grid { gap:10px; }
 
     /* ── Stat cards ── */
     .stats-row { grid-template-columns:1fr 1fr; gap:8px; margin-bottom:10px; }
@@ -13470,6 +14312,42 @@ button.stock-sheet-row-chosen, button.stock-sheet-row-chosen:hover { background:
     /* action buttons inside cards are tap-friendly */
     table.sc-table td.sc-cell-action .btn { min-height:38px; padding:0 16px; }
     .table-wrap:has(table.sc-table) { overflow-x:visible; border:none; border-radius:0; }
+
+    /* ── Shared "stack into cards" treatment for any wide table on mobile ──
+       Same field-work pattern as sc-table, reusable via class="stack-table".
+       Kills horizontal scroll on the License Plate dashboard / search tables so
+       every list screen in the app reads the same way. Cells need data-label
+       attributes for the inline field labels (added in their JS renderers). */
+    table.stack-table, table.stack-table tbody, table.stack-table tr, table.stack-table td { display:block; width:100%; }
+    table.stack-table thead { display:none; }
+    table.stack-table { border:none; font-size:13px; }
+    table.stack-table tr {
+        background:var(--surface); border:1px solid var(--border);
+        border-radius:10px; margin-bottom:8px; padding:6px 4px;
+        box-shadow:0 1px 3px rgba(0,0,0,.04);
+    }
+    table.stack-table tr:hover td { background:transparent; }
+    table.stack-table td {
+        border:none; padding:7px 12px;
+        display:flex; align-items:center; justify-content:space-between;
+        gap:12px; white-space:normal; text-align:right;
+    }
+    table.stack-table td[data-label]:not([data-label=""])::before {
+        content:attr(data-label); flex:0 0 auto; margin-right:auto;
+        font-size:10px; font-weight:700; text-transform:uppercase;
+        letter-spacing:.04em; color:var(--text-dim); text-align:left;
+    }
+    /* action cell (buttons) spans full width, centered, with a divider */
+    table.stack-table td.stack-cell-action {
+        justify-content:center; text-align:center;
+        border-top:1px solid var(--border); margin-top:4px; padding-top:10px;
+        flex-wrap:wrap; gap:8px;
+    }
+    table.stack-table td.stack-cell-action::before { content:none; }
+    table.stack-table td.stack-cell-action .btn { min-height:38px; }
+    table.stack-table td[colspan] { justify-content:center; text-align:center; }
+    table.stack-table td[colspan]::before { content:none; }
+    .table-wrap:has(table.stack-table) { overflow-x:visible; border:none; border-radius:0; }
 }
 </style>
 </head>
@@ -13553,6 +14431,10 @@ button.stock-sheet-row-chosen, button.stock-sheet-row-chosen:hover { background:
     <div class="mob-more-item" data-view="itemlookup" onclick="mobNavTo('itemlookup')">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="11" y1="8" x2="11" y2="14"/><line x1="8" y1="11" x2="14" y2="11"/></svg>
         Item Lookup
+    </div>
+    <div class="mob-more-item" data-view="itemnotes" onclick="mobNavTo('itemnotes')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="9" y1="13" x2="15" y2="13"/><line x1="9" y1="17" x2="13" y2="17"/></svg>
+        Item Notes
     </div>
     <div class="mob-more-item" data-view="inventorystatuschange" onclick="mobNavTo('inventorystatuschange')">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/><path d="M3 21v-5h5"/></svg>
@@ -13665,6 +14547,10 @@ button.stock-sheet-row-chosen, button.stock-sheet-row-chosen:hover { background:
     <div class="nav-item" data-view="itemlookup">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="11" y1="8" x2="11" y2="14"/><line x1="8" y1="11" x2="14" y2="11"/></svg>
         Item Lookup
+    </div>
+    <div class="nav-item" data-view="itemnotes">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="9" y1="13" x2="15" y2="13"/><line x1="9" y1="17" x2="13" y2="17"/></svg>
+        Item Notes
     </div>
     <div class="nav-group">
         <div class="nav-group-toggle" onclick="toggleNavGroup(this)">
@@ -13789,6 +14675,10 @@ button.stock-sheet-row-chosen, button.stock-sheet-row-chosen:hover { background:
             <button class="home-tile" onclick="navigateTo('itemlookup')">
                 <div class="home-tile-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="11" y1="8" x2="11" y2="14"/><line x1="8" y1="11" x2="14" y2="11"/></svg></div>
                 <div class="home-tile-title">Item Lookup</div>
+            </button>
+            <button class="home-tile" onclick="navigateTo('itemnotes')">
+                <div class="home-tile-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="9" y1="13" x2="15" y2="13"/><line x1="9" y1="17" x2="13" y2="17"/></svg></div>
+                <div class="home-tile-title">Item Notes</div>
             </button>
         </div>
     </div>
@@ -14097,6 +14987,107 @@ button.stock-sheet-row-chosen, button.stock-sheet-row-chosen:hover { background:
     <iframe id="il-iframe" src="${apiUrl}&action=itemlookup" style="width:100%;height:calc(100dvh - 56px);border:none;display:block;"></iframe>
 </div>
 
+<!-- ═══════ ITEM NOTES VIEW ═══════ -->
+<div class="view" id="view-itemnotes">
+    <div class="page-header">
+        <div><div class="page-title">Item Notes</div><div class="page-subtitle">Note serials by memo, or add a note to a non-serialized item</div></div>
+    </div>
+
+    <!-- Serialized vs Non-Serialized mode toggle -->
+    <div style="display:flex;gap:8px;margin-bottom:16px;max-width:900px;">
+        <button class="btn btn-primary" id="in-tab-serial" onclick="inSwitchMode('serial')">Serialized</button>
+        <button class="btn" id="in-tab-nonserial" onclick="inSwitchMode('nonserial')">Non-Serialized</button>
+    </div>
+
+    <div id="in-serial-mode">
+    <!-- Step 1: enter serials (express entry) -->
+    <div class="card" style="max-width:900px;">
+        <div class="card-title">Serial Numbers</div>
+        <div class="form-group">
+            <label class="form-label">Scan or paste serial numbers — one per line</label>
+            <textarea id="in-serials" rows="5" placeholder="Scan or paste serials, one per line…" style="width:100%;padding:14px 16px;border:2px solid var(--border, #d1d5db);border-radius:10px;font-size:15px;font-family:monospace;resize:vertical;" oninput="inUpdateCount()"></textarea>
+        </div>
+        <div style="display:flex;align-items:center;gap:10px;margin-top:12px;flex-wrap:wrap;">
+            <button class="btn btn-primary" id="in-load-btn" onclick="inLoadSerials()">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+                Load Serials
+            </button>
+            <button class="btn" onclick="inReset()">Reset</button>
+            <span style="color:var(--text-dim);font-size:13px;"><span id="in-count">0</span> serial(s)</span>
+        </div>
+    </div>
+
+    <!-- Step 2: per-serial memo editor (hidden until loaded) -->
+    <div class="card" id="in-editor" style="max-width:900px;margin-top:16px;display:none;">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-bottom:12px;">
+            <div class="card-title" style="margin:0;">Notes <span id="in-editor-count" class="badge badge-info" style="font-size:11px;"></span></div>
+        </div>
+
+        <div id="in-invalid" style="display:none;margin-bottom:12px;"></div>
+
+        <!-- Apply to all -->
+        <div style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;margin-bottom:12px;padding-bottom:12px;border-bottom:1px solid var(--border, #e5e7eb);">
+            <div class="form-group" style="flex:1;min-width:220px;margin:0;">
+                <label class="form-label">Apply the same note to every serial below</label>
+                <input type="text" id="in-applyall" placeholder="e.g. Damaged box — inspect before selling" onkeydown="if(event.key==='Enter'){event.preventDefault();inApplyToAll();}">
+            </div>
+            <button class="btn" onclick="inApplyToAll()">Apply to all</button>
+        </div>
+
+        <div class="table-wrap">
+            <table class="sc-table">
+                <thead>
+                    <tr>
+                        <th style="width:200px;">Serial</th>
+                        <th style="width:200px;">Item</th>
+                        <th>Note (memo)</th>
+                    </tr>
+                </thead>
+                <tbody id="in-rows"></tbody>
+            </table>
+        </div>
+
+        <div style="margin-top:16px;display:flex;gap:8px;">
+            <button class="btn btn-primary" id="in-save-btn" onclick="inSave()">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
+                Save all notes
+            </button>
+        </div>
+    </div>
+    </div><!-- /#in-serial-mode -->
+
+    <!-- Non-serialized: attach a User Note to the item (with quantity in the note) -->
+    <div id="in-nonserial-mode" style="display:none;">
+        <div class="card" style="max-width:900px;">
+            <div class="card-title">Non-Serialized Item Note</div>
+            <div style="background:#f0f9ff;border:1px solid #bae6fd;color:#0369a1;border-radius:8px;padding:10px 12px;font-size:12.5px;margin-bottom:14px;">
+                Non-serialized items have no per-unit record, so this saves a <strong>User Note on the item</strong> (visible on the item's Notes subtab, with your name and the date). The quantity is stored in the note text.
+            </div>
+            <div class="form-group">
+                <label class="form-label">Item (SKU)</label>
+                <input type="text" id="nsn-item-search" placeholder="Type to search items…" autocomplete="off">
+                <input type="hidden" id="nsn-item-id">
+                <div id="nsn-item-dropdown" style="position:relative;"></div>
+            </div>
+            <div class="form-group">
+                <label class="form-label">Quantity</label>
+                <input type="number" id="nsn-qty" min="1" placeholder="e.g. 5" style="max-width:180px;">
+            </div>
+            <div class="form-group">
+                <label class="form-label">Note</label>
+                <textarea id="nsn-note" rows="4" placeholder="e.g. 5 units water-damaged, inspect before sale" style="width:100%;padding:14px 16px;border:2px solid var(--border, #d1d5db);border-radius:10px;font-size:15px;resize:vertical;"></textarea>
+            </div>
+            <div style="display:flex;gap:8px;">
+                <button class="btn btn-primary" id="nsn-save-btn" onclick="nsnSaveNote()">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
+                    Add note to item
+                </button>
+                <button class="btn" onclick="nsnReset()">Reset</button>
+            </div>
+        </div>
+    </div>
+</div>
+
 <!-- ═══════ DASHBOARD VIEW ═══════ -->
 <div class="view" id="view-dashboard">
     <div class="page-header">
@@ -14137,7 +15128,7 @@ button.stock-sheet-row-chosen, button.stock-sheet-row-chosen:hover { background:
     </div>
     <div class="card">
         <div class="card-title">All License Plates</div>
-        <div class="table-wrap"><table>
+        <div class="table-wrap"><table class="stack-table">
             <thead><tr><th>Plate ID</th><th>Item</th><th>Bin</th><th>Serials</th><th>Status</th><th>Created</th></tr></thead>
             <tbody id="dashboard-table"><tr><td colspan="6" style="text-align:center;color:var(--text-dim)">Loading…</td></tr></tbody>
         </table></div>
@@ -14252,7 +15243,7 @@ button.stock-sheet-row-chosen, button.stock-sheet-row-chosen:hover { background:
         </div>
     </div>
     <div class="card">
-        <div class="table-wrap"><table>
+        <div class="table-wrap"><table class="stack-table">
             <thead><tr><th>Plate ID</th><th>Item</th><th>Location</th><th>Bin</th><th>Serials</th><th>Status</th><th>Actions</th></tr></thead>
             <tbody id="search-results"><tr><td colspan="7" style="text-align:center;color:var(--text-dim)">Use the filters above to search</td></tr></tbody>
         </table></div>
@@ -15045,6 +16036,10 @@ button.stock-sheet-row-chosen, button.stock-sheet-row-chosen:hover { background:
                 <label class="form-label">Serial Number</label>
                 <input type="text" id="scd-serial-filter" placeholder="Serial number" onkeydown="if(event.key==='Enter')scdLoadStockCounts()">
             </div>
+            <div class="form-group">
+                <label class="form-label">Bin</label>
+                <input type="text" id="scd-bin-filter" placeholder="Bin name" onkeydown="if(event.key==='Enter')scdLoadStockCounts()">
+            </div>
             <div class="form-group" style="display:flex;align-items:flex-end;">
                 <button class="btn" onclick="scdLoadStockCounts()">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:16px;height:16px;margin-right:6px;"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
@@ -15442,7 +16437,7 @@ function hasPerm(id) { return WH_PERMS.indexOf(id) !== -1; }
 const VIEW_PERM = {
     warehouse: 1, printlabel: 2, poreceive: 3, sopick: 4, sopickmulti: 4,
     binputaway: 5, bintransferall: 5, bintransferitem: 5, pickamazon: 6, inventorystatuschange: 7,
-    consolidate: 8, itemlookup: 9,
+    consolidate: 8, itemlookup: 9, itemnotes: 9,
     dashboard: 10, scan: 10, create: 10, search: 10, transfer: 10, fulfill: 10, poimport: 10, irimport: 10,
     'sc-dashboard': 11, 'sc-create': 11, 'sc-execute': 11,
     'sc-pending-review': 12, 'sc-review': 12
@@ -16027,6 +17022,7 @@ document.querySelectorAll('.nav-item[data-view]').forEach(el => {
         if (el.dataset.view === 'irimport') document.getElementById('ir-number-input').focus();
         if (el.dataset.view === 'consolidate') consInit();
         if (el.dataset.view === 'bintransferitem') { btiInit(); document.getElementById('bti-source-bin').focus(); }
+        if (el.dataset.view === 'itemnotes') { const t = document.getElementById('in-serials'); if (t) t.focus(); }
     });
 });
 
@@ -16300,12 +17296,12 @@ async function loadDashboard(page = 0) {
     }
     tbody.innerHTML = data.results.map(p =>
         '<tr class="clickable-row" onclick="viewPlateModal(' + p.id + ')">' +
-        '<td style="font-family:var(--mono);font-weight:600;">' + escHtml(p.name) + '</td>' +
-        '<td>' + escHtml(p.item || '—') + '</td>' +
-        '<td>' + escHtml(p.bin || '—') + '</td>' +
-        '<td><span class="badge badge-info">' + p.serialCount + '</span></td>' +
-        '<td>' + statusBadge(p.status) + '</td>' +
-        '<td style="color:var(--text-muted);font-size:12px;">' + escHtml(p.created || '') + '</td>' +
+        '<td data-label="Plate ID" style="font-family:var(--mono);font-weight:600;">' + escHtml(p.name) + '</td>' +
+        '<td data-label="Item">' + escHtml(p.item || '—') + '</td>' +
+        '<td data-label="Bin">' + escHtml(p.bin || '—') + '</td>' +
+        '<td data-label="Serials"><span class="badge badge-info">' + p.serialCount + '</span></td>' +
+        '<td data-label="Status">' + statusBadge(p.status) + '</td>' +
+        '<td data-label="Created" style="color:var(--text-muted);font-size:12px;">' + escHtml(p.created || '') + '</td>' +
         '</tr>'
     ).join('');
 
@@ -16537,13 +17533,13 @@ async function doSearch(page = 0) {
     }
     tbody.innerHTML = data.results.map(p =>
         '<tr>' +
-        '<td style="font-family:var(--mono);font-weight:600;">' + escHtml(p.name) + '</td>' +
-        '<td>' + escHtml(p.item || '—') + '</td>' +
-        '<td>' + escHtml(p.location || '—') + '</td>' +
-        '<td>' + escHtml(p.bin || '—') + '</td>' +
-        '<td><span class="badge badge-info">' + p.serialCount + '</span></td>' +
-        '<td>' + statusBadge(p.status) + '</td>' +
-        '<td><div class="btn-group">' +
+        '<td data-label="Plate ID" style="font-family:var(--mono);font-weight:600;">' + escHtml(p.name) + '</td>' +
+        '<td data-label="Item">' + escHtml(p.item || '—') + '</td>' +
+        '<td data-label="Location">' + escHtml(p.location || '—') + '</td>' +
+        '<td data-label="Bin">' + escHtml(p.bin || '—') + '</td>' +
+        '<td data-label="Serials"><span class="badge badge-info">' + p.serialCount + '</span></td>' +
+        '<td data-label="Status">' + statusBadge(p.status) + '</td>' +
+        '<td class="stack-cell-action"><div class="btn-group">' +
             '<button class="btn btn-sm" onclick="viewPlateModal(' + p.id + ')">View</button>' +
             '<button class="btn btn-sm" onclick="editPlate(' + p.id + ')">Edit</button>' +
             '<button class="btn btn-sm" onclick="printPlateQR(' + p.id + ')" title="Print QR"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 6 2 18 2 18 9"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8"/></svg></button>' +
@@ -21776,6 +22772,208 @@ async function submitStockCount() {
 }
 
 // ═══════════════════════════════════════════════════════════
+//  ITEM NOTES
+//  Express-entry serials -> set the memo field on each serial's
+//  inventory-number record. Resolve pasted serials into an editable
+//  per-serial list (plus an apply-to-all box), then save. Saving
+//  overwrites the existing memo on each matching record.
+// ═══════════════════════════════════════════════════════════
+let _inRows = []; // [{ serial, found, itemName, memo }]
+
+function inUpdateCount() {
+    const ta = document.getElementById('in-serials');
+    const el = document.getElementById('in-count');
+    if (!ta || !el) return;
+    el.textContent = ta.value.split(/[\\r\\n]+/).filter(s => s.trim() !== '').length;
+}
+
+function inReset() {
+    _inRows = [];
+    const ta = document.getElementById('in-serials');
+    if (ta) ta.value = '';
+    const ed = document.getElementById('in-editor');
+    if (ed) ed.style.display = 'none';
+    const aa = document.getElementById('in-applyall');
+    if (aa) aa.value = '';
+    inUpdateCount();
+    if (ta) ta.focus();
+}
+
+async function inLoadSerials() {
+    const ta = document.getElementById('in-serials');
+    const raw = (ta.value || '').trim();
+    if (!raw) { ta.focus(); return; }
+    const btn = document.getElementById('in-load-btn');
+    _btnWait(btn);
+    try {
+        const data = await apiGet('getItemNotes', { serials: raw });
+        if (!data.success) { toast(data.message || 'Failed to load serials.', 'error'); return; }
+        _inRows = data.rows || [];
+        inRenderRows();
+        const ed = document.getElementById('in-editor');
+        if (ed) ed.style.display = '';
+        if (data.invalid && data.invalid.length) {
+            toast(data.invalid.length + ' serial(s) not found in inventory.', 'warning');
+        }
+    } catch (e) {
+        toast('Error: ' + e.message, 'error');
+    } finally {
+        _btnReset(btn);
+    }
+}
+
+function inRenderRows() {
+    const tbody = document.getElementById('in-rows');
+    const countEl = document.getElementById('in-editor-count');
+    const invEl = document.getElementById('in-invalid');
+    if (!tbody) return;
+
+    const foundRows = _inRows.filter(r => r.found);
+    const missing = _inRows.filter(r => !r.found).map(r => r.serial);
+
+    if (countEl) countEl.textContent = foundRows.length + ' serial' + (foundRows.length === 1 ? '' : 's');
+
+    if (invEl) {
+        if (missing.length) {
+            invEl.style.display = '';
+            invEl.innerHTML = '<div style="background:#fef2f2;border:1px solid #fecaca;color:#b91c1c;border-radius:8px;padding:10px 12px;font-size:13px;">⚠ '
+                + missing.length + ' serial(s) not found and skipped: ' + escHtml(missing.join(', ')) + '</div>';
+        } else {
+            invEl.style.display = 'none';
+            invEl.innerHTML = '';
+        }
+    }
+
+    if (!foundRows.length) {
+        tbody.innerHTML = '<tr><td colspan="3" style="text-align:center;color:var(--text-dim);">No matching serials in inventory.</td></tr>';
+        return;
+    }
+
+    // value="" is set via JS below (escHtml doesn't escape quotes) so notes
+    // containing double quotes can't break the input markup.
+    tbody.innerHTML = _inRows.map((r, i) => {
+        if (!r.found) return '';
+        return '<tr>'
+            + '<td data-label="Serial" style="font-family:monospace;font-weight:600;word-break:break-all;">' + escHtml(r.serial) + '</td>'
+            + '<td data-label="Item" style="font-size:13px;">' + escHtml(r.itemName || '—') + '</td>'
+            + '<td data-label="Note"><input type="text" data-in-row="' + i + '" oninput="inRowInput(' + i + ', this.value)" placeholder="Add a note…" style="width:100%;"></td>'
+            + '</tr>';
+    }).join('');
+
+    tbody.querySelectorAll('input[data-in-row]').forEach(inp => {
+        const i = parseInt(inp.getAttribute('data-in-row'), 10);
+        inp.value = (_inRows[i] && _inRows[i].memo) || '';
+    });
+}
+
+function inRowInput(i, val) {
+    if (_inRows[i]) _inRows[i].memo = val;
+}
+
+function inApplyToAll() {
+    const el = document.getElementById('in-applyall');
+    if (!el) return;
+    const val = el.value;
+    _inRows.forEach(r => { if (r.found) r.memo = val; });
+    document.querySelectorAll('#in-rows input[data-in-row]').forEach(inp => { inp.value = val; });
+}
+
+async function inSave() {
+    const notes = _inRows.filter(r => r.found).map(r => ({ serial: r.serial, memo: r.memo || '' }));
+    if (!notes.length) { toast('No serials to save.', 'error'); return; }
+    const btn = document.getElementById('in-save-btn');
+    _btnWait(btn);
+    try {
+        const data = await apiPost('saveItemNotes', { notes: notes });
+        if (!data.success) { toast(data.message || 'Failed to save notes.', 'error'); return; }
+        let msg = 'Saved notes on ' + data.updatedCount + ' serial(s).';
+        if (data.notFound && data.notFound.length) msg += ' ' + data.notFound.length + ' not found.';
+        toast(msg, 'success');
+    } catch (e) {
+        toast('Error: ' + e.message, 'error');
+    } finally {
+        _btnReset(btn);
+    }
+}
+
+// ── Item Notes: Serialized vs Non-Serialized mode toggle ──────────────
+function inSwitchMode(mode) {
+    const ser = document.getElementById('in-serial-mode');
+    const non = document.getElementById('in-nonserial-mode');
+    const tS = document.getElementById('in-tab-serial');
+    const tN = document.getElementById('in-tab-nonserial');
+    const nonSerial = mode === 'nonserial';
+    if (ser) ser.style.display = nonSerial ? 'none' : '';
+    if (non) non.style.display = nonSerial ? '' : 'none';
+    if (tS) tS.className = nonSerial ? 'btn' : 'btn btn-primary';
+    if (tN) tN.className = nonSerial ? 'btn btn-primary' : 'btn';
+    const focusId = nonSerial ? 'nsn-item-search' : 'in-serials';
+    const f = document.getElementById(focusId); if (f) f.focus();
+}
+
+// ── Non-serialized item note: item typeahead + save ───────────────────
+// Mirrors the item typeahead used elsewhere (form-item-search): the visible
+// input searches items, the hidden #nsn-item-id holds the resolved id.
+let _nsnItemTimeout;
+document.getElementById('nsn-item-search').addEventListener('input', function() {
+    clearTimeout(_nsnItemTimeout);
+    const q = this.value.trim();
+    document.getElementById('nsn-item-id').value = ''; // clear resolved id when text changes
+    if (q.length < 2) { document.getElementById('nsn-item-dropdown').innerHTML = ''; return; }
+    _nsnItemTimeout = setTimeout(() => nsnItemSearch(q), 300);
+});
+
+async function nsnItemSearch(q) {
+    const data = await apiGet('getItems', { q });
+    const dd = document.getElementById('nsn-item-dropdown');
+    if (!data.results || !data.results.length) { dd.innerHTML = ''; return; }
+    dd.innerHTML = '<div style="position:absolute;top:0;left:0;right:0;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-sm);z-index:50;max-height:200px;overflow-y:auto;box-shadow:var(--shadow);">' +
+        data.results.map(r => '<div style="padding:8px 12px;cursor:pointer;font-size:13px;border-bottom:1px solid var(--border);" onmouseover="this.style.background=\\'var(--surface-hover)\\'" onmouseout="this.style.background=\\'transparent\\'" onclick="nsnSelectItem(' + r.id + ',\\'' + escHtml(r.name) + '\\')">' + escHtml(r.name) + (r.display ? ' — ' + escHtml(r.display) : '') + '</div>').join('') +
+        '</div>';
+}
+
+function nsnSelectItem(id, name) {
+    document.getElementById('nsn-item-id').value = id;
+    document.getElementById('nsn-item-search').value = name;
+    document.getElementById('nsn-item-dropdown').innerHTML = '';
+    document.getElementById('nsn-qty').focus();
+}
+
+function nsnReset() {
+    document.getElementById('nsn-item-search').value = '';
+    document.getElementById('nsn-item-id').value = '';
+    document.getElementById('nsn-item-dropdown').innerHTML = '';
+    document.getElementById('nsn-qty').value = '';
+    document.getElementById('nsn-note').value = '';
+    document.getElementById('nsn-item-search').focus();
+}
+
+async function nsnSaveNote() {
+    const itemId = document.getElementById('nsn-item-id').value;
+    const itemName = document.getElementById('nsn-item-search').value.trim();
+    const qty = parseInt(document.getElementById('nsn-qty').value, 10) || 0;
+    const note = document.getElementById('nsn-note').value.trim();
+    if (!itemId) { toast('Pick an item from the dropdown.', 'error'); document.getElementById('nsn-item-search').focus(); return; }
+    if (qty <= 0) { toast('Enter a quantity.', 'error'); document.getElementById('nsn-qty').focus(); return; }
+    if (!note) { toast('Enter a note.', 'error'); document.getElementById('nsn-note').focus(); return; }
+    const btn = document.getElementById('nsn-save-btn');
+    _btnWait(btn);
+    try {
+        const data = await apiPost('saveNonSerializedItemNote', { itemId: itemId, quantity: qty, note: note });
+        if (!data.success) { toast(data.message || 'Failed to save note.', 'error'); return; }
+        toast('Note added to ' + (data.itemName || itemName) + '.', 'success');
+        // Keep the item selected; clear qty/note for a quick next entry.
+        document.getElementById('nsn-qty').value = '';
+        document.getElementById('nsn-note').value = '';
+        document.getElementById('nsn-note').focus();
+    } catch (e) {
+        toast('Error: ' + e.message, 'error');
+    } finally {
+        _btnReset(btn);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
 //  STOCK COUNT DASHBOARD
 // ═══════════════════════════════════════════════════════════
 
@@ -21811,6 +23009,7 @@ async function scdLoadStockCounts() {
     const assignedTo = document.getElementById('scd-user-filter').value;
     const item       = document.getElementById('scd-item-filter').value.trim();
     const serial     = document.getElementById('scd-serial-filter').value.trim();
+    const bin        = document.getElementById('scd-bin-filter').value.trim();
     const tbody = document.getElementById('scd-table-body');
     tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--text-dim)">Loading...</td></tr>';
     scdRenderPagination();
@@ -21821,6 +23020,7 @@ async function scdLoadStockCounts() {
         if (assignedTo) params.assignedTo = assignedTo;
         if (item)       params.item       = item;
         if (serial)     params.serial     = serial;
+        if (bin)        params.bin        = bin;
         const data = await apiGet('getStockCounts', params);
         if (!data.success) {
             _scdResults = [];
